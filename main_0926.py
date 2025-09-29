@@ -110,8 +110,8 @@ class ColbertFdeRetriever:
 
         self.doc_config = FixedDimensionalEncodingConfig(
             dimension=128,
-            num_repetitions=5,
-            num_simhash_projections=7,
+            num_repetitions=2,
+            num_simhash_projections=5,
             seed=42,
             fill_empty_partitions=True,
         )
@@ -275,7 +275,7 @@ class ColbertFdeRetriever:
     def index(self, corpus: dict):
         self._corpus = corpus
 
-        # (사용자 설정대로 캐시 로드 스킵 가능)
+        # # (사용자 설정대로 캐시 로드 스킵 가능)
         # if self._load_cache():
         #     return
 
@@ -290,9 +290,9 @@ class ColbertFdeRetriever:
 
         # 1) 외부/내부에서 가능한 만큼 채운다
         for doc_id in self.doc_ids:
-            ext = self._external_doc_emb_path(doc_id)
+            ext = self._external_doc_emb_path(doc_id)            
             if ext and os.path.exists(ext):
-                doc_embeddings_map[doc_id] = np.load(ext).astype(np.float32)
+                doc_embeddings_map[doc_id] = np.load(ext).astype(np.float32)                
                 # 필요 시 내부 캐시에도 채움
                 if self.save_doc_embeds:
                     dst = self._doc_emb_path(doc_id)
@@ -301,8 +301,9 @@ class ColbertFdeRetriever:
                 continue
 
             # 내부 캐시 확인
-            dst = self._doc_emb_path(doc_id)            
-            if os.path.exists(dst):                
+            dst = self._doc_emb_path(doc_id)
+            if os.path.exists(dst): # shape(256, 128)
+                print(f"[inner shape]: {np.load(dst).shape}")
                 doc_embeddings_map[doc_id] = np.load(dst).astype(np.float32)
             else:
                 missing_doc_ids.append(doc_id)
@@ -375,8 +376,12 @@ class ColbertFdeRetriever:
             query_embeddings = cached_emb
             query_fde = cached_fde
 
+        start_fde_scores = time.perf_counter()
         fde_scores = self.fde_index @ query_fde
+        end_fde_scores = time.perf_counter() - start_fde_scores
+        start_argsort = time.perf_counter()
         order_fde = np.argsort(-fde_scores)
+        end_argsort = time.perf_counter() - start_argsort
         search_time = time.perf_counter() - t0
 
         # 2) 재랭킹 시간
@@ -411,7 +416,7 @@ class ColbertFdeRetriever:
         self._log_latency(str(query_id) if query_id is not None else "", search_time, rerank_time)
         logging.info(
             f"[search] QID={query_id} reranked={len(cand_ids)} "
-            f"search_ms={search_time*1000:.3f} rerank_ms={rerank_time*1000:.3f}"
+            f"search_ms={search_time*1000:.3f} rerank_ms={rerank_time*1000:.3f}, scoring_ms={end_fde_scores*1000:.3f}, argsort_ms={end_argsort*1000:.3f}"
         )
 
         return out
@@ -436,7 +441,7 @@ if __name__ == "__main__":
             enable_rerank=True,
             save_doc_embeds=True,
             latency_log_path=os.path.join(CACHE_ROOT, "latency.tsv"),  # QID\tSearch\tRerank
-            external_doc_embeds_dir="/home/dccbeta/muvera_optimized/BeIR_trec-covid__raphaelsty_neural-cherche-colbert__d128_r1_p7_seed42_fill1__5d9f685f71/doc_embeds",  # ★ 외부 임베딩 디렉터리 지정
+            external_doc_embeds_dir="/home/dccbeta/muvera_optimized/cache_muvera/treccovid/doc_embeds",  # ★ 외부 임베딩 디렉터리 지정
         )
     }
 
@@ -456,16 +461,16 @@ if __name__ == "__main__":
         if hasattr(retriever, "precompute_queries"):
             retriever.precompute_queries(queries)
 
-        query_times = []
-        results = {}
-        for query_id, query_text in queries.items():
-            start_time = time.perf_counter()
-            results[str(query_id)] = retriever.search(query_text, query_id=str(query_id))
-            query_times.append(time.perf_counter() - start_time)
+        # query_times = []
+        # results = {}
+        # for query_id, query_text in queries.items():
+        #     start_time = time.perf_counter()
+        #     # results[str(query_id)] = retriever.search(query_text, query_id=str(query_id))
+        #     query_times.append(time.perf_counter() - start_time)
 
-        timings[name]["avg_query_time"] = np.mean(query_times)
-        final_results[name] = results
-        logging.info(f"'{name}' search finished. Avg query time: {timings[name]['avg_query_time'] * 1000:.2f} ms.")
+        # timings[name]["avg_query_time"] = np.mean(query_times)
+        # final_results[name] = results
+        # logging.info(f"'{name}' search finished. Avg query time: {timings[name]['avg_query_time'] * 1000:.2f} ms.")
 
     print("\n" + "=" * 85)
     print(f"{'FINAL REPORT':^85}")
