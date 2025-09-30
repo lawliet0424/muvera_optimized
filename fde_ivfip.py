@@ -33,7 +33,7 @@ except Exception as _e:
 # ======================
 # --- Configuration ----
 # ======================
-DATASET_REPO_ID = "treccovid"
+DATASET_REPO_ID = "scidocs"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
 TOP_K = 10
 
@@ -44,8 +44,8 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
 else:
     DEVICE = "cpu"
 
-# 데이터셋 준비 (BEIR trec-covid)
-dataset = "trec-covid"
+# 데이터셋 준비 
+dataset = "scidocs"
 url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip"
 out_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "datasets")
 data_path = util.download_and_unzip(url, out_dir)
@@ -53,6 +53,10 @@ data_path = util.download_and_unzip(url, out_dir)
 # 캐시 루트
 CACHE_ROOT = os.path.join(pathlib.Path(__file__).parent.absolute(), "cache_muvera")
 os.makedirs(CACHE_ROOT, exist_ok=True)
+
+# 쿼리 검색 디렉터리
+QUERY_SEARCH_DIR = os.path.join(CACHE_ROOT, "query_search", dataset, "fde_ivfip")
+os.makedirs(QUERY_SEARCH_DIR, exist_ok=True)
 
 # ======================
 # --- Logging Setup ----
@@ -64,6 +68,22 @@ logging.info(f"Using device: {DEVICE}  |  FAISS={'on' if _FAISS_OK else 'off'}")
 # --- Helper Functions  -----
 # ===========================
 def load_nanobeir_dataset(repo_id: str):
+    """Loads BEIR dataset from local 'data_path' in test split."""
+    # 데이터셋 준비 
+    url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip"
+    out_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "datasets")
+
+    if not os.path.exists(os.path.join(out_dir, dataset)):
+        data_path = util.download_and_unzip(url, out_dir)
+        logging.info(
+            f"[Dataset] Downloaded and unzipped dataset from {url} to {out_dir}"
+        )
+    else:
+        data_path = os.path.join(out_dir, dataset)
+        logging.info(
+            f"[Dataset] Dataset already exists in {out_dir}"
+        )
+
     logging.info(f"Loading dataset from local path (BEIR): '{repo_id}'...")
     corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split="test")
     logging.info(f"Dataset loaded: {len(corpus)} documents, {len(queries)} queries.")
@@ -118,6 +138,7 @@ class ColbertFdeRetriever:
         faiss_num_threads: Optional[int] = None,
     ):
         self.faiss_num_threads = faiss_num_threads or max(1, (os.cpu_count() or 1) - 0)
+        logging.info(f"Using {self.faiss_num_threads} threads for FAISS")
 
         model = neural_cherche_models.ColBERT(model_name_or_path=model_name, device=DEVICE)
         self.ranker = neural_cherche_rank.ColBERT(key="id", on=["title", "text"], model=model)
@@ -555,6 +576,10 @@ if __name__ == "__main__":
 
     corpus, queries, qrels = load_nanobeir_dataset(DATASET_REPO_ID)
 
+    # 쿼리를 첫 100개로 제한 (1:100)
+    queries = dict(list(queries.items())[:100])
+    logging.info(f"Limited queries to first 100: {len(queries)} queries.")
+
     logging.info("Initializing retrieval models...")
     retrievers = {
         "2. ColBERT + FDE (+FAISS IVF IP) + Chamfer": ColbertFdeRetriever(
@@ -562,8 +587,8 @@ if __name__ == "__main__":
             rerank_candidates=100,
             enable_rerank=True,
             save_doc_embeds=True,
-            latency_log_path=os.path.join(CACHE_ROOT, "latency.tsv"),
-            external_doc_embeds_dir="/home/dccbeta/muvera_optimized/cache_muvera/treccovid/doc_embeds",
+            latency_log_path=os.path.join(QUERY_SEARCH_DIR, "latency.tsv"),  # QID\tSearch\tRerank
+            external_doc_embeds_dir=f"/home/dccbeta/muvera_optimized/cache_muvera/{dataset}/doc_embeds",
 
             # FAISS 설정
             use_faiss_ann=True,   # False로 끄면 기존 matmul 경로 사용
@@ -574,6 +599,10 @@ if __name__ == "__main__":
     }
 
     timings, final_results = {}, {}
+
+    # 지연시간 로그 파일 초기화
+    with open(os.path.join(QUERY_SEARCH_DIR, "latency.tsv"), "w", encoding="utf-8") as f:
+        f.write("QID\tSearch\tRerank\n")
 
     logging.info("--- PHASE 1: INDEXING / LOAD CACHES ---")
     for name, retriever in retrievers.items():
@@ -608,9 +637,10 @@ if __name__ == "__main__":
     print("-" * 85)
 
     for name in retrievers.keys():
-        recall = evaluate_recall(final_results[name], qrels, k=TOP_K)
+        #recall = evaluate_recall(final_results[name], qrels, k=TOP_K)
         ready_s = timings[name]["indexing_time"]
         query_time_ms = timings[name]["avg_query_time"] * 1000
-        print(f"{name:<40} | {ready_s:<16.2f} | {query_time_ms:<22.2f} | {recall:<10.4f}")
+        #print(f"{name:<40} | {ready_s:<16.2f} | {query_time_ms:<22.2f} | {recall:<10.4f}")
+        print(f"{name:<40} | {ready_s:<16.2f} | {query_time_ms:<22.2f}")
 
     print("=" * 85)
