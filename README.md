@@ -1,3 +1,9 @@
+[Requirements]
+* python 3.10+
+* nltk 3.9.1
+* neural-cherche 1.4.3
+* faiss-gpu 1.7.2
+
 [Main files]
 - main_0926.py -> BEIR dataset 다운로드 및 Document/Query FDE indexing.
     * FixedDimensionalEncodingConfig 에서 num_repetition, num_simhash_projections 파라미터 세팅
