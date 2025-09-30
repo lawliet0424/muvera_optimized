@@ -46,6 +46,11 @@ else:
 CACHE_ROOT = os.path.join(pathlib.Path(__file__).parent.absolute(), "cache_muvera")
 os.makedirs(CACHE_ROOT, exist_ok=True)
 
+# 쿼리 검색 디렉터리
+dataset = "scidocs"
+QUERY_SEARCH_DIR = os.path.join(CACHE_ROOT, "query_search", dataset, "main_0926")
+os.makedirs(QUERY_SEARCH_DIR, exist_ok=True)
+
 # ======================
 # --- Logging Setup ----
 # ======================
@@ -58,7 +63,6 @@ logging.info(f"Using device: {DEVICE}")
 def load_nanobeir_dataset(repo_id: str):
     """Loads BEIR dataset from local 'data_path' in test split."""
     # 데이터셋 준비 (BEIR trec-covid)
-    dataset = "scidocs"
     url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip"
     out_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "datasets")
 
@@ -449,6 +453,10 @@ if __name__ == "__main__":
 
     # 데이터셋 로드
     corpus, queries, qrels = load_nanobeir_dataset(DATASET_REPO_ID)
+    
+    # 쿼리를 첫 100개로 제한 (1:100)
+    queries = dict(list(queries.items())[:100])
+    logging.info(f"Limited queries to first 100: {len(queries)} queries.")
 
 
     logging.info("Initializing retrieval models...")
@@ -458,8 +466,8 @@ if __name__ == "__main__":
             rerank_candidates=100,
             enable_rerank=True,
             save_doc_embeds=True,
-            latency_log_path=os.path.join(CACHE_ROOT, "latency.tsv"),  # QID\tSearch\tRerank
-            external_doc_embeds_dir="/home/hyunji/muvera_optimized/cache_muvera/scidocs/doc_embeds",  # ★ 외부 임베딩 디렉터리 지정
+            latency_log_path=os.path.join(QUERY_SEARCH_DIR, "latency.tsv"),  # QID\tSearch\tRerank
+            external_doc_embeds_dir=f"/home/hyunji/muvera_optimized/cache_muvera/{dataset}/doc_embeds",  # ★ 외부 임베딩 디렉터리 지정
         )
     }
 
@@ -481,6 +489,11 @@ if __name__ == "__main__":
 
         query_times = []
         results = {}
+
+        # 지연시간 로그 파일 초기화
+        with open(os.path.join(QUERY_SEARCH_DIR, "latency.tsv"), "w", encoding="utf-8") as f:
+            f.write("QID\tSearch\tRerank\n")
+
         for query_id, query_text in queries.items():
             start_time = time.perf_counter()
             results[str(query_id)] = retriever.search(query_text, query_id=str(query_id))

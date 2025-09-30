@@ -3,6 +3,7 @@
 * nltk 3.9.1
 * neural-cherche 1.4.3
 * faiss-gpu 1.7.2
+* numpy 1.26.4
 
 [Main files]
 - main_0926.py -> BEIR dataset 다운로드 및 Document/Query FDE indexing.
