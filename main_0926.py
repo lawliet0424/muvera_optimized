@@ -8,12 +8,18 @@ import nltk
 import numpy as np
 import torch
 import joblib
+import time
 
 import neural_cherche.models as neural_cherche_models
 import neural_cherche.rank as neural_cherche_rank
+from datasets import load_dataset
 
-from beir import util
+from beir import util, LoggingHandler
+from beir.retrieval import models
 from beir.datasets.data_loader import GenericDataLoader
+from beir.retrieval.evaluation import EvaluateRetrieval
+from beir.retrieval.search.dense import DenseRetrievalExactSearch as DRES
+
 
 # FDE 구현 (업로드된 파일 사용)
 from fde_generator_optimized_stream import (
@@ -25,7 +31,7 @@ from fde_generator_optimized_stream import (
 # ======================
 # --- Configuration ----
 # ======================
-DATASET_REPO_ID = "treccovid"
+DATASET_REPO_ID = "scidocs"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
 TOP_K = 10
 
@@ -35,12 +41,6 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     DEVICE = "mps"
 else:
     DEVICE = "cpu"
-
-# 데이터셋 준비 (BEIR trec-covid)
-dataset = "trec-covid"
-url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip"
-out_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "datasets")
-data_path = util.download_and_unzip(url, out_dir)
 
 # 캐시 루트
 CACHE_ROOT = os.path.join(pathlib.Path(__file__).parent.absolute(), "cache_muvera")
@@ -57,6 +57,22 @@ logging.info(f"Using device: {DEVICE}")
 # ===========================
 def load_nanobeir_dataset(repo_id: str):
     """Loads BEIR dataset from local 'data_path' in test split."""
+    # 데이터셋 준비 (BEIR trec-covid)
+    dataset = "scidocs"
+    url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip"
+    out_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "datasets")
+
+    if not os.path.exists(os.path.join(out_dir, dataset)):
+        data_path = util.download_and_unzip(url, out_dir)
+        logging.info(
+            f"[Dataset] Downloaded and unzipped dataset from {url} to {out_dir}"
+        )
+    else:
+        data_path = os.path.join(out_dir, dataset)
+        logging.info(
+            f"[Dataset] Dataset already exists in {out_dir}"
+        )
+
     logging.info(f"Loading dataset from local path (BEIR): '{repo_id}'...")
     corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split="test")
     logging.info(f"Dataset loaded: {len(corpus)} documents, {len(queries)} queries.")
@@ -239,13 +255,13 @@ class ColbertFdeRetriever:
         # 1) 외부 디렉터리 우선
         ext_path = self._external_doc_emb_path(doc_id)
         if ext_path and os.path.exists(ext_path):
-            logging.info(f"[doc-embed] external load: id={doc_id} path={ext_path}")
+            #logging.info(f"[doc-embed] external load: id={doc_id} path={ext_path}")
             return np.load(ext_path)
 
         # 2) 내부 캐시
         int_path = self._doc_emb_path(doc_id)
         if os.path.exists(int_path):
-            logging.info(f"[doc-embed] internal load: id={doc_id} path={int_path}")
+            #logging.info(f"[doc-embed] internal load: id={doc_id} path={int_path}")
             return np.load(int_path)
 
         # 3) 필요 시 빌드
@@ -260,7 +276,7 @@ class ColbertFdeRetriever:
 
         # 내부 캐시에 저장(선택)
         np.save(int_path, arr)
-        logging.info(f"[doc-embed] built & saved: id={doc_id} path={int_path}")
+        #logging.info(f"[doc-embed] built & saved: id={doc_id} path={int_path}")
         return arr
 
     # --------- Latency log ---------
@@ -431,7 +447,9 @@ if __name__ == "__main__":
     except LookupError:
         pass
 
+    # 데이터셋 로드
     corpus, queries, qrels = load_nanobeir_dataset(DATASET_REPO_ID)
+
 
     logging.info("Initializing retrieval models...")
     retrievers = {
@@ -441,7 +459,7 @@ if __name__ == "__main__":
             enable_rerank=True,
             save_doc_embeds=True,
             latency_log_path=os.path.join(CACHE_ROOT, "latency.tsv"),  # QID\tSearch\tRerank
-            external_doc_embeds_dir="/home/dccbeta/muvera_optimized/cache_muvera/treccovid/doc_embeds",  # ★ 외부 임베딩 디렉터리 지정
+            external_doc_embeds_dir="/home/hyunji/muvera_optimized/cache_muvera/scidocs/doc_embeds",  # ★ 외부 임베딩 디렉터리 지정
         )
     }
 
@@ -461,16 +479,16 @@ if __name__ == "__main__":
         if hasattr(retriever, "precompute_queries"):
             retriever.precompute_queries(queries)
 
-        # query_times = []
-        # results = {}
-        # for query_id, query_text in queries.items():
-        #     start_time = time.perf_counter()
-        #     # results[str(query_id)] = retriever.search(query_text, query_id=str(query_id))
-        #     query_times.append(time.perf_counter() - start_time)
+        query_times = []
+        results = {}
+        for query_id, query_text in queries.items():
+            start_time = time.perf_counter()
+            results[str(query_id)] = retriever.search(query_text, query_id=str(query_id))
+            query_times.append(time.perf_counter() - start_time)
 
-        # timings[name]["avg_query_time"] = np.mean(query_times)
-        # final_results[name] = results
-        # logging.info(f"'{name}' search finished. Avg query time: {timings[name]['avg_query_time'] * 1000:.2f} ms.")
+        timings[name]["avg_query_time"] = np.mean(query_times)
+        final_results[name] = results
+        logging.info(f"'{name}' search finished. Avg query time: {timings[name]['avg_query_time'] * 1000:.2f} ms.")
 
     print("\n" + "=" * 85)
     print(f"{'FINAL REPORT':^85}")
@@ -480,9 +498,10 @@ if __name__ == "__main__":
     print("-" * 85)
 
     for name in retrievers.keys():
-        recall = evaluate_recall(final_results[name], qrels, k=TOP_K)
+        #recall = evaluate_recall(final_results[name], qrels, k=TOP_K)
         idx_time = timings[name]["indexing_time"]
         query_time_ms = timings[name]["avg_query_time"] * 1000
-        print(f"{name:<30} | {idx_time:<20.2f} | {query_time_ms:<22.2f} | {recall:<10.4f}")
+        #print(f"{name:<30} | {idx_time:<20.2f} | {query_time_ms:<22.2f} | {recall:<10.4f}")
+        print(f"{name:<30} | {idx_time:<20.2f} | {query_time_ms:<22.2f}")
 
     print("=" * 85)
