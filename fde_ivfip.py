@@ -36,6 +36,7 @@ except Exception as _e:
 DATASET_REPO_ID = "scidocs"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
 TOP_K = 10
+FILENAME = "fde_ivfip"
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -51,11 +52,11 @@ out_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "datasets")
 data_path = util.download_and_unzip(url, out_dir)
 
 # 캐시 루트
-CACHE_ROOT = os.path.join(pathlib.Path(__file__).parent.absolute(), "cache_muvera")
+CACHE_ROOT = os.path.join(pathlib.Path(__file__).parent.absolute(), "cache_muvera", DATASET_REPO_ID, FILENAME)
 os.makedirs(CACHE_ROOT, exist_ok=True)
 
 # 쿼리 검색 디렉터리
-QUERY_SEARCH_DIR = os.path.join(CACHE_ROOT, "query_search", dataset, "fde_ivfip")
+QUERY_SEARCH_DIR = os.path.join(CACHE_ROOT, "query_search", DATASET_REPO_ID, FILENAME)
 os.makedirs(QUERY_SEARCH_DIR, exist_ok=True)
 
 # ======================
@@ -637,10 +638,10 @@ if __name__ == "__main__":
     print("-" * 85)
 
     for name in retrievers.keys():
-        #recall = evaluate_recall(final_results[name], qrels, k=TOP_K)
+        recall = evaluate_recall(final_results[name], qrels, k=TOP_K)
         ready_s = timings[name]["indexing_time"]
         query_time_ms = timings[name]["avg_query_time"] * 1000
-        #print(f"{name:<40} | {ready_s:<16.2f} | {query_time_ms:<22.2f} | {recall:<10.4f}")
-        print(f"{name:<40} | {ready_s:<16.2f} | {query_time_ms:<22.2f}")
+        print(f"{name:<40} | {ready_s:<16.2f} | {query_time_ms:<22.2f} | {recall:<10.4f}")
+        #print(f"{name:<40} | {ready_s:<16.2f} | {query_time_ms:<22.2f}")
 
     print("=" * 85)

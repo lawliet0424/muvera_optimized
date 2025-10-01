@@ -20,9 +20,11 @@ from beir.datasets.data_loader import GenericDataLoader
 from beir.retrieval.evaluation import EvaluateRetrieval
 from beir.retrieval.search.dense import DenseRetrievalExactSearch as DRES
 
+from sklearn.decomposition import PCA
+
 
 # FDE 구현 (업로드된 파일 사용)
-from fde_generator_optimized_stream import (
+from fde_generator_optimized_stream_weight import (
     FixedDimensionalEncodingConfig,
     generate_query_fde,
     generate_document_fde_batch,
@@ -34,7 +36,7 @@ from fde_generator_optimized_stream import (
 DATASET_REPO_ID = "scidocs"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
 TOP_K = 10
-FILENAME = "main_0926"
+FILENAME = "main_weight"
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -348,18 +350,41 @@ class ColbertFdeRetriever:
         # 3) 리스트로 정렬
         doc_embeddings_list = [doc_embeddings_map[doc_id] for doc_id in self.doc_ids]
 
-        # ---------- FDE 인덱스 생성 ----------
+        # ---------- FDE 인덱스 생성 (PCA 차원 축소 포함) ----------
         logging.info(f"[{self.__class__.__name__}] Generating FDEs from ColBERT embeddings in BATCH mode...")
+        
+        # PCA 차원 축소를 적용
+        # FDE 전체 차원 = num_repetitions × (2^num_simhash_projections) × dimension
+        full_fde_dim = self.doc_config.num_repetitions * (2**self.doc_config.num_simhash_projections) * self.doc_config.dimension
+        # 예: 50% 축소
+        pca_components = full_fde_dim // 2
+        
+        logging.info(f"[FDE Index] Original expected FDE dimension (before PCA): {self.doc_config.num_repetitions * (2**self.doc_config.num_simhash_projections) * self.doc_config.dimension}")
+        logging.info(f"[FDE Index] PCA components: {pca_components}")
+        
         self.fde_index = generate_document_fde_batch(
             doc_embeddings_list,
             self.doc_config,
             memmap_path=os.path.join(self._cache_dir, "fde_index.mmap"),
             max_bytes_in_memory=2 * 1024**3,  # optional guard
-            log_every=50000
-        )# generate_document_fde_batch(doc_embeddings_list, self.doc_config)
+            log_every=50000,
+            pca_components=pca_components,  # PCA 차원 축소
+            pca_model_path=os.path.join(self._cache_dir, "pca_model.pkl")  # PCA 모델 저장
+        )
 
+        logging.info(f"[FDE Index] Final FDE index shape after PCA: {self.fde_index.shape}")
+        logging.info(f"[FDE Index] Expected: ({len(self.doc_ids)}, {pca_components})")
+        
+        # 확인: FDE가 PCA 적용된 차원인지 체크
+        if self.fde_index.shape[1] != pca_components:
+            logging.error(f"[FDE Index] ERROR: FDE dimension mismatch! Got {self.fde_index.shape[1]}, expected {pca_components}")
+        else:
+            logging.info(f"[FDE Index] ✓ FDE correctly compressed to {pca_components} dimensions")
+        
         # 저장
         self._save_cache()
+        logging.info(f"[FDE Index] Saved PCA-compressed FDE index to: {self._fde_path}")
+        logging.info(f"[FDE Index] Saved size: {os.path.getsize(self._fde_path) / 1024 / 1024:.1f} MB")
 
     def precompute_queries(self, queries: dict):
         missing = 0
@@ -372,6 +397,19 @@ class ColbertFdeRetriever:
             query_embeddings = to_numpy(next(iter(query_embeddings_map.values())))
             query_config = replace(self.doc_config, fill_empty_partitions=False)
             query_fde = generate_query_fde(query_embeddings, query_config)
+
+            # PCA 차원 축소 (문서 FDE로 학습한 PCA 모델 로드)
+            pca_model_path = os.path.join(self._cache_dir, "pca_model.pkl")
+            if os.path.exists(pca_model_path):
+                import joblib
+                pca = joblib.load(pca_model_path)
+                # transform만 적용 (fit 아님!)
+                compressed_query_fde = pca.transform(query_fde.reshape(1, -1))
+                query_fde = compressed_query_fde.reshape(-1)
+                logging.info(f"[Query PCA] Compressed Query FDE Shape: {query_fde.shape}")
+            else:
+                logging.warning(f"[Query PCA] PCA model not found at {pca_model_path}, using original FDE")
+
             self._save_query_cache(key, query_embeddings, query_fde)
             missing += 1
         logging.info(f"[{self.__class__.__name__}] Precomputed {missing} uncached queries.")
@@ -392,6 +430,16 @@ class ColbertFdeRetriever:
             query_embeddings = to_numpy(next(iter(query_embeddings_map.values())))
             query_config = replace(self.doc_config, fill_empty_partitions=False)
             query_fde = generate_query_fde(query_embeddings, query_config)
+            
+            # PCA 차원 축소 (문서 FDE로 학습한 PCA 모델 로드)
+            pca_model_path = os.path.join(self._cache_dir, "pca_model.pkl")
+            if os.path.exists(pca_model_path):
+                import joblib
+                pca = joblib.load(pca_model_path)
+                # transform만 적용 (fit 아님!)
+                compressed_query_fde = pca.transform(query_fde.reshape(1, -1))
+                query_fde = compressed_query_fde.reshape(-1)
+            
             self._save_query_cache(key, query_embeddings, query_fde)
         else:
             query_embeddings = cached_emb
