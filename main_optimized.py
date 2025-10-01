@@ -31,6 +31,8 @@ from fde_generator_optimized import (
 DATASET_REPO_ID = "BeIR/scidocs"  # 사용되는 데이터셋 식별자(캐시 키에 포함)
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
 TOP_K = 10
+
+
 DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 
 # 캐시 루트 디렉터리
