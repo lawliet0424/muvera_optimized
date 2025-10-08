@@ -33,15 +33,17 @@ from threading import Lock
 try:
     # 선택: BLAS 스레드 과다 생성 방지 (NumPy/OpenBLAS/MKL)
     from threadpoolctl import threadpool_limits
+    # BLAS thread 비활성화
+    _TPCTL = threadpool_limits(limits=1)  # 프로그램 시작 시
     _TPCTL_OK = True
 except Exception:
     _TPCTL_OK = False
 
 # ---- 환경 제한(권장: 내부 라이브러리 멀티스레딩 억제) ----
-os.environ.setdefault("OMP_NUM_THREADS", "12")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "12")
-os.environ.setdefault("MKL_NUM_THREADS", "12")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "12")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 # ========== Faiss (CPU) ==========
 try:
@@ -66,7 +68,7 @@ TARGET_NUM_QUERIES = 1000
 RANDOM_SEED = 42
 
 # ----- ANN 배치 (고정 크기) -----
-ANN_BATCH_SIZE = 2          # ← 100개 모이면 배치 검색
+ANN_BATCH_SIZE = 8          # ← 100개 모이면 배치 검색
 FAISS_NLIST = 1000
 FAISS_NPROBE = 50
 FAISS_CANDIDATES = 100        # over-fetch; rerank보다 크거나 같게 권장
@@ -115,6 +117,8 @@ logging.info(f"Using device: {DEVICE}  |  FAISS={'on' if _FAISS_OK else 'off'}")
 avg_search_time_list = []
 avg_ann_time_list = []
 avg_rerank_time_list = []
+avg_rerank_cp_list = []
+avg_rerank_io_list = []
 
 # ===========================
 # --- Helper Functions  -----
@@ -583,24 +587,36 @@ def rerank_aggregator_loop(retriever: ColbertFdeRetrieverNaive,
         compute_rerank_time = 0
         io_rerank_time = 0
         sort_rerank_time = 0
+
+        reranked_pairs = []
+
+        for did in compute_ids:
+            t_io = time.perf_counter()
+            d_tok = retriever._get_doc_embeddings(did, allow_build=True) # I/O
+            io_rerank_time += time.perf_counter() - t_io
+            t_compute = time.perf_counter()
+            score = retriever._chamfer(task.query_embeddings, d_tok) # compute
+            compute_rerank_time += time.perf_counter() - t_compute                    
+            reranked_pairs.append((did, score))
+
         # 선택: BLAS 스레드 과다 생성 방지 (있으면 1로 한정)
-        if _TPCTL_OK:
-            with threadpool_limits(limits=1):  # OpenBLAS/MKL을 워커별 1스레드로
-                reranked_pairs = []
-                for did in compute_ids:
-                    t_io = time.perf_counter()
-                    d_tok = retriever._get_doc_embeddings(did, allow_build=True) # I/O
-                    io_rerank_time += time.perf_counter() - t_io
-                    t_compute = time.perf_counter()
-                    score = retriever._chamfer(task.query_embeddings, d_tok) # compute
-                    compute_rerank_time += time.perf_counter() - t_compute                    
-                    reranked_pairs.append((did, score))
-        else:
-            reranked_pairs = []
-            for did in compute_ids:
-                d_tok = retriever._get_doc_embeddings(did, allow_build=True)
-                score = retriever._chamfer(task.query_embeddings, d_tok)
-                reranked_pairs.append((did, score))
+        # if _TPCTL_OK:
+        #     with threadpool_limits(limits=1):  # OpenBLAS/MKL을 워커별 1스레드로
+        #         reranked_pairs = []
+        #         for did in compute_ids:
+        #             t_io = time.perf_counter()
+        #             d_tok = retriever._get_doc_embeddings(did, allow_build=True) # I/O
+        #             io_rerank_time += time.perf_counter() - t_io
+        #             t_compute = time.perf_counter()
+        #             score = retriever._chamfer(task.query_embeddings, d_tok) # compute
+        #             compute_rerank_time += time.perf_counter() - t_compute                    
+        #             reranked_pairs.append((did, score))
+        # else:
+        #     reranked_pairs = []
+        #     for did in compute_ids:
+        #         d_tok = retriever._get_doc_embeddings(did, allow_build=True)
+        #         score = retriever._chamfer(task.query_embeddings, d_tok)
+        #         reranked_pairs.append((did, score))
 
         t_sort = time.perf_counter()
         reranked_pairs.sort(key=lambda x: x[1], reverse=True)
@@ -626,6 +642,8 @@ def rerank_aggregator_loop(retriever: ColbertFdeRetrieverNaive,
         avg_search_time_list.append(total_search_time)
         avg_ann_time_list.append(task.ann_time_s)
         avg_rerank_time_list.append(rerank_time)
+        avg_rerank_cp_list.append(compute_rerank_time)
+        avg_rerank_io_list.append(io_rerank_time)
         
         retriever._log_latency(task.qid, total_search_time, task.ann_time_s, rerank_time, compute_rerank_time, io_rerank_time, sort_rerank_time)
 
@@ -748,8 +766,9 @@ if __name__ == "__main__":
           f"ANN_BATCH={ANN_BATCH_SIZE}, RERANK_BATCH_Q={RERANK_BATCH_QUERIES}, "
           f"TOPN={RERANK_TOPN}, TOTAL_TIME= {end_time:.2f})")
     print("=" * 105)
-
-    print(f"[Average] Search: {mean(avg_search_time_list)*1000:.2f}, ANN: {mean(avg_ann_time_list)*1000:.2f}, Rerank: {mean(avg_rerank_time_list)*1000:.2f}")
+    # avg_rerank_cp_list.append(compute_rerank_time) avg_rerank_io_list.append(io_rerank_time)
+    print(f"[Average] Search: {mean(avg_search_time_list)*1000:.2f}, ANN: {mean(avg_ann_time_list)*1000:.2f}, "
+          f"Rerank: {mean(avg_rerank_time_list)*1000:.2f}, Rerank(CP): {mean(avg_rerank_cp_list)*1000:.2f}, Rerank(IO): {mean(avg_rerank_io_list)*1000:.2f}")
     print("=" * 105)
 
     # Recall@K
