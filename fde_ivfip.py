@@ -111,7 +111,7 @@ class ColbertFdeRetriever:
         # ----- FAISS params -----
         use_faiss_ann: bool = True,
         faiss_nlist: int = 10000,
-        faiss_nprobe: int = 10,
+        faiss_nprobe: int = 100,
         faiss_candidates: int = 1000,   # ANN에서 몇 개를 받아 재랭크 소스로 쓸지
 
         # ----- NEW: threading -----
@@ -124,7 +124,7 @@ class ColbertFdeRetriever:
 
         self.doc_config = FixedDimensionalEncodingConfig(
             dimension=128,
-            num_repetitions=2,
+            num_repetitions=6,
             num_simhash_projections=7,
             seed=42,
             fill_empty_partitions=True,
@@ -242,7 +242,7 @@ class ColbertFdeRetriever:
         self._doc_pos = {d: i for i, d in enumerate(self.doc_ids)}
         logging.info(
             f"[{self.__class__.__name__}] Loaded FDE index cache: "
-            f"{self.fde_index.shape} for {len(self.doc_ids)} docs"
+            f"{self.fde_index.shape} for {len(self.doc_ids)} docs, [use_faiss_ann] : {self.use_faiss_ann}, [self.faiss_nprobe]: {self.faiss_nprobe}"
         )
         # FAISS index가 있으면 로드 시도
         if self.use_faiss_ann and os.path.exists(self._faiss_path):
@@ -374,17 +374,18 @@ class ColbertFdeRetriever:
         # ------------------------------------------------------------------
         # B) (옵션) On-disk inverted lists: 벡터 코드 저장을 디스크로 이동 (RAM 절감)
         # ------------------------------------------------------------------
-        use_ondisk = hasattr(faiss, "OnDiskInvertedLists")
-        if use_ondisk:
-            try:
-                ivf = faiss.extract_index_ivf(index)
-                invlists_path = self._faiss_path + ".lists"  # 실제 코드 데이터 파일
-                invlists = faiss.OnDiskInvertedLists(ivf.nlist, ivf.code_size, invlists_path)
-                ivf.replace_invlists(invlists)
-                logging.info(f"[FAISS] Using On-Disk inverted lists at: {invlists_path}")
-            except Exception as e:
-                use_ondisk = False
-                logging.warning(f"[FAISS] On-Disk inverted lists not available/failed: {e}")
+        # 1005 OnDiskInvertedList 옵션으로 할 경우, IVF size가 증폭되는 문제가 있으므로, 여기를 비활성해야함.
+        # use_ondisk = hasattr(faiss, "OnDiskInvertedListsss")
+        # if use_ondisk:
+        #     try:
+        #         ivf = faiss.extract_index_ivf(index)
+        #         invlists_path = self._faiss_path + ".lists"  # 실제 코드 데이터 파일
+        #         invlists = faiss.OnDiskInvertedLists(ivf.nlist, ivf.code_size, invlists_path)
+        #         ivf.replace_invlists(invlists)
+        #         logging.info(f"[FAISS] Using On-Disk inverted lists at: {invlists_path}, ivf_code: {ivf.code_size}. index_total: {index.ntotal}, ivf.nlist: {ivf.nlist}")
+        #     except Exception as e:
+        #         use_ondisk = False
+        #         logging.warning(f"[FAISS] On-Disk inverted lists not available/failed: {e}")
 
         # ------------------------------------
         # C) ADD: 큰 배열을 나눠서 배치 추가 (피크 메모리 ↓)
@@ -392,15 +393,24 @@ class ColbertFdeRetriever:
         add_bs = 100_000  # 배치 크기 (메모리 상황에 맞게 조절)
         t_add = time.perf_counter()
         added = 0
+        added_sum = 0
+        logging.info("[DCCLAB] Before add!")
         for start in range(0, nvecs, add_bs):
             end = min(start + add_bs, nvecs)
-            # 중요: 배치만큼만 연속 버퍼로 보장 (필요시 그 배치만 복사)
+            # 중요: 배치만큼만 연속 버퍼로 보장 (필요시 그 배치만 복사)                        
             xb = np.ascontiguousarray(self.fde_index[start:end], dtype=np.float32)
+            before = index.ntotal
             index.add(xb)
+            after = index.ntotal
+            logging.info(f"[DCCLAB] added: {after - before}, added_sum: {added_sum}")  # 기대: n_chunk
+            ntotal = after
             added += (end - start)
+            added_sum += (after - before)
+
             if added % 200_000 == 0:
                 logging.info(f"[FAISS] Added {added}/{nvecs} vectors...")
 
+        logging.info(f"final ntotal: {ntotal}")
         logging.info(f"[FAISS] Added all {nvecs} vectors in {time.perf_counter()-t_add:.2f}s")
 
         # On-disk inverted lists를 썼다면, 아래 write_index는 메타/헤더만 저장하고
@@ -419,6 +429,7 @@ class ColbertFdeRetriever:
             # ensure FAISS index is available/loaded
             if self.use_faiss_ann and self.faiss_index is None:
                 try:
+                    logging.info(f"complete to _load_cache")
                     self._build_or_load_faiss_index()
                 except Exception as e:
                     logging.warning(f"[FAISS] Build/load skipped due to error: {e}")
@@ -450,6 +461,7 @@ class ColbertFdeRetriever:
         # make sure FAISS index exists if we want ANN
         if self.use_faiss_ann and self.faiss_index is None:
             try:
+                logging.info(f"have to call self._build_or_load_faiss_index()")
                 self._build_or_load_faiss_index()
             except Exception as e:
                 logging.warning(f"[FAISS] Build/load failed; falling back to brute-force: {e}")
@@ -516,7 +528,7 @@ class ColbertFdeRetriever:
 
         reranked = []
         for did in topN_ids:
-            d_tok = self._get_doc_embeddings(did, allow_build=True)
+            d_tok = self._get_doc_embeddings(did, allow_build=False)
             score = self._chamfer(query_embeddings, d_tok)
             reranked.append((did, score))
         reranked.sort(key=lambda x: x[1], reverse=True)
@@ -559,7 +571,7 @@ if __name__ == "__main__":
     retrievers = {
         "2. ColBERT + FDE (+FAISS IVF IP) + Chamfer": ColbertFdeRetriever(
             model_name=COLBERT_MODEL_NAME,
-            rerank_candidates=100,
+            rerank_candidates=10,
             enable_rerank=True,
             save_doc_embeds=True,
             latency_log_path=os.path.join(CACHE_ROOT, "latency.tsv"),
@@ -569,7 +581,7 @@ if __name__ == "__main__":
             use_faiss_ann=True,   # False로 끄면 기존 matmul 경로 사용
             faiss_nlist=100,
             faiss_nprobe=10,
-            faiss_candidates=100,
+            faiss_candidates=10,
         )
     }
 
