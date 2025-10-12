@@ -11,12 +11,13 @@ Naive-baseline pipeline (deadline 제거, 고정 배치 크기 100):
   RERANK_TOPN (= rerank_candidates)
   OMP/BLAS thread caps (기본 1)
 """
-import os, json, time, hashlib, logging, pathlib, random, threading, argparse, sys
+import os, json, time, hashlib, logging, pathlib, random, threading, argparse, sys, resource
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from typing import Optional, List, Tuple, Dict
 from queue import Queue
 from statistics import mean
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import nltk
 import numpy as np
@@ -58,25 +59,31 @@ except Exception as _e:
 # ======================
 DATASET_REPO_ID = "quora"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
-TOP_K = 10
+TOP_K = 40
 
 # ----- Rerank 워커 개수 -----
 RERANK_WORKERS = 16  # 코어/메모리/I/O 상황에 맞춰 조정
 
 # ----- 실험 스케일 -----
-TARGET_NUM_QUERIES = 1000
+TARGET_NUM_QUERIES = 100
 RANDOM_SEED = 42
 
 # ----- ANN 배치 (고정 크기) -----
-ANN_BATCH_SIZE = 16          # ← 100개 모이면 배치 검색
+ANN_BATCH_SIZE = 4          # ← 100개 모이면 배치 검색 (지금은 16으로 운영)
 FAISS_NLIST = 1000
 FAISS_NPROBE = 50
-FAISS_CANDIDATES = 100        # over-fetch; rerank보다 크거나 같게 권장
+FAISS_CANDIDATES = 50        # over-fetch; rerank보다 크거나 같게 권장
 FAISS_NUM_THREADS = 1         # OpenMP 스레드 수(권장: 1 또는 소수)
 
 # ----- Rerank 배치(나이브, 고정 크기) -----
-RERANK_BATCH_QUERIES = 2    # ← 100개 모이면 배치 시작(내부는 문서별 순차 Chamfer)
-RERANK_TOPN = 100             # top-N만 재랭크 (나이브)
+RERANK_BATCH_QUERIES = 4      # ← 100개 모이면 배치 시작(현 코드에서는 즉시 처리였음)
+RERANK_TOPN = 50              # top-N만 재랭크 (나이브)
+
+# ====== Rerank Batch Mode Switches ======
+# 'immediate' : 쿼리 도착 즉시 Rerank (워커 병렬, mega GEMM)
+# 'batch'     : Rerank 작업을 BATCH_RERANK_SIZE 개 모아 한 번에 멀티스레드 나이브 rerank
+BATCH_RERANK_MODE = "batch"   # "immediate" or "batch"
+BATCH_RERANK_SIZE = 4        # 배치 모을 크기
 
 # ----- 캐시(기본 끔: 정말 나이브) -----
 ENABLE_DOC_EMB_LRU_CACHE = False
@@ -110,6 +117,7 @@ os.makedirs(CACHE_ROOT, exist_ok=True)
 # ======================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logging.info(f"Using device: {DEVICE}  |  FAISS={'on' if _FAISS_OK else 'off'}")
+logging.info(f"[RERANK MODE] {BATCH_RERANK_MODE} (batch_size={BATCH_RERANK_SIZE})")
 
 # ======================
 # --- Metric Setup ----
@@ -119,6 +127,8 @@ avg_ann_time_list = []
 avg_rerank_time_list = []
 avg_rerank_cp_list = []
 avg_rerank_io_list = []
+avg_rerank_wait_list = []
+avg_dup_ratio_list = []
 
 # ===========================
 # --- Helper Functions  -----
@@ -129,7 +139,20 @@ def load_nanobeir_dataset(repo_id: str):
     logging.info(f"Dataset loaded: {len(corpus)} documents, {len(queries)} queries.")
     return corpus, queries, qrels
 
-def evaluate_recall(results: dict, qrels: dict, k: int) -> float:
+# === (NEW) Per-query Recall@K ===
+def per_query_recall_at_k(results: dict, qrels: dict, k: int) -> float:
+    recalls = {}
+    for qid, ranked_docs in results.items():        
+        rel = set(qrels.get(str(qid), {}).keys())
+        if not rel:
+            continue
+        topk = list(ranked_docs.keys())[:k]
+        hit_rel = rel.intersection(topk)
+        recalls[qid] = len(hit_rel) / len(rel)
+    return recalls
+
+# === (NEW) Per-query Recall@K ===
+def evaluate_hit_k(results: dict, qrels: dict, k: int) -> float:
     hits, total_queries = 0, 0
     for query_id, ranked_docs in results.items():
         relevant_docs = set(qrels.get(str(query_id), {}).keys())
@@ -149,6 +172,29 @@ def to_numpy(tensor_or_array) -> np.ndarray:
     else:
         raise TypeError(f"Unsupported type for conversion: {type(tensor_or_array)}")
 
+# 랜덤 I/O 계측 헬퍼
+def _read_proc_io_bytes() -> Optional[int]:
+    """
+    /proc/self/io 에서 read_bytes를 읽어온다 (Linux 한정).
+    실패/비지원 시 None.
+    """
+    try:
+        with open("/proc/self/io", "r") as f:
+            for line in f:
+                if line.startswith("read_bytes:"):
+                    return int(line.split()[1])
+    except Exception:
+        return None
+    return None
+
+def _get_rusage_faults():
+    """(minflt, majflt) 튜플 반환"""
+    try:
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        return int(ru.ru_minflt), int(ru.ru_majflt)
+    except Exception:
+        return None, None
+
 # =====================================
 # --- FDE Query/Doc Generator Stubs  ---
 # =====================================
@@ -159,7 +205,7 @@ from fde_generator_optimized_stream import (
 )
 
 # =====================================
-# --- Retriever (ANN 배치 + Rerank 나이브) ---
+# --- Retriever (ANN 배치 + Rerank) ---
 # =====================================
 class ColbertFdeRetrieverNaive:
     def __init__(
@@ -210,21 +256,17 @@ class ColbertFdeRetrieverNaive:
         self.faiss_candidates = faiss_candidates
         self.faiss_index = None
 
-        # in_default = f"fde_index_{P}_{R}.pkl"
-        # faiss_default = f"ivf{args.nlist}_ip_{P}_{R}.faiss"
-        # meta_default = f"meta_{P}_{R}.json"
-
         # cache paths
         self._model_name = model_name
         self._cache_dir = self._compute_cache_dir(dataset=DATASET_REPO_ID)
-        # self.in_path = os.path.join(self._cache_dir, in_default)
-        
+
+        # 경로는 main 이후에 결정되는 전역 이름에 의존 (기존 코드 유지)
         self._fde_path = os.path.join(self._cache_dir, in_default)
         self._ids_path = os.path.join(self._cache_dir, "doc_ids.json")
         self._meta_path = os.path.join(self._cache_dir, meta_default)
         self._queries_dir = os.path.join(self._cache_dir, "queries")
         self._doc_emb_dir = os.path.join(self._cache_dir, "doc_embeds")
-        self._faiss_path = os.path.join(self._cache_dir, faiss_default)# f"ivf{self.faiss_nlist}_ip.faiss")
+        self._faiss_path = os.path.join(self._cache_dir, faiss_default)
 
         os.makedirs(self._cache_dir, exist_ok=True)
         os.makedirs(self._queries_dir, exist_ok=True)
@@ -241,6 +283,29 @@ class ColbertFdeRetrieverNaive:
             self._lru = _OD()
             self._lru_lock = threading.Lock()
             self._lru_cap = DOC_EMB_LRU_SIZE
+        
+        # 헤더 기록 (이미 존재하면 이어쓰기)
+        try:
+            with self._log_lock:
+                if not os.path.exists(self._latency_log_path):
+                    with open(self._latency_log_path, "a", encoding="utf-8") as f:
+                        f.write(
+                            "qid\tann_ms\trerank_ms\trerank_compute_ms\trerank_io_ms\t"
+                            "wait_ms\tdup_ratio\tread_bytes\tminflt\tmajflt\t"
+                            "docloads\tuniqdocs\tmean_pos_delta\tp95_pos_delta\n"
+                        )
+        except Exception as e:
+            logging.warning(f"[{self.__class__.__name__}] Failed to write latency header: {e}")
+        
+        # 헤더 기록 (이미 존재하면 이어쓰기), query 별 로깅 파일 생성
+        self._per_query_log_path = os.path.join(CACHE_ROOT, f"per_query.tsv") # os.path.join(self._cache_dir, "latency.tsv")
+        try:
+            with self._log_lock:                
+                if not os.path.exists(self._per_query_log_path):                    
+                    with open(self._per_query_log_path, "a", encoding="utf-8") as f:                        
+                        f.write("qid\trecall_at_k\n")
+        except Exception as e:
+            logging.warning(f"[{self.__class__.__name__}] Failed to write per-query header: {e}")        
 
     def _compute_cache_dir(self, dataset: str) -> str:
         return os.path.join(CACHE_ROOT, dataset)
@@ -250,7 +315,6 @@ class ColbertFdeRetrieverNaive:
             return
         try:
             faiss.omp_set_num_threads(self.faiss_num_threads)
-            logging.info(f"[FAISS] omp_set_num_threads({self.faiss_num_threads})")
         except Exception as e:
             logging.warning(f"[FAISS] omp_set_num_threads failed: {e}")
 
@@ -265,8 +329,7 @@ class ColbertFdeRetrieverNaive:
         )
 
     def _doc_emb_path(self) -> str:
-        # 내부 저장 시 pos 기반 파일 이름을 사용
-        raise NotImplementedError  # 이 함수는 사용하지 않음 (외부/내부 경로에서 직접 처리)
+        raise NotImplementedError  # 내부 pos 기반 파일 이름 사용
 
     def _external_doc_emb_path(self, doc_id: str) -> Optional[str]:
         if not self.external_doc_embeds_dir:
@@ -366,12 +429,52 @@ class ColbertFdeRetrieverNaive:
                 if len(self._lru) > self._lru_cap:
                     self._lru.popitem(last=False)
         return arr
-    # retriever._log_latency(task.qid, total_search_time, task.ann_time_s, rerank_time, compute_rerank_time, io_rerank_time)
-    def _log_latency(self, qid: str, search_s: float, ann_s: float, rerank_s: float, rerank_compute_s: float, rerank_io_s: float, rerank_sort_s: float):
+
+    # per_query logging
+    def _log_per_query(self, qid: str, recall_at_k: int):
         try:
             with self._log_lock:
+                with open(self._per_query_log_path, "a", encoding="utf-8") as f:
+                    f.write(f"{qid}\t{recall_at_k}\n")
+        except Exception as e:
+            logging.warning(f"[{self.__class__.__name__}] Failed to write per-query row: {e}")
+    
+    def _log_latency(
+        self,
+        qid: str,
+        search_s: float,
+        ann_s: float,
+        rerank_s: float,
+        rerank_compute_s: float,
+        rerank_io_s: float,
+        wait_s: float,
+        dup_ratio: Optional[float] = None,
+        # ── 랜덤 I/O 측정 추가 ──
+        read_bytes: Optional[int] = None,
+        minflt_delta: Optional[int] = None,
+        majflt_delta: Optional[int] = None,
+        docloads: Optional[int] = None,
+        uniqdocs: Optional[int] = None,
+        mean_pos_delta: Optional[float] = None,
+        p95_pos_delta: Optional[float] = None,
+    ):
+        try:
+            divided_ann_s = ann_s / ANN_BATCH_SIZE
+            dr = -1.0 if (dup_ratio is None) else float(dup_ratio)
+            rb = -1 if (read_bytes is None) else int(read_bytes)
+            mf = -1 if (minflt_delta is None) else int(minflt_delta)
+            M  = -1 if (majflt_delta is None) else int(majflt_delta)
+            dl = -1 if (docloads is None) else int(docloads)
+            ud = -1 if (uniqdocs is None) else int(uniqdocs)
+            mp = -1.0 if (mean_pos_delta is None) else float(mean_pos_delta)
+            p95= -1.0 if (p95_pos_delta is None) else float(p95_pos_delta)
+            with self._log_lock:
                 with open(self._latency_log_path, "a", encoding="utf-8") as f:
-                    f.write(f"{qid}\t{search_s*1000:.3f}\t{ann_s*1000:.3f}\t{rerank_s*1000:.3f}\t{rerank_compute_s*1000:.3f}\t{rerank_io_s*1000:.3f}\t{rerank_sort_s*1000:.3f}\n")
+                    f.write(
+                        f"{qid}\t{divided_ann_s*1000:.3f}\t{rerank_s*1000:.3f}\t"
+                        f"{rerank_compute_s*1000:.3f}\t{rerank_io_s*1000:.3f}\t{wait_s*1000:.3f}\t"
+                        f"{dr:.6f}\t{rb}\t{mf}\t{M}\t{dl}\t{ud}\t{mp:.6f}\t{p95:.6f}\n"
+                    )
         except Exception as e:
             logging.warning(f"[{self.__class__.__name__}] Failed to write latency log: {e}")
 
@@ -434,7 +537,6 @@ class ColbertFdeRetrieverNaive:
         faiss.write_index(index, self._faiss_path)
         index.nprobe = self.faiss_nprobe
         self.faiss_index = index
-        # logging.info(f"[FAISS] Saved to {out_path} (nprobe={self.faiss_nprobe})")
 
     # --------- Public API ---------
     def index(self, corpus: dict):
@@ -471,10 +573,195 @@ class ColbertFdeRetrieverNaive:
         assert XQ_batch.ndim == 2
         if self.faiss_index is None:
             self._build_or_load_faiss_index()
+        # 검색 직전에도 스레드 수 보장
+        self._set_faiss_threads()
         t0 = time.perf_counter()
         D, I = self.faiss_index.search(XQ_batch, k)
         ann_time = time.perf_counter() - t0
         return D, I, ann_time
+
+# ============== 공통: 하나의 task를 대형 GEMM + 세그먼트-리듀스로 재랭크 ==============
+def _rerank_task_with_mega_gemm(
+    retriever: ColbertFdeRetrieverNaive,
+    task: "RerankTask",
+    top_k: int,
+) -> Tuple[OrderedDict, float, float, float, float, dict]:
+    """
+    반환: (out_pairs, rerank_total_s, compute_s, io_s, sort_s, meta)
+    meta: 랜덤 I/O 계측 { 'docloads','uniqdocs','read_bytes','minflt_delta','majflt_delta','mean_pos_delta','p95_pos_delta' }
+    """
+    q_emb = task.query_embeddings  # [m, d] float32
+    N_compute = min(top_k, retriever.rerank_candidates, len(task.initial_candidates))
+    compute_ids = [did for (did, _) in task.initial_candidates[:N_compute]]
+
+    # ── 계측 시작 ──
+    io_before = _read_proc_io_bytes()
+    mf0, M0   = _get_rusage_faults()
+    pos_seq: List[int] = []
+    # ────────────────
+
+    # ----- I/O: 문서 토큰 모두 로드 & 이어붙이기 -----
+    t_io0 = time.perf_counter()
+    doc_spans: List[Tuple[str, int, int]] = []
+    blocks = []
+    col_start = 0
+    for did in compute_ids:
+        # pos 기록(순차성 근사)
+        try:
+            pos_seq.append(int(retriever._doc_pos[did]))
+        except Exception:
+            pass
+        d_tok = retriever._get_doc_embeddings(did, allow_build=True)  # np.ndarray [n_i, d]
+        n_i = int(d_tok.shape[0])
+        blocks.append(d_tok)
+        doc_spans.append((did, col_start, col_start + n_i))  # [start, end) in D_all
+        col_start += n_i
+    D_all = None
+    if blocks:
+        # [sum(n_i), d], C-contiguous
+        D_all = np.ascontiguousarray(np.vstack(blocks).astype(np.float32))
+    io_s = time.perf_counter() - t_io0
+
+    # ----- Compute: 한 번의 큰 GEMM -----
+    t_c0 = time.perf_counter()
+    reranked_pairs: List[Tuple[str, float]] = []
+
+    if D_all is not None and D_all.size > 0:
+        # S: [m, sum(n_i)]
+        S = q_emb @ D_all.T
+        # 문서별 세그먼트 리듀스 (row-wise max → sum)
+        for did, s, e in doc_spans:
+            if e - s == 0:
+                score = -1e9  # empty defensive
+            else:
+                score = float(S[:, s:e].max(axis=1).sum())
+            reranked_pairs.append((did, score))
+    compute_s = time.perf_counter() - t_c0
+
+    # ----- Sort + Tail(미재채점 후보) 유지 -----
+    t_sort0 = time.perf_counter()
+    reranked_pairs.sort(key=lambda x: x[1], reverse=True)
+    computed_set = {did for (did, _) in reranked_pairs}
+    tail_pairs = [(did, sc) for (did, sc) in task.initial_candidates if did not in computed_set]
+    out = OrderedDict()
+    for did, sc in reranked_pairs:
+        out[did] = float(sc)
+    for did, sc in tail_pairs:
+        out[did] = float(sc)
+    sort_s = time.perf_counter() - t_sort0
+
+    total_s = io_s + compute_s + sort_s
+
+    # ── 계측 종료/집계 ──
+    io_after = _read_proc_io_bytes()
+    mf1, M1  = _get_rusage_faults()
+    read_bytes = (io_after - io_before) if (io_before is not None and io_after is not None) else None
+    minflt_delta = (mf1 - mf0) if (mf0 is not None and mf1 is not None) else None
+    majflt_delta = (M1 - M0) if (M0 is not None and M1 is not None) else None
+
+    # pos-delta 통계
+    mean_pos_delta = None
+    p95_pos_delta = None
+    if len(pos_seq) >= 2:
+        deltas = [abs(pos_seq[i] - pos_seq[i-1]) for i in range(1, len(pos_seq))]
+        deltas_sorted = sorted(deltas)
+        mean_pos_delta = float(sum(deltas) / len(deltas))
+        p95_pos_delta = float(deltas_sorted[int(0.95*(len(deltas_sorted)-1))])
+
+    meta = dict(
+        docloads=len(compute_ids),
+        uniqdocs=len(set(compute_ids)),
+        read_bytes=read_bytes,
+        minflt_delta=minflt_delta,
+        majflt_delta=majflt_delta,
+        mean_pos_delta=mean_pos_delta,
+        p95_pos_delta=p95_pos_delta,
+    )
+    return out, total_s, compute_s, io_s, sort_s, meta
+
+# ============== 나이브 per-task rerank (멀티스레드 배치용) ==============
+def _rerank_task_naive(
+    retriever: ColbertFdeRetrieverNaive,
+    task: "RerankTask",
+    top_k: int,
+) -> Tuple[OrderedDict, float, float, float, float, dict]:
+    """
+    mega_gemm을 쓰지 않는 나이브 per-task rerank:
+      - 상위 N 문서 각각에 대해 d_tok 로드 → Q @ D_doc.T → row-wise max→sum (Chamfer)
+      - 정렬 후 tail 이어붙임
+    반환: (out_pairs, total_s, compute_s, io_s, sort_s, meta)
+    meta: 랜덤 I/O 계측 딕셔너리
+    """
+    q_emb = task.query_embeddings  # [m, d]
+    N_compute = min(top_k, retriever.rerank_candidates, len(task.initial_candidates))
+    compute_ids = [did for (did, _) in task.initial_candidates[:N_compute]]
+
+    # ── 계측 시작 ──
+    io_before = _read_proc_io_bytes()
+    mf0, M0   = _get_rusage_faults()
+    pos_seq: List[int] = []
+    # ────────────────
+
+    io_s = 0.0
+    compute_s = 0.0
+    reranked_pairs: List[Tuple[str, float]] = []
+
+    for did in compute_ids:
+        # pos 추출(순차성 프록시)
+        try:
+            pos_seq.append(int(retriever._doc_pos[did]))
+        except Exception:
+            pass
+
+        t_io = time.perf_counter()
+        d_tok = retriever._get_doc_embeddings(did, allow_build=True)  # [n_i, d]
+        io_s += time.perf_counter() - t_io
+
+        t_cp = time.perf_counter()
+        score = retriever._chamfer(q_emb, d_tok)  # Q @ D_doc.T → row-wise max → sum
+        compute_s += time.perf_counter() - t_cp
+        reranked_pairs.append((did, float(score)))
+
+    t_sort0 = time.perf_counter()
+    reranked_pairs.sort(key=lambda x: x[1], reverse=True)
+    computed_set = {did for (did, _) in reranked_pairs}
+    tail_pairs = [(did, sc) for (did, sc) in task.initial_candidates if did not in computed_set]
+
+    out = OrderedDict()
+    for did, sc in reranked_pairs:
+        out[did] = sc
+    for did, sc in tail_pairs:
+        out[did] = float(sc)
+
+    sort_s = time.perf_counter() - t_sort0
+    total_s = io_s + compute_s + sort_s
+
+    # ── 계측 종료/집계 ──
+    io_after = _read_proc_io_bytes()
+    mf1, M1  = _get_rusage_faults()
+    read_bytes = (io_after - io_before) if (io_before is not None and io_after is not None) else None
+    minflt_delta = (mf1 - mf0) if (mf0 is not None and mf1 is not None) else None
+    majflt_delta = (M1 - M0) if (M0 is not None and M1 is not None) else None
+
+    # pos-delta 통계
+    mean_pos_delta = None
+    p95_pos_delta = None
+    if len(pos_seq) >= 2:
+        deltas = [abs(pos_seq[i] - pos_seq[i-1]) for i in range(1, len(pos_seq))]
+        deltas_sorted = sorted(deltas)
+        mean_pos_delta = float(sum(deltas) / len(deltas))
+        p95_pos_delta = float(deltas_sorted[int(0.95*(len(deltas_sorted)-1))])
+
+    meta = dict(
+        docloads=len(compute_ids),
+        uniqdocs=len(set(compute_ids)),
+        read_bytes=read_bytes,
+        minflt_delta=minflt_delta,
+        majflt_delta=majflt_delta,
+        mean_pos_delta=mean_pos_delta,
+        p95_pos_delta=p95_pos_delta,
+    )
+    return out, total_s, compute_s, io_s, sort_s, meta
 
 # ============== 배치 오케스트레이션(나이브, 고정 크기) ==============
 @dataclass
@@ -511,14 +798,14 @@ def build_qrels_for_sample(orig_qrels: Dict[str, Dict[str, int]], sample_queries
             new_qrels[new_qid] = orig_qrels[base]
     return new_qrels
 
-# ---- ANN Aggregator (배치: 100개 모이면 flush) ----
+# ---- ANN Aggregator (배치: batch_size 모이면 flush) ----
 def ann_aggregator_loop(retriever: ColbertFdeRetrieverNaive,
                         in_q: Queue, out_q: Queue,
                         k: int,
                         batch_size: int = ANN_BATCH_SIZE):
     exp_dim = int(retriever.fde_index.shape[1])
     XQ_list: List[np.ndarray] = []
-    metas: List[Tuple[str, str, np.ndarray, float]] = []
+    metas: List[Tuple[str, str, np.ndarray, float]] = [] # flush 전 qid, qtext 등
 
     def flush():
         if not XQ_list:
@@ -552,7 +839,7 @@ def ann_aggregator_loop(retriever: ColbertFdeRetrieverNaive,
         qid, qtext, t_enq = item.qid, item.qtext, item.t_enqueue
         key = retriever._query_key(qtext, qid)
         qemb, qfde = retriever._load_query_cache(key)
-        if (qemb is None) or (qfde is None) or (qfde.shape[0] != exp_dim):
+        if (qemb is None) or (qfde is None) or (fde := qfde) is None or (fde.shape[0] != exp_dim):
             qmap = retriever.ranker.encode_queries(queries=[qtext])
             qemb = to_numpy(next(iter(qmap.values())))
             qcfg = replace(retriever.doc_config, fill_empty_partitions=False)
@@ -565,95 +852,140 @@ def ann_aggregator_loop(retriever: ColbertFdeRetrieverNaive,
         if len(XQ_list) >= batch_size:
             flush()
 
+# ---- Rerank Aggregator (즉시/배치 모드 모두 지원) ----
 def rerank_aggregator_loop(retriever: ColbertFdeRetrieverNaive,
                            in_q: Queue,
                            out_dict: Dict[str, OrderedDict],
-                           batch_queries: int = RERANK_BATCH_QUERIES,  # 더 이상 사용되지 않음
+                           batch_queries: int = RERANK_BATCH_QUERIES,  # 호환용
                            top_k: int = TOP_K,
                            num_workers: int = RERANK_WORKERS):
     """
-    - in_q에서 task를 받는 즉시 워커가 처리 (즉시 flush 의미 유지)
-    - 워커 수(num_workers)만큼 병렬 처리
-    - 상위 top_k만 토큰 로드/Chamfer 계산, 나머지는 ANN 순서 유지
+    - immediate 모드: in_q에서 task를 받는 즉시 워커가 _rerank_task_with_mega_gemm 수행
+    - batch 모드    : BATCH_RERANK_SIZE 만큼 모아 멀티스레드 나이브 per-task rerank
     """
     results_lock = Lock()
     stop_token = "__STOP__"
 
-    def process_one(task: RerankTask):
-        # 배치 시작 대신, '해당 작업이 실제로 시작되는 시점'을 기준으로 wait 측정
-        t_start = time.perf_counter()
-        wait_s = t_start - task.enqueued_time_s
-
-        # 상위 TOP_K만 재채점 (상한: retriever.rerank_candidates)
-        N_compute = min(top_k, retriever.rerank_candidates, len(task.initial_candidates))
-        compute_ids = [did for (did, _) in task.initial_candidates[:N_compute]]
-
-        # 재채점
-        t0 = time.perf_counter()
-        compute_rerank_time = 0
-        io_rerank_time = 0
-        sort_rerank_time = 0
-
-        reranked_pairs = []
-
-        for did in compute_ids:
-            t_io = time.perf_counter()
-            d_tok = retriever._get_doc_embeddings(did, allow_build=True) # I/O
-            io_rerank_time += time.perf_counter() - t_io
-            t_compute = time.perf_counter()
-            score = retriever._chamfer(task.query_embeddings, d_tok) # compute
-            compute_rerank_time += time.perf_counter() - t_compute                    
-            reranked_pairs.append((did, score))
-
-        t_sort = time.perf_counter()
-        reranked_pairs.sort(key=lambda x: x[1], reverse=True)
-        sort_rerank_time = time.perf_counter() - t_sort
-        
-        rerank_time = time.perf_counter() - t0
-        # 나머지 후보는 ANN 순서 유지
-        computed_set = {did for (did, _) in reranked_pairs}
-        tail_pairs = [(did, sc) for (did, sc) in task.initial_candidates if did not in computed_set]
-
-        # 출력(재채점 결과 + ANN 꼬리)
-        out = OrderedDict()
-        for did, sc in reranked_pairs:
-            out[did] = float(sc)
-        for did, sc in tail_pairs:
-            out[did] = float(sc)
-
-        # 기록 compute_rerank_time | io_rerank_time
+    def _commit_result(
+        task: RerankTask,
+        out_pairs: OrderedDict,
+        rerank_time: float,
+        compute_rerank_time: float,
+        io_rerank_time: float,
+        wait_s: float,
+        dup_ratio: Optional[float] = None,
+        meta: Optional[dict] = None,
+    ):
         with results_lock:
-            out_dict[task.qid] = out
+            out_dict[task.qid] = out_pairs
         total_search_time = task.ann_time_s + rerank_time
-        
         avg_search_time_list.append(total_search_time)
-        avg_ann_time_list.append(task.ann_time_s)
+        avg_ann_time_list.append(task.ann_time_s/ANN_BATCH_SIZE)
         avg_rerank_time_list.append(rerank_time)
         avg_rerank_cp_list.append(compute_rerank_time)
         avg_rerank_io_list.append(io_rerank_time)
-        
-        retriever._log_latency(task.qid, total_search_time, task.ann_time_s, rerank_time, compute_rerank_time, io_rerank_time, sort_rerank_time)
+        avg_rerank_wait_list.append(wait_s)
+        if dup_ratio is not None:
+            avg_dup_ratio_list.append(dup_ratio)
 
-    # ---- 워커 풀 구성 ----
-    workers = []
-    def worker_loop():
+        # meta 풀기
+        rb  = meta.get("read_bytes")      if meta else None
+        mf  = meta.get("minflt_delta")    if meta else None
+        M   = meta.get("majflt_delta")    if meta else None
+        dl  = meta.get("docloads")        if meta else None
+        ud  = meta.get("uniqdocs")        if meta else None
+        mp  = meta.get("mean_pos_delta")  if meta else None
+        p95 = meta.get("p95_pos_delta")   if meta else None
+
+        retriever._log_latency(
+            task.qid, total_search_time, task.ann_time_s,
+            rerank_time, compute_rerank_time, io_rerank_time, wait_s,
+            dup_ratio=dup_ratio,
+            read_bytes=rb, minflt_delta=mf, majflt_delta=M,
+            docloads=dl, uniqdocs=ud, mean_pos_delta=mp, p95_pos_delta=p95,
+        )
+
+    # -------- Immediate Mode: 도착 즉시 워커 처리 (mega GEMM) --------
+    if BATCH_RERANK_MODE == "immediate":
+        def process_one(task: RerankTask):
+            t_start = time.perf_counter()
+            wait_s = t_start - task.enqueued_time_s
+            t0 = time.perf_counter()
+            out_pairs, total_rerank_s, compute_s, io_s, sort_s, meta = _rerank_task_with_mega_gemm(
+                retriever, task, top_k)
+            rerank_time = time.perf_counter() - t0  # 전체 함수 감싼 시간(검증용)
+            _commit_result(task, out_pairs, rerank_time, compute_s, io_s, wait_s, dup_ratio=None, meta=meta)
+
+        workers = []
+        def worker_loop():
+            while True:
+                item = in_q.get()
+                if item == stop_token:
+                    in_q.put(stop_token)  # 다른 워커 종료 유도
+                    break
+                process_one(item)
+
+        for _ in range(max(1, int(num_workers))):
+            t = threading.Thread(target=worker_loop, daemon=True)
+            t.start()
+            workers.append(t)
+        for t in workers:
+            t.join()
+        return
+
+    # -------- Batch Mode: 배치로 모아 멀티스레드 처리 (나이브 per-task) --------
+    elif BATCH_RERANK_MODE == "batch":
+        buffer: List[RerankTask] = []
+
+        def _process_task(task: RerankTask, dup_ratio_for_batch: Optional[float]):
+            # 각 task를 스레드에서 독립적으로 나이브 rerank
+            t_start = time.perf_counter()
+            wait_s = t_start - task.enqueued_time_s
+            t0 = time.perf_counter()
+            out_pairs, total_rerank_s, compute_s, io_s, sort_s, meta = _rerank_task_naive(
+                retriever, task, top_k
+            )
+            rerank_time = time.perf_counter() - t0
+            _commit_result(
+                task, out_pairs, rerank_time, compute_s, io_s, wait_s,
+                dup_ratio=dup_ratio_for_batch, meta=meta
+            )
+
+        def _flush_batch(buf: List[RerankTask]):
+            if not buf:
+                return
+            # --- 배치 내 문서 중복율 계산 ---
+            all_doc_ids: List[str] = []
+            for task in buf:
+                N_compute = min(top_k, retriever.rerank_candidates, len(task.initial_candidates))
+                all_doc_ids.extend([did for (did, _) in task.initial_candidates[:N_compute]])
+            total_docs = len(all_doc_ids)
+            if total_docs > 0:
+                unique_docs = len(set(all_doc_ids))
+                dup_ratio_for_batch = 1.0 - (unique_docs / total_docs)
+            else:
+                dup_ratio_for_batch = 0.0
+
+            # --- 멀티스레드 실행 ---
+            parallelism = min(max(1, int(num_workers)), len(buf))
+            with ThreadPoolExecutor(max_workers=parallelism, thread_name_prefix="rerank-batch") as ex:
+                futures = [ex.submit(_process_task, t, dup_ratio_for_batch) for t in buf]
+                for f in as_completed(futures):
+                    _ = f.result()  # 예외 전파
+
         while True:
             item = in_q.get()
             if item == stop_token:
-                # 다른 워커들도 멈출 수 있도록 토큰을 다시 넣는다.
-                in_q.put(stop_token)
+                _flush_batch(buffer)
                 break
-            process_one(item)
+            buffer.append(item)
+            if len(buffer) >= max(1, int(BATCH_RERANK_SIZE)):
+                _flush_batch(buffer)
+                buffer.clear()
+        return
 
-    # 워커 시작
-    for _ in range(max(1, int(num_workers))):
-        t = threading.Thread(target=worker_loop, daemon=True)
-        t.start()
-        workers.append(t)
-
-    # 메인 스레드: 종료 대기
-    for t in workers:
-        t.join()
+    else:
+        raise ValueError(f"Unknown BATCH_RERANK_MODE={BATCH_RERANK_MODE}")
 
 # ======================
 # --- Main Script ------
@@ -693,6 +1025,10 @@ if __name__ == "__main__":
     in_default = f"fde_index_{P}_{R}.pkl"
     faiss_default = f"ivf{args.nlist}_ip_{P}_{R}.faiss"
     meta_default = f"meta_{P}_{R}.json"
+
+    # 실수 방지 가드
+    assert FAISS_CANDIDATES >= RERANK_TOPN, \
+        f"FAISS_CANDIDATES({FAISS_CANDIDATES}) must be >= RERANK_TOPN({RERANK_TOPN})"
     
     corpus, queries, qrels = load_nanobeir_dataset(DATASET_REPO_ID)
 
@@ -719,7 +1055,7 @@ if __name__ == "__main__":
     t_ready = time.perf_counter() - t_ready0
     logging.info(f"Retriever ready in {t_ready:.2f}s")
 
-    # 1,000개 샘플
+    # 샘플링
     def make_random_query_sample(orig_queries: Dict[str, str], n_target: int, seed: int = 42) -> Dict[str, str]:
         rnd = random.Random(seed)
         items = list(orig_queries.items())
@@ -780,14 +1116,21 @@ if __name__ == "__main__":
     print(f"{'FINAL REPORT':^105}")
     print(f"(Dataset: {DATASET_REPO_ID}, Queries: {len(sample_queries)} | "
           f"ANN_BATCH={ANN_BATCH_SIZE}, RERANK_BATCH_Q={RERANK_BATCH_QUERIES}, "
-          f"TOPN={RERANK_TOPN}, TOTAL_TIME= {end_time:.2f})")
+          f"TOPN={RERANK_TOPN}, TOTAL_TIME= {end_time:.2f}, MODE={BATCH_RERANK_MODE})")
     print("=" * 105)
-    # avg_rerank_cp_list.append(compute_rerank_time) avg_rerank_io_list.append(io_rerank_time)
-    print(f"[Average] Search: {mean(avg_search_time_list)*1000:.2f}, ANN: {mean(avg_ann_time_list)*1000:.2f}, "
-          f"Rerank: {mean(avg_rerank_time_list)*1000:.2f}, Rerank(CP): {mean(avg_rerank_cp_list)*1000:.2f}, Rerank(IO): {mean(avg_rerank_io_list)*1000:.2f}")
+    total_search_s = mean(avg_ann_time_list) + mean(avg_rerank_time_list) if avg_ann_time_list and avg_rerank_time_list else 0.0
+    print(f"[Average] Search: {total_search_s*1000:.2f} ms, ANN: {mean(avg_ann_time_list)*1000:.2f} ms, "
+          f"Rerank(TT): {mean(avg_rerank_time_list)*1000:.2f} ms, Rerank(CP): {mean(avg_rerank_cp_list)*1000:.2f} ms, "
+          f"Rerank(IO): {mean(avg_rerank_io_list)*1000:.2f} ms, Rerank(WT): {mean(avg_rerank_wait_list)*1000:.2f} ms")
+    if avg_dup_ratio_list:
+        print(f"[Batch] Avg dup_ratio: {mean(avg_dup_ratio_list):.6f}")
     print("=" * 105)
 
+    per_q_recall = per_query_recall_at_k(results, sample_qrels, TOP_K)
+    macro_recall = sum(per_q_recall.values()) / len(per_q_recall)
+
     # Recall@K
-    recall = evaluate_recall(results, sample_qrels, k=TOP_K)
+    recall = evaluate_hit_k(results, sample_qrels, k=TOP_K)
     print(f"Ready Time (s): {t_ready:.2f}")
-    print(f"Recall@{TOP_K}: {recall:.4f}")
+    print(f"Hit@{TOP_K}: {recall:.4f}")
+    print(f"Recall@{TOP_K}: {macro_recall:.4f}")
