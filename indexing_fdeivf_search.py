@@ -140,7 +140,7 @@ def load_nanobeir_dataset(repo_id: str):
     return corpus, queries, qrels
 
 # === (NEW) Per-query Recall@K ===
-def per_query_recall_at_k(results: dict, qrels: dict, k: int) -> float:
+def per_query_recall_at_k(results: dict, qrels: dict, k: int) -> float:    
     recalls = {}
     for qid, ranked_docs in results.items():        
         rel = set(qrels.get(str(qid), {}).keys())
@@ -149,6 +149,11 @@ def per_query_recall_at_k(results: dict, qrels: dict, k: int) -> float:
         topk = list(ranked_docs.keys())[:k]
         hit_rel = rel.intersection(topk)
         recalls[qid] = len(hit_rel) / len(rel)
+        try:
+            with open(f"/home/dccvenus/muvera_3070/cache_muvera/per_query_{TOP_K}.tsv", "a", encoding="utf-8") as f:                
+                f.write(f"{qid}\t{recalls[qid]}\n")
+        except Exception as e:
+            logging.warning(f"Failed to write per-query row: {e}")
     return recalls
 
 # === (NEW) Per-query Recall@K ===
@@ -298,7 +303,7 @@ class ColbertFdeRetrieverNaive:
             logging.warning(f"[{self.__class__.__name__}] Failed to write latency header: {e}")
         
         # 헤더 기록 (이미 존재하면 이어쓰기), query 별 로깅 파일 생성
-        self._per_query_log_path = os.path.join(CACHE_ROOT, f"per_query.tsv") # os.path.join(self._cache_dir, "latency.tsv")
+        self._per_query_log_path = os.path.join(CACHE_ROOT, f"per_query_{TOP_K}.tsv") # os.path.join(self._cache_dir, "latency.tsv")
         try:
             with self._log_lock:                
                 if not os.path.exists(self._per_query_log_path):                    
