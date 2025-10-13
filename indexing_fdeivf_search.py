@@ -18,6 +18,7 @@ from typing import Optional, List, Tuple, Dict
 from queue import Queue
 from statistics import mean
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import islice
 
 import nltk
 import numpy as np
@@ -57,7 +58,7 @@ except Exception as _e:
 # ======================
 # --- Configuration ----
 # ======================
-DATASET_REPO_ID = "quora"
+DATASET_REPO_ID = "scidocs"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
 TOP_K = 40
 
@@ -103,7 +104,7 @@ else:
     DEVICE = "cpu"
 
 # 데이터셋 경로
-dataset = "quora"
+dataset = "scidocs"
 url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip"
 out_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "datasets")
 data_path = util.download_and_unzip(url, out_dir)
@@ -136,21 +137,32 @@ avg_dup_ratio_list = []
 def load_nanobeir_dataset(repo_id: str):
     logging.info(f"Loading dataset from local path (BEIR): '{repo_id}'...")
     corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split="test")
-    logging.info(f"Dataset loaded: {len(corpus)} documents, {len(queries)} queries.")
-    return corpus, queries, qrels
+    target_queries = dict(islice(queries.items(), TARGET_NUM_QUERIES))
+    logging.info(f"Dataset loaded: {len(corpus)} documents, {len(target_queries)} queries.")
+    return corpus, target_queries, qrels
 
 # === (NEW) Per-query Recall@K ===
 def per_query_recall_at_k(results: dict, qrels: dict, k: int) -> float:    
-    recalls = {}
-    for qid, ranked_docs in results.items():        
+    # recalls = {}
+    recalls: Dict[str, float] = {}
+    for qid, ranked_docs in results.items():
         rel = set(qrels.get(str(qid), {}).keys())
         if not rel:
             continue
-        topk = list(ranked_docs.keys())[:k]
-        hit_rel = rel.intersection(topk)
-        recalls[qid] = len(hit_rel) / len(rel)
+        
+        if isinstance(ranked_docs, OrderedDict):            
+            topk_ids = list(islice(ranked_docs.keys(), k))
+        else:
+            topk_ids = [doc for doc, _ in sorted(
+                ranked_docs.items(), key=lambda x: x[1], reverse=True)[:k]]
+        
+        # 3) recall 계산
+        hit_rel = rel.intersection(topk_ids)
+        recall = len(hit_rel) / len(rel)
+        recalls[qid] = recall        
+        
         try:
-            with open(f"/home/dccvenus/muvera_3070/cache_muvera/per_query_{TOP_K}.tsv", "a", encoding="utf-8") as f:                
+            with open(f"/home/dccbeta/muvera_optimized/cache_muvera/per_query_{TOP_K}.tsv", "a", encoding="utf-8") as f:                
                 f.write(f"{qid}\t{recalls[qid]}\n")
         except Exception as e:
             logging.warning(f"Failed to write per-query row: {e}")
@@ -1058,30 +1070,9 @@ if __name__ == "__main__":
     t_ready0 = time.perf_counter()
     retriever.index(corpus)
     t_ready = time.perf_counter() - t_ready0
-    logging.info(f"Retriever ready in {t_ready:.2f}s")
+    logging.info(f"Retriever ready in {t_ready:.2f}s")    
 
-    # 샘플링
-    def make_random_query_sample(orig_queries: Dict[str, str], n_target: int, seed: int = 42) -> Dict[str, str]:
-        rnd = random.Random(seed)
-        items = list(orig_queries.items())
-        m = len(items)
-        out: Dict[str, str] = {}
-        for i in range(n_target):
-            oid, otext = items[rnd.randrange(m)]
-            out[f"{oid}__rep{i}"] = otext
-        return out
-
-    def build_qrels_for_sample(orig_qrels: Dict[str, Dict[str, int]], sample_queries: Dict[str, str]) -> Dict[str, Dict[str, int]]:
-        new_qrels = {}
-        for new_qid in sample_queries.keys():
-            base = new_qid.split("__rep")[0] if "__rep" in new_qid else new_qid
-            if base in orig_qrels:
-                new_qrels[new_qid] = orig_qrels[base]
-        return new_qrels
-
-    sample_queries = make_random_query_sample(queries, TARGET_NUM_QUERIES, seed=RANDOM_SEED)
-    sample_qrels   = build_qrels_for_sample(qrels, sample_queries)
-    retriever.precompute_queries(sample_queries)
+    retriever.precompute_queries(queries)
 
     # 파이프 큐
     ann_in_q: Queue = Queue(maxsize=4096)
@@ -1104,7 +1095,7 @@ if __name__ == "__main__":
 
     # 프론트: 쿼리 주입
     q_start_times: Dict[str, float] = {}
-    for qid, qtext in sample_queries.items():
+    for qid, qtext in queries.items():
         q_start_times[qid] = time.perf_counter()
         ann_in_q.put(AnnItem(qid=qid, qtext=qtext, t_enqueue=q_start_times[qid]))
 
@@ -1119,7 +1110,7 @@ if __name__ == "__main__":
     # 성능 리포트
     print("\n" + "=" * 105)
     print(f"{'FINAL REPORT':^105}")
-    print(f"(Dataset: {DATASET_REPO_ID}, Queries: {len(sample_queries)} | "
+    print(f"(Dataset: {DATASET_REPO_ID}, Queries: {len(queries)} | "
           f"ANN_BATCH={ANN_BATCH_SIZE}, RERANK_BATCH_Q={RERANK_BATCH_QUERIES}, "
           f"TOPN={RERANK_TOPN}, TOTAL_TIME= {end_time:.2f}, MODE={BATCH_RERANK_MODE})")
     print("=" * 105)
@@ -1131,11 +1122,11 @@ if __name__ == "__main__":
         print(f"[Batch] Avg dup_ratio: {mean(avg_dup_ratio_list):.6f}")
     print("=" * 105)
 
-    per_q_recall = per_query_recall_at_k(results, sample_qrels, TOP_K)
+    per_q_recall = per_query_recall_at_k(results, qrels, TOP_K)
     macro_recall = sum(per_q_recall.values()) / len(per_q_recall)
 
     # Recall@K
-    recall = evaluate_hit_k(results, sample_qrels, k=TOP_K)
+    recall = evaluate_hit_k(results, qrels, k=TOP_K)
     print(f"Ready Time (s): {t_ready:.2f}")
     print(f"Hit@{TOP_K}: {recall:.4f}")
     print(f"Recall@{TOP_K}: {macro_recall:.4f}")
