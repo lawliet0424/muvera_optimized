@@ -31,7 +31,7 @@ from fde_generator_optimized_stream import (
 # ======================
 # --- Configuration ----
 # ======================
-DATASET_REPO_ID = "scidocs"
+DATASET_REPO_ID = "vihealthqa"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
 TOP_K = 10
 FILENAME = "main_0926"
@@ -48,7 +48,7 @@ CACHE_ROOT = os.path.join(pathlib.Path(__file__).parent.absolute(), "cache_muver
 os.makedirs(CACHE_ROOT, exist_ok=True)
 
 # 쿼리 검색 디렉터리
-dataset = "scidocs"
+dataset = "vihealthqa"
 QUERY_SEARCH_DIR = os.path.join(CACHE_ROOT, "query_search", DATASET_REPO_ID, FILENAME)
 os.makedirs(QUERY_SEARCH_DIR, exist_ok=True)
 

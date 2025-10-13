@@ -17,3 +17,4 @@
 [Statistic]
 e.g. 
 python3 muvera_statistic.py latency.tsv --columns Search Rerank --metrics mean p95 p99 --dataset scidocs --method main_weight
+
