@@ -8,9 +8,13 @@
     * 559 라인에서 IVF 파라미터 설정값을 변경할 수 있음, faiss_nlist를 1000이상으로 할 경우 시간이 오래걸리는데, index train할 떄 걸리는 것임. 왜 멀티스레드가 안되는지 모르겠음. 멀티 스레드가 된다면 개선 후 commit 바람
 
 (1009) New files
+    <br />
     * 1. FDE(query/document) 생성
+    <br />
     * 2. FDE를 IVFIP(Inner Product) 인덱싱
-위 2개의 프로세스를 자동화함. 자동화 프로세스에 요구되는 코드는 아래와 같음.
+    <br />
+    위 2개의 프로세스를 자동화함. 자동화 프로세스에 요구되는 코드는 아래와 같음.
+    <br />
     * run_all.sh (자동화 상위 프로그램, 여기서 num_simHashPartition 개수와 num_repetition 수를 설정함)
     <br />
     * run_fde_autopipeline.sh (build_fde.py, indexing_fdeivf_search.py에 넘기는 인자 설정)
