@@ -110,7 +110,7 @@ def parse_arguments():
   python3 flexible_statistic.py data.csv --columns Duration Latency --metrics mean median p95 p99
   python3 flexible_statistic.py data.csv --columns Score --metrics all
   python3 flexible_statistic.py data.csv --columns Duration --metrics mean p95 p99 --output results.csv
-  python3 flexible_statistic.py data.csv --columns Search Rerank --metrics mean p95 --dataset scidocs
+  python3 flexible_statistic.py data.csv --columns Search Rerank --metrics mean p95 --dataset 
         """
     )
     
