@@ -56,7 +56,7 @@ except Exception as _e:
 # ======================
 # --- Configuration ----
 # ======================
-DATASET_REPO_ID = "treccovid"
+DATASET_REPO_ID = "scidocs"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
 TOP_K = 10
 
@@ -96,14 +96,22 @@ else:
     DEVICE = "cpu"
 
 # 데이터셋 경로
-dataset = "trec-covid"
+dataset = "scidocs"
 url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip"
 out_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "datasets")
 data_path = util.download_and_unzip(url, out_dir)
 
+# [Original] 캐시 루트
+# CACHE_ROOT = os.path.join(pathlib.Path(__file__).parent.absolute(), "cache_muvera")
+#os.makedirs(CACHE_ROOT, exist_ok=True)
+
 # 캐시 루트
-CACHE_ROOT = os.path.join(pathlib.Path(__file__).parent.absolute(), "cache_muvera")
+FILENAME = "build_fdeivf_indexing"
+CACHE_ROOT = os.path.join(pathlib.Path(__file__).parent.absolute(), "cache_muvera", DATASET_REPO_ID, FILENAME)
 os.makedirs(CACHE_ROOT, exist_ok=True)
+
+QUERY_SEARCH_DIR = os.path.join(CACHE_ROOT, "query_search", FILENAME)
+os.makedirs(QUERY_SEARCH_DIR, exist_ok=True)
 
 # ======================
 # --- Logging Setup ----
@@ -243,7 +251,7 @@ class ColbertFdeRetrieverNaive:
             self._lru_cap = DOC_EMB_LRU_SIZE
 
     def _compute_cache_dir(self, dataset: str) -> str:
-        return os.path.join(CACHE_ROOT, dataset)
+        return os.path.join(CACHE_ROOT)
 
     def _set_faiss_threads(self):
         if not self.use_faiss_ann:
@@ -705,7 +713,7 @@ if __name__ == "__main__":
         rerank_candidates=RERANK_TOPN,
         enable_rerank=True,
         save_doc_embeds=True,
-        latency_log_path=os.path.join(CACHE_ROOT, "latency.tsv"),
+        latency_log_path=os.path.join(QUERY_SEARCH_DIR, "latency.tsv"),
         external_doc_embeds_dir=None,  # 있으면 경로 지정
         use_faiss_ann=True,
         faiss_nlist=FAISS_NLIST,
