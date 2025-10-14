@@ -60,7 +60,13 @@ except Exception as _e:
 # ======================
 DATASET_REPO_ID = "scidocs"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
-TOP_K = 40
+TOP_K = 100
+
+# 데이터셋 경로
+dataset = "scidocs" # fiqa, arguana, scidocs, treccovid, quora
+url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip"
+out_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "datasets")
+data_path = util.download_and_unzip(url, out_dir)
 
 # ----- Rerank 워커 개수 -----
 RERANK_WORKERS = 16  # 코어/메모리/I/O 상황에 맞춰 조정
@@ -70,21 +76,21 @@ TARGET_NUM_QUERIES = 100
 RANDOM_SEED = 42
 
 # ----- ANN 배치 (고정 크기) -----
-ANN_BATCH_SIZE = 4          # ← 100개 모이면 배치 검색 (지금은 16으로 운영)
+ANN_BATCH_SIZE = 1          # ← 100개 모이면 배치 검색 (지금은 16으로 운영)
 FAISS_NLIST = 1000
 FAISS_NPROBE = 50
-FAISS_CANDIDATES = 50        # over-fetch; rerank보다 크거나 같게 권장
+FAISS_CANDIDATES = 1000        # over-fetch; rerank보다 크거나 같게 권장
 FAISS_NUM_THREADS = 1         # OpenMP 스레드 수(권장: 1 또는 소수)
 
 # ----- Rerank 배치(나이브, 고정 크기) -----
-RERANK_BATCH_QUERIES = 4      # ← 100개 모이면 배치 시작(현 코드에서는 즉시 처리였음)
+RERANK_BATCH_QUERIES = 1      # ← 100개 모이면 배치 시작(현 코드에서는 즉시 처리였음)
 RERANK_TOPN = 50              # top-N만 재랭크 (나이브)
 
 # ====== Rerank Batch Mode Switches ======
 # 'immediate' : 쿼리 도착 즉시 Rerank (워커 병렬, mega GEMM)
 # 'batch'     : Rerank 작업을 BATCH_RERANK_SIZE 개 모아 한 번에 멀티스레드 나이브 rerank
 BATCH_RERANK_MODE = "batch"   # "immediate" or "batch"
-BATCH_RERANK_SIZE = 4        # 배치 모을 크기
+BATCH_RERANK_SIZE = 1        # 배치 모을 크기
 
 # ----- 캐시(기본 끔: 정말 나이브) -----
 ENABLE_DOC_EMB_LRU_CACHE = False
@@ -93,7 +99,7 @@ DOC_EMB_LRU_SIZE = 0          # 0이면 캐시 안씀
 # ----- FDE 설정(예: 1024 차원) -----
 FDE_DIM = 128
 FDE_NUM_REPETITIONS = 2
-FDE_NUM_SIMHASH = 3
+FDE_NUM_SIMHASH = 4
 
 # ----- 디바이스 -----
 if torch.cuda.is_available():
@@ -103,23 +109,9 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
 else:
     DEVICE = "cpu"
 
-# 데이터셋 경로
-dataset = "scidocs"
-url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip"
-out_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "datasets")
-data_path = util.download_and_unzip(url, out_dir)
-
-# [Original] 캐시 루트
-# CACHE_ROOT = os.path.join(pathlib.Path(__file__).parent.absolute(), "cache_muvera")
-#os.makedirs(CACHE_ROOT, exist_ok=True)
-
 # 캐시 루트
-FILENAME = "indexing_fdeivf_search"
-CACHE_ROOT = os.path.join(pathlib.Path(__file__).parent.absolute(), "cache_muvera", DATASET_REPO_ID)
+CACHE_ROOT = os.path.join(pathlib.Path(__file__).parent.absolute(), "cache_muvera")
 os.makedirs(CACHE_ROOT, exist_ok=True)
-
-QUERY_SEARCH_DIR = os.path.join(CACHE_ROOT, "query_search", FILENAME)
-os.makedirs(QUERY_SEARCH_DIR, exist_ok=True)
 
 # ======================
 # --- Logging Setup ----
@@ -142,44 +134,108 @@ avg_dup_ratio_list = []
 # ===========================
 # --- Helper Functions  -----
 # ===========================
+# def load_nanobeir_dataset(repo_id: str):
+#     logging.info(f"Loading dataset from local path (BEIR): '{repo_id}'...")
+#     corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split="test")
+#     target_queries = dict(islice(queries.items(), TARGET_NUM_QUERIES))
+#     logging.info(f"Dataset loaded: {len(corpus)} documents, {len(target_queries)} queries.")
+#     return corpus, target_queries, qrels
+
+import os, csv
+from itertools import islice
+from beir.datasets.data_loader import GenericDataLoader
+
 def load_nanobeir_dataset(repo_id: str):
     logging.info(f"Loading dataset from local path (BEIR): '{repo_id}'...")
-    corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split="test")
+    corpus, queries, _ = GenericDataLoader(data_folder=data_path).load(split="test")
     target_queries = dict(islice(queries.items(), TARGET_NUM_QUERIES))
-    logging.info(f"Dataset loaded: {len(corpus)} documents, {len(target_queries)} queries.")
-    return corpus, target_queries, qrels
+
+    # ---- qrels: test.tsv에서 score>0만 포함 ----
+    # 후보 경로: <data_path>/qrels/test.tsv 또는 <data_path>/test.tsv
+    candidates = [
+        os.path.join(data_path, "qrels", "test.tsv"),
+        os.path.join(data_path, "test.tsv"),
+    ]
+    qrels_pos = {}
+    tsv_path = next((p for p in candidates if os.path.exists(p)), None)
+
+    if tsv_path is None:
+        logging.warning("[qrels] test.tsv not found; falling back to BEIR loader qrels (may already be filtered).")
+        # BEIR 기본 qrels로 대체(이미 양성만 있을 가능성이 큼)
+        _, _, qrels_beir = GenericDataLoader(data_folder=data_path).load(split="test")
+        qrels_pos = qrels_beir
+    else:
+        with open(tsv_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            # 컬럼명 호환 처리
+            def _get(row, *keys):
+                for k in keys:
+                    if k in row:
+                        return row[k]
+                raise KeyError(f"Missing any of keys {keys} in row: {row}")
+
+            kept, skipped = 0, 0
+            for row in reader:
+                try:
+                    qid   = _get(row, "query-id", "qid", "query_id")
+                    docid = _get(row, "corpus-id", "docid", "doc_id")
+                    score = int(_get(row, "score", "label"))
+                except Exception as e:
+                    logging.warning(f"[qrels] skip malformed row: {e}")
+                    continue
+
+                if score > 0:
+                    qrels_pos.setdefault(str(qid), {})[str(docid)] = 1
+                    kept += 1
+                else:
+                    skipped += 1
+
+        logging.info(f"[qrels] loaded from {tsv_path}: kept positives={kept}, skipped non-positives={skipped}")
+
+    logging.info(f"Dataset loaded: {len(corpus)} documents, {len(target_queries)} queries, "
+                 f"{sum(len(v) for v in qrels_pos.values())} positive qrels.")
+    return corpus, target_queries, qrels_pos
 
 # === (NEW) Per-query Recall@K ===
-def per_query_recall_at_k(results: dict, qrels: dict, k: int) -> float:    
-    # recalls = {}
+def per_query_recall_at_k(results: dict, qrels: dict, k: int) -> Dict[str, float]:
     recalls: Dict[str, float] = {}
     for qid, ranked_docs in results.items():
         rel = set(qrels.get(str(qid), {}).keys())
         if not rel:
             continue
-        
-        if isinstance(ranked_docs, OrderedDict):            
-            topk_ids = list(islice(ranked_docs.keys(), k))
-        else:
-            topk_ids = [doc for doc, _ in sorted(
-                ranked_docs.items(), key=lambda x: x[1], reverse=True)[:k]]
-        
-        # 3) recall 계산
+        topk_ids = list(islice(ranked_docs.keys(), k)) if isinstance(ranked_docs, OrderedDict) \
+                   else [doc for doc, _ in sorted(ranked_docs.items(), key=lambda x: x[1], reverse=True)[:k]]
         hit_rel = rel.intersection(topk_ids)
-        recall = len(hit_rel) / len(rel)
-        recalls[qid] = recall        
-        
-        try:
-<<<<<<< HEAD
-            file_path = os.path.join(QUERY_SEARCH_DIR, f"per_query_{TOP_K}.tsv")
-            with open(file_path, "a", encoding="utf-8") as f:                
-=======
-            with open(f"/home/dccbeta/muvera_optimized/cache_muvera/per_query_{TOP_K}.tsv", "a", encoding="utf-8") as f:                
->>>>>>> upstream/master
-                f.write(f"{qid}\t{recalls[qid]}\n")
-        except Exception as e:
-            logging.warning(f"Failed to write per-query row: {e}")
+        recalls[qid] = len(hit_rel) / len(rel)
     return recalls
+
+# def per_query_recall_at_k(results: dict, qrels: dict, k: int) -> float:        
+#     recalls: Dict[str, float] = {}
+#     for qid, ranked_docs in results.items():
+#         rel = set(qrels.get(str(qid), {}).keys())
+        
+#         if not rel:
+#             continue
+
+#         topk = list(ranked_docs.keys())[:k]
+        
+#         # if isinstance(ranked_docs, OrderedDict):
+#         #     topk_ids = list(islice(ranked_docs.keys(), k))
+#         # else:
+#         #     topk_ids = [doc for doc, _ in sorted(
+#         #         ranked_docs.items(), key=lambda x: x[1], reverse=True)[:k]]
+        
+#         # 3) recall 계산
+#         hit_rel = rel.intersection(topk)
+#         recall = len(hit_rel) / len(rel)
+#         recalls[qid] = recall
+        
+#         try:
+#             with open(f"/home/dccbeta/muvera_optimized/cache_muvera/per_query_{TOP_K}.tsv", "a", encoding="utf-8") as f:                
+#                 f.write(f"{qid}\t{recalls[qid]}\n")
+#         except Exception as e:
+#             logging.warning(f"Failed to write per-query row: {e}")
+#     return recalls
 
 # === (NEW) Per-query Recall@K ===
 def evaluate_hit_k(results: dict, qrels: dict, k: int) -> float:
@@ -328,7 +384,7 @@ class ColbertFdeRetrieverNaive:
             logging.warning(f"[{self.__class__.__name__}] Failed to write latency header: {e}")
         
         # 헤더 기록 (이미 존재하면 이어쓰기), query 별 로깅 파일 생성
-        self._per_query_log_path = os.path.join(QUERY_SEARCH_DIR, f"per_query_{TOP_K}.tsv") # os.path.join(self._cache_dir, "latency.tsv")
+        self._per_query_log_path = os.path.join(CACHE_ROOT, f"per_query_{TOP_K}.tsv") # os.path.join(self._cache_dir, "latency.tsv")
         try:
             with self._log_lock:                
                 if not os.path.exists(self._per_query_log_path):                    
@@ -338,7 +394,7 @@ class ColbertFdeRetrieverNaive:
             logging.warning(f"[{self.__class__.__name__}] Failed to write per-query header: {e}")        
 
     def _compute_cache_dir(self, dataset: str) -> str:
-        return os.path.join(CACHE_ROOT)
+        return os.path.join(CACHE_ROOT, dataset)
 
     def _set_faiss_threads(self):
         if not self.use_faiss_ann:
@@ -376,7 +432,8 @@ class ColbertFdeRetrieverNaive:
     def _load_cache(self) -> bool:
         self.fde_index = joblib.load(self._fde_path)
         with open(self._ids_path, "r", encoding="utf-8") as f:
-            self.doc_ids = json.load(f)
+            # self.doc_ids = json.load(f)
+            self.doc_ids = [str(d) for d in json.load(f)]
         self._doc_pos = {d: i for i, d in enumerate(self.doc_ids)}
         logging.info(f"[{self.__class__.__name__}] Loaded FDE index cache: "
                      f"{self.fde_index.shape} for {len(self.doc_ids)} docs")
@@ -810,24 +867,6 @@ class RerankTask:
     ann_time_s: float
     enqueued_time_s: float
 
-def make_random_query_sample(orig_queries: Dict[str, str], n_target: int, seed: int = 42) -> Dict[str, str]:
-    rnd = random.Random(seed)
-    items = list(orig_queries.items())
-    m = len(items)
-    out: Dict[str, str] = {}
-    for i in range(n_target):
-        oid, otext = items[rnd.randrange(m)]
-        out[f"{oid}__rep{i}"] = otext
-    return out
-
-def build_qrels_for_sample(orig_qrels: Dict[str, Dict[str, int]], sample_queries: Dict[str, str]) -> Dict[str, Dict[str, int]]:
-    new_qrels = {}
-    for new_qid in sample_queries.keys():
-        base = new_qid.split("__rep")[0] if "__rep" in new_qid else new_qid
-        if base in orig_qrels:
-            new_qrels[new_qid] = orig_qrels[base]
-    return new_qrels
-
 # ---- ANN Aggregator (배치: batch_size 모이면 flush) ----
 def ann_aggregator_loop(retriever: ColbertFdeRetrieverNaive,
                         in_q: Queue, out_q: Queue,
@@ -1067,7 +1106,7 @@ if __name__ == "__main__":
         rerank_candidates=RERANK_TOPN,
         enable_rerank=True,
         save_doc_embeds=True,
-        latency_log_path=os.path.join(QUERY_SEARCH_DIR, "latency.tsv"),
+        latency_log_path=os.path.join(CACHE_ROOT, "latency.tsv"),
         external_doc_embeds_dir=None,  # 있으면 경로 지정
         use_faiss_ann=True,
         faiss_nlist=FAISS_NLIST,
@@ -1083,7 +1122,11 @@ if __name__ == "__main__":
     t_ready0 = time.perf_counter()
     retriever.index(corpus)
     t_ready = time.perf_counter() - t_ready0
-    logging.info(f"Retriever ready in {t_ready:.2f}s")    
+    logging.info(f"Retriever ready in {t_ready:.2f}s")
+
+    all_rel = {d for rels in qrels.values() for d in rels.keys()}
+    overlap = len(all_rel & set(retriever.doc_ids)) / max(1, len(all_rel))
+    print(f"[sanity] overlap with indexed doc_ids: {overlap*100:.2f}%")
 
     retriever.precompute_queries(queries)
 
