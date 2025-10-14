@@ -18,3 +18,13 @@
 e.g. 
 python3 muvera_statistic.py latency.tsv --columns Search Rerank --metrics mean p95 p99 --dataset scidocs --method main_weight
 
+[Notifications]
+(1009) New files
+* 1. FDE(query/document) 생성
+* 2. FDE를 IVFIP(Inner Product) 인덱싱
+위 2개의 프로세스를 자동화함. 자동화 프로세스에 요구되는 코드는 아래와 같음.
+* run_all.sh (자동화 상위 프로그램, 여기서 num_simHashPartition 개수와 num_repetition 수를 설정함)
+* run_fde_autopipeline.sh (build_fde.py, indexing_fdeivf_search.py에 넘기는 인자 설정)
+* build_fde.py: FDE 생성하는 코드
+* indexing_fdeivf_search.py: 기 만들어진 FDE를 이용하여 document IVF Indexing
+* output: fde_index_3_2.mmap(이 때, 3: num_simHashPartition, 2: num_repetition), fde_index_3_2.pkl, ivf1000_ip_3_2.faiss, meta_3_2.json) 

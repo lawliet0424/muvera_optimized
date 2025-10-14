@@ -25,7 +25,7 @@ from fde_generator_optimized_stream import (
 # ======================
 # --- Configuration ----
 # ======================
-DATASET_REPO_ID = "treccovid"
+DATASET_REPO_ID = "scidocs"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
 TOP_K = 10
 
@@ -37,14 +37,23 @@ else:
     DEVICE = "cpu"
 
 # 데이터셋 준비 (BEIR trec-covid)
-dataset = "trec-covid"
+dataset = "scidocs"
 url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip"
 out_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "datasets")
 data_path = util.download_and_unzip(url, out_dir)
 
+# [original] 캐시 루트
+# CACHE_ROOT = os.path.join(pathlib.Path(__file__).parent.absolute(), "cache_muvera")
+# os.makedirs(CACHE_ROOT, exist_ok=True)
+
 # 캐시 루트
-CACHE_ROOT = os.path.join(pathlib.Path(__file__).parent.absolute(), "cache_muvera")
+FILENAME = "build_fde"
+CACHE_ROOT = os.path.join(pathlib.Path(__file__).parent.absolute(), "cache_muvera", DATASET_REPO_ID)
 os.makedirs(CACHE_ROOT, exist_ok=True)
+
+# 쿼리 검색 디렉터리
+QUERY_SEARCH_DIR = os.path.join(CACHE_ROOT, "query_search", FILENAME)
+os.makedirs(QUERY_SEARCH_DIR, exist_ok=True)
 
 # ======================
 # --- Logging Setup ----
@@ -152,7 +161,7 @@ class ColbertFdeRetriever:
         raw = f"{dataset}|{model_key}|{cfg_str}"
         key = hashlib.md5(raw.encode()).hexdigest()[:10]
         dir_name = f"{dataset.replace('/', '_')}__{model_key}__{cfg_str}__{key}"
-        return os.path.join(CACHE_ROOT, dataset)
+        return os.path.join(CACHE_ROOT)
 
     def _query_key(self, query_text: str, query_id: Optional[str]) -> str:
         base = (query_id or "") + "||" + query_text
@@ -476,8 +485,8 @@ if __name__ == "__main__":
             rerank_candidates=100,
             enable_rerank=True,
             save_doc_embeds=True,
-            latency_log_path=os.path.join(CACHE_ROOT, "latency.tsv"),  # QID\tSearch\tRerank
-            external_doc_embeds_dir=f"/home/dccbeta/muvera_optimized/cache_muvera/{DATASET_REPO_ID}/doc_embeds",  # ★ 외부 임베딩 디렉터리 지정
+            latency_log_path=os.path.join(QUERY_SEARCH_DIR, "latency.tsv"),  # QID\tSearch\tRerank
+            external_doc_embeds_dir=f"/home/hyunji/Desktop/muvera_optimized/cache_muvera/{DATASET_REPO_ID}/doc_embeds",  # ★ 외부 임베딩 디렉터리 지정
         )
     }
 

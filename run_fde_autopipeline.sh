@@ -41,10 +41,10 @@ FDE_PKL="fde_index_${P}_${R}.pkl"
 FAISS_OUT="ivf${NLIST}_ip_${P}_${R}.faiss"
 
 echo "[pipeline] === STEP 1: Build FDE ===" # build_fde.py build_fdeivf_indexing.py
-python3 build_fde.py --p "${P}" --r "${R}" -o "${FDE_PKL}" ${FORCE}
+python3.10 build_fde.py --p "${P}" --r "${R}" -o "${FDE_PKL}" ${FORCE}
 
 echo "[pipeline] === STEP 2: Build FAISS IVF-IP ==="
-python3 indexing_fdeivf_search.py --p "${P}" --r "${R}" --nlist "${NLIST}" \
+python3.10 indexing_fdeivf_search.py --p "${P}" --r "${R}" --nlist "${NLIST}" \
   -i "${FDE_PKL}" -o "${FAISS_OUT}" ${FORCE}
 
 echo "[pipeline] DONE: ${FDE_PKL} -> ${FAISS_OUT}"
