@@ -340,20 +340,9 @@ class ColbertFdeRetriever:
         final_fde_dim_per_rep = num_partitions * (self.doc_config.projection_dimension or self.doc_config.dimension)
         final_fde_dim = self.doc_config.num_repetitions * final_fde_dim_per_rep
         
-        # PCA 적용 여부에 따른 최종 차원 결정
-        pca_model_path = os.path.join(self._cache_dir, "pca_model.pkl")
-        if os.path.exists(pca_model_path):
-            import joblib
-            pca = joblib.load(pca_model_path)
-            final_dim = pca.n_components_
-            logging.info(f"[Atomic Batch] Using PCA dimension: {final_fde_dim} -> {final_dim}")
-        else:
-            final_dim = final_fde_dim
-            logging.info(f"[Atomic Batch] Using original dimension: {final_dim}")
-        
         # FDE 인덱스 memmap 생성
         fde_index = np.memmap(fde_memmap_path, mode="w+", dtype=np.float32, 
-                             shape=(len(self.doc_ids), final_dim))
+                             shape=(len(self.doc_ids), final_fde_dim))
         
         # Atomic 배치 처리 (1000개 문서씩)
         atomic_batch_size = 1000  # 인코딩과 FDE 배치 크기 통일
@@ -409,17 +398,13 @@ class ColbertFdeRetriever:
                 flush_interval=atomic_batch_size  # atomic_batch_size 활용
             )
             
-            # Step 3: PCA 적용 (필요한 경우)
-            if os.path.exists(pca_model_path):
-                batch_fde = pca.transform(batch_fde)
-            
-            # Step 4: FDE 인덱스에 저장
+            # Step 3: FDE 인덱스에 저장
             fde_index[batch_start:batch_end] = batch_fde
             
-            # Step 5: 배치별 flush (즉시 디스크 저장)
+            # Step 4: 배치별 flush (즉시 디스크 저장)
             fde_index.flush()
             
-            # Step 6: 배치 완료 후 메모리 해제
+            # Step 5: 배치 완료 후 메모리 해제
             del batch_embeddings
             del batch_fde
             gc.collect()
