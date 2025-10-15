@@ -8,6 +8,7 @@ import nltk
 import numpy as np
 import torch
 import joblib
+import psutil
 
 import neural_cherche.models as neural_cherche_models
 import neural_cherche.rank as neural_cherche_rank
@@ -16,11 +17,21 @@ from beir import util
 from beir.datasets.data_loader import GenericDataLoader
 
 # FDE 구현 (업로드된 파일 사용)
-from fde_generator_optimized_stream import (
+from fde_generator_optimized_stream_weight import (
     FixedDimensionalEncodingConfig,
     generate_query_fde,
     generate_document_fde_batch,
 )
+
+# 메모리 사용량 확인 함수
+def log_memory_usage(stage: str):
+    """현재 메모리 사용량을 로깅"""
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    memory_mb = memory_info.rss / 1024 / 1024  # MB 단위
+    memory_gb = memory_mb / 1024  # GB 단위
+    logging.info(f"[MEMORY] {stage}: {memory_mb:.1f} MB ({memory_gb:.2f} GB)")
+    return memory_mb
 
 # ======================
 # --- Configuration ----
@@ -53,7 +64,7 @@ os.makedirs(CACHE_ROOT, exist_ok=True)
 
 # 쿼리 검색 디렉터리
 QUERY_SEARCH_DIR = os.path.join(CACHE_ROOT, "query_search", FILENAME)
-os.makedirs(QUERY_SEARCH_DIR, exist_ok=True)
+#os.makedirs(QUERY_SEARCH_DIR, exist_ok=True)
 
 # ======================
 # --- Logging Setup ----
@@ -323,6 +334,8 @@ class ColbertFdeRetriever:
         )
 
         # 2) 외부/내부에 없는 문서만 배치 인코딩
+        log_memory_usage("Before encoding")
+        
         if missing_doc_ids:
             to_encode_docs = [{"id": did, **corpus[did]} for did in missing_doc_ids]
             logging.info(f"[index] encoding {len(to_encode_docs)} documents that are missing from precomputed files...")
@@ -333,8 +346,18 @@ class ColbertFdeRetriever:
                 if self.save_doc_embeds:
                     np.save(self._doc_emb_path(did), arr)
 
+                # [1014] 사용한 원소 즉시 삭제
+                del encoded_map[did]
+            
+            # [1014] ---------- 인코딩 관련 메모리 해제 ----------
+            del to_encode_docs  # 인코딩용 문서 리스트 삭제
+            del encoded_map     # 인코딩 결과 딕셔너리 삭제
+            logging.info(f"[index] Freed encoding-related memory")
+            log_memory_usage("After encoding and cleanup")
+
         # 3) 리스트로 정렬
         doc_embeddings_list = [doc_embeddings_map[doc_id] for doc_id in self.doc_ids]
+        log_memory_usage("Before FDE generation")
 
         # ---------- FDE 인덱스 생성 ----------
         logging.info(f"[{self.__class__.__name__}] Generating FDEs from ColBERT embeddings in BATCH mode...")
@@ -345,9 +368,23 @@ class ColbertFdeRetriever:
             max_bytes_in_memory=2 * 1024**3,  # optional guard
             log_every=50000
         )# generate_document_fde_batch(doc_embeddings_list, self.doc_config)
+        log_memory_usage("After FDE generation")
+
+        #[1014] ---------- 메모리 해제 ----------
+        logging.info(f"[{self.__class__.__name__}] Freeing document embeddings from memory...")
+        del doc_embeddings_map  # 딕셔너리 삭제
+        del doc_embeddings_list  # 리스트 삭제
+        
+        # 가비지 컬렉션 강제 실행
+        import gc
+        gc.collect()
+        
+        logging.info(f"[{self.__class__.__name__}] Memory cleanup completed")
+        log_memory_usage("After memory cleanup")
 
         # 저장
         self._save_cache()
+        log_memory_usage("Index completed")
 
     def precompute_queries(self, queries: dict):
         missing = 0

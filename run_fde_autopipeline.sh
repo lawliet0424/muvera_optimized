@@ -44,7 +44,7 @@ echo "[pipeline] === STEP 1: Build FDE ===" # build_fde.py build_fdeivf_indexing
 python3.10 build_fde.py --p "${P}" --r "${R}" -o "${FDE_PKL}" ${FORCE}
 
 echo "[pipeline] === STEP 2: Build FAISS IVF-IP ==="
-python3.10 indexing_fdeivf_search.py --p "${P}" --r "${R}" --nlist "${NLIST}" \
+python3.10 indexing_fdeivf_naive_batching_annrerank.py --p "${P}" --r "${R}" --nlist "${NLIST}" \
   -i "${FDE_PKL}" -o "${FAISS_OUT}" ${FORCE}
 
 echo "[pipeline] DONE: ${FDE_PKL} -> ${FAISS_OUT}"

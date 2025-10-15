@@ -114,6 +114,7 @@ data_path = util.download_and_unzip(url, out_dir)
 #os.makedirs(CACHE_ROOT, exist_ok=True)
 
 # 캐시 루트
+BUILD_FDE_FILENAME = "build_fde"
 FILENAME = "indexing_fdeivf_search"
 CACHE_ROOT = os.path.join(pathlib.Path(__file__).parent.absolute(), "cache_muvera", DATASET_REPO_ID)
 os.makedirs(CACHE_ROOT, exist_ok=True)
@@ -170,12 +171,8 @@ def per_query_recall_at_k(results: dict, qrels: dict, k: int) -> float:
         recalls[qid] = recall        
         
         try:
-<<<<<<< HEAD
             file_path = os.path.join(QUERY_SEARCH_DIR, f"per_query_{TOP_K}.tsv")
             with open(file_path, "a", encoding="utf-8") as f:                
-=======
-            with open(f"/home/dccbeta/muvera_optimized/cache_muvera/per_query_{TOP_K}.tsv", "a", encoding="utf-8") as f:                
->>>>>>> upstream/master
                 f.write(f"{qid}\t{recalls[qid]}\n")
         except Exception as e:
             logging.warning(f"Failed to write per-query row: {e}")
