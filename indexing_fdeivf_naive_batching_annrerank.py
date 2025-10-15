@@ -110,8 +110,12 @@ else:
     DEVICE = "cpu"
 
 # 캐시 루트
-CACHE_ROOT = os.path.join(pathlib.Path(__file__).parent.absolute(), "cache_muvera")
+FILENAME = "indexing_fdeivf_naive_batching_annrerank"
+CACHE_ROOT = os.path.join(pathlib.Path(__file__).parent.absolute(), "cache_muvera", DATASET_REPO_ID)
 os.makedirs(CACHE_ROOT, exist_ok=True)
+
+QUERY_SEARCH_DIR = os.path.join(CACHE_ROOT, "query_search", FILENAME)
+os.makedirs(QUERY_SEARCH_DIR, exist_ok=True)
 
 # ======================
 # --- Logging Setup ----
@@ -207,6 +211,12 @@ def per_query_recall_at_k(results: dict, qrels: dict, k: int) -> Dict[str, float
                    else [doc for doc, _ in sorted(ranked_docs.items(), key=lambda x: x[1], reverse=True)[:k]]
         hit_rel = rel.intersection(topk_ids)
         recalls[qid] = len(hit_rel) / len(rel)
+
+        try:
+            with open(os.path.join(QUERY_SEARCH_DIR, f"per_query_{TOP_K}.tsv"), "a", encoding="utf-8") as f:                
+                f.write(f"{qid}\t{recalls[qid]}\n")
+        except Exception as e:
+            logging.warning(f"Failed to write per-query row: {e}")
     return recalls
 
 # def per_query_recall_at_k(results: dict, qrels: dict, k: int) -> float:        
@@ -359,7 +369,7 @@ class ColbertFdeRetrieverNaive:
         if self.save_doc_embeds:
             os.makedirs(self._doc_emb_dir, exist_ok=True)
 
-        self._latency_log_path = latency_log_path or os.path.join(self._cache_dir, "latency.tsv")
+        self._latency_log_path = latency_log_path or os.path.join(QUERY_SEARCH_DIR, "latency.tsv")
         self._log_lock = threading.Lock()
 
         # (선택) 작은 LRU 캐시 – 기본 비활성
@@ -384,7 +394,7 @@ class ColbertFdeRetrieverNaive:
             logging.warning(f"[{self.__class__.__name__}] Failed to write latency header: {e}")
         
         # 헤더 기록 (이미 존재하면 이어쓰기), query 별 로깅 파일 생성
-        self._per_query_log_path = os.path.join(CACHE_ROOT, f"per_query_{TOP_K}.tsv") # os.path.join(self._cache_dir, "latency.tsv")
+        self._per_query_log_path = os.path.join(QUERY_SEARCH_DIR, f"per_query_{TOP_K}.tsv") # os.path.join(self._cache_dir, "latency.tsv")
         try:
             with self._log_lock:                
                 if not os.path.exists(self._per_query_log_path):                    
@@ -394,7 +404,7 @@ class ColbertFdeRetrieverNaive:
             logging.warning(f"[{self.__class__.__name__}] Failed to write per-query header: {e}")        
 
     def _compute_cache_dir(self, dataset: str) -> str:
-        return os.path.join(CACHE_ROOT, dataset)
+        return os.path.join(CACHE_ROOT)
 
     def _set_faiss_threads(self):
         if not self.use_faiss_ann:
@@ -1106,7 +1116,7 @@ if __name__ == "__main__":
         rerank_candidates=RERANK_TOPN,
         enable_rerank=True,
         save_doc_embeds=True,
-        latency_log_path=os.path.join(CACHE_ROOT, "latency.tsv"),
+        latency_log_path=os.path.join(QUERY_SEARCH_DIR, "latency.tsv"),
         external_doc_embeds_dir=None,  # 있으면 경로 지정
         use_faiss_ann=True,
         faiss_nlist=FAISS_NLIST,
