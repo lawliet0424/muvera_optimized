@@ -260,7 +260,8 @@ def generate_document_fde_batch(
     max_bytes_in_memory: int = 2 * 1024**3,      # 2GB safety threshold
     log_every: int = 10000,                       # progress logging
     pca_components: Optional[int] = None,         # PCA 차원 축소 (None이면 축소 안함)
-    pca_model_path: Optional[str] = None          # PCA 모델 저장 경로
+    pca_model_path: Optional[str] = None,         # PCA 모델 저장 경로
+    flush_interval: int = 1000                    # 배치별 flush 간격
 ) -> np.ndarray:
     """
     Streaming implementation: no np.vstack; processes docs one by one.
@@ -450,6 +451,10 @@ def generate_document_fde_batch(
             # Write this doc's rep chunk
             out_fdes[d, rep_offset:rep_offset + final_fde_dim_per_rep] = rep_sum.reshape(-1)
 
+            # 배치별 flush (메모리 효율성)
+            if (d + 1) % flush_interval == 0 and memmap_used and hasattr(out_fdes, "flush"):
+                out_fdes.flush()
+
             if (d + 1) % log_every == 0:
                 logging.info(f"[FDE Batch] rep {rep_num} doc {d+1}/{num_docs} processed")
 
@@ -485,6 +490,11 @@ def generate_document_fde_batch(
         for d in range(num_docs):
             vec = out_fdes[d]  # 1D view
             final_out[d] = _apply_count_sketch_to_vector(vec, target_dim, config.seed)
+            
+            # 배치별 flush (메모리 효율성)
+            if (d + 1) % flush_interval == 0 and hasattr(final_out, "flush"):
+                final_out.flush()
+            
             if (d + 1) % log_every == 0:
                 logging.info(f"[FDE Batch] final-proj doc {d+1}/{num_docs}")
 
@@ -526,6 +536,10 @@ def generate_document_fde_batch(
                 compressed_batch = pca.transform(batch_data)
             
             pca_out[start_idx:end_idx] = compressed_batch
+            
+            # 배치별 flush (즉시 디스크 저장)
+            if hasattr(pca_out, "flush"):
+                pca_out.flush()
             
             if (end_idx) % log_every == 0:
                 logging.info(f"[FDE Batch] PCA processed {end_idx}/{num_docs} documents")

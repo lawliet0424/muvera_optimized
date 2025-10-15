@@ -16,6 +16,8 @@ import neural_cherche.rank as neural_cherche_rank
 from beir import util
 from beir.datasets.data_loader import GenericDataLoader
 
+import gc
+
 # FDE 구현 (업로드된 파일 사용)
 from fde_generator_optimized_stream_weight import (
     FixedDimensionalEncodingConfig,
@@ -304,81 +306,139 @@ class ColbertFdeRetriever:
         self._doc_pos = {d: i for i, d in enumerate(self.doc_ids)}
         documents_for_ranker = [{"id": doc_id, **corpus[doc_id]} for doc_id in self.doc_ids]
 
-        # ---------- 외부/내부 임베딩 로드 & 부족분만 인코딩 ----------
-        doc_embeddings_map = {}
+        # [1015]---------- 누락된 문서 ID만 수집 (메모리 효율적) ----------
         missing_doc_ids: List[str] = []
 
-        # 1) 외부/내부에서 가능한 만큼 채운다
+        # 1) 누락된 문서만 찾기 (임베딩 로드하지 않음)
         for doc_id in self.doc_ids:
             ext = self._external_doc_emb_path(doc_id)            
             if ext and os.path.exists(ext):
-                doc_embeddings_map[doc_id] = np.load(ext).astype(np.float32)                
-                # 필요 시 내부 캐시에도 채움
-                if self.save_doc_embeds:
-                    dst = self._doc_emb_path(doc_id)
-                    if not os.path.exists(dst):
-                        np.save(dst, doc_embeddings_map[doc_id])
+                # 외부에 있으면 스킵
                 continue
 
             # 내부 캐시 확인
             dst = self._doc_emb_path(doc_id)
-            if os.path.exists(dst): # shape(256, 128)
-                print(f"[inner shape]: {np.load(dst).shape}")
-                doc_embeddings_map[doc_id] = np.load(dst).astype(np.float32)
+            if os.path.exists(dst):
+                # 내부에 있으면 스킵
+                continue
             else:
                 missing_doc_ids.append(doc_id)
 
         logging.info(
-            f"[index] preloaded from external/internal: {len(doc_embeddings_map)} / {len(self.doc_ids)}, "
-            f"to-encode: {len(missing_doc_ids)}"
+            f"[index] missing documents to encode: {len(missing_doc_ids)} / {len(self.doc_ids)}"
         )
 
-        # 2) 외부/내부에 없는 문서만 배치 인코딩
-        log_memory_usage("Before encoding")
-        
+        # [1015] 2) Atomic 배치 처리: Encoding → FDE → Index 저장
+        log_memory_usage("Before atomic batch processing")
+
         if missing_doc_ids:
-            to_encode_docs = [{"id": did, **corpus[did]} for did in missing_doc_ids]
-            logging.info(f"[index] encoding {len(to_encode_docs)} documents that are missing from precomputed files...")
-            encoded_map = self.ranker.encode_documents(documents=to_encode_docs)
-            for did in missing_doc_ids:
-                arr = to_numpy(encoded_map[did])
-                doc_embeddings_map[did] = arr
-                if self.save_doc_embeds:
-                    np.save(self._doc_emb_path(did), arr)
-
-                # [1014] 사용한 원소 즉시 삭제
-                del encoded_map[did]
-            
-            # [1014] ---------- 인코딩 관련 메모리 해제 ----------
-            del to_encode_docs  # 인코딩용 문서 리스트 삭제
-            del encoded_map     # 인코딩 결과 딕셔너리 삭제
-            logging.info(f"[index] Freed encoding-related memory")
-            log_memory_usage("After encoding and cleanup")
-
-        # 3) 리스트로 정렬
-        doc_embeddings_list = [doc_embeddings_map[doc_id] for doc_id in self.doc_ids]
-        log_memory_usage("Before FDE generation")
-
-        # ---------- FDE 인덱스 생성 ----------
-        logging.info(f"[{self.__class__.__name__}] Generating FDEs from ColBERT embeddings in BATCH mode...")
-        self.fde_index = generate_document_fde_batch(
-            doc_embeddings_list,
-            self.doc_config,
-            memmap_path=os.path.join(self._cache_dir, f"fde_index_{P}_{R}.mmap"), # default_out = f"fde_index_{P}_{R}.pkl"
-            max_bytes_in_memory=2 * 1024**3,  # optional guard
-            log_every=50000
-        )# generate_document_fde_batch(doc_embeddings_list, self.doc_config)
-        log_memory_usage("After FDE generation")
-
-        #[1014] ---------- 메모리 해제 ----------
-        logging.info(f"[{self.__class__.__name__}] Freeing document embeddings from memory...")
-        del doc_embeddings_map  # 딕셔너리 삭제
-        del doc_embeddings_list  # 리스트 삭제
+            logging.info(f"[index] encoding {len(missing_doc_ids)} documents that are missing from precomputed files...")
         
-        # 가비지 컬렉션 강제 실행
-        import gc
+        # FDE 인덱스 초기화 (memmap으로)
+        fde_memmap_path = os.path.join(self._cache_dir, f"fde_index_{P}_{R}.mmap")
+        num_partitions = 2 ** self.doc_config.num_simhash_projections
+        final_fde_dim_per_rep = num_partitions * (self.doc_config.projection_dimension or self.doc_config.dimension)
+        final_fde_dim = self.doc_config.num_repetitions * final_fde_dim_per_rep
+        
+        # PCA 적용 여부에 따른 최종 차원 결정
+        pca_model_path = os.path.join(self._cache_dir, "pca_model.pkl")
+        if os.path.exists(pca_model_path):
+            import joblib
+            pca = joblib.load(pca_model_path)
+            final_dim = pca.n_components_
+            logging.info(f"[Atomic Batch] Using PCA dimension: {final_fde_dim} -> {final_dim}")
+        else:
+            final_dim = final_fde_dim
+            logging.info(f"[Atomic Batch] Using original dimension: {final_dim}")
+        
+        # FDE 인덱스 memmap 생성
+        fde_index = np.memmap(fde_memmap_path, mode="w+", dtype=np.float32, 
+                             shape=(len(self.doc_ids), final_dim))
+        
+        # Atomic 배치 처리 (1000개 문서씩)
+        atomic_batch_size = 1000  # 인코딩과 FDE 배치 크기 통일
+        logging.info(f"[{self.__class__.__name__}] Processing {len(self.doc_ids)} documents in atomic batches of {atomic_batch_size}...")
+        
+        for batch_start in range(0, len(self.doc_ids), atomic_batch_size):
+            batch_end = min(batch_start + atomic_batch_size, len(self.doc_ids))
+            batch_doc_ids = self.doc_ids[batch_start:batch_end]
+            
+            logging.info(f"[Atomic Batch] Processing batch {batch_start//atomic_batch_size + 1}/{(len(self.doc_ids) + atomic_batch_size - 1)//atomic_batch_size}: docs {batch_start}-{batch_end-1}")
+            
+            # Step 1: 배치용 임베딩 수집 (파일에서 직접 로드)
+            batch_embeddings = []
+            batch_missing_ids = []
+            
+            for doc_id in batch_doc_ids:
+                # 파일에서 직접 로드 (메모리 효율적)
+                ext = self._external_doc_emb_path(doc_id)
+                if ext and os.path.exists(ext):
+                    batch_embeddings.append(np.load(ext).astype(np.float32))
+                else:
+                    dst = self._doc_emb_path(doc_id)
+                    if os.path.exists(dst):
+                        batch_embeddings.append(np.load(dst).astype(np.float32))
+                    else:
+                        batch_missing_ids.append(doc_id)
+            
+            # 누락된 문서들 배치 인코딩
+            if batch_missing_ids:
+                logging.info(f"[Atomic Batch] Encoding {len(batch_missing_ids)} missing documents...")
+                to_encode_docs = [{"id": did, **corpus[did]} for did in batch_missing_ids]
+                encoded_map = self.ranker.encode_documents(documents=to_encode_docs)
+                
+                for did in batch_missing_ids:
+                    arr = to_numpy(encoded_map[did])
+                    batch_embeddings.append(arr)
+                    if self.save_doc_embeds:
+                        np.save(self._doc_emb_path(did), arr)
+                    del encoded_map[did]
+                    del arr
+                
+                del to_encode_docs
+                del encoded_map
+            
+            # Step 2: 배치 FDE 생성
+            logging.info(f"[Atomic Batch] Generating FDE for {len(batch_embeddings)} documents...")
+            batch_fde = generate_document_fde_batch(
+                batch_embeddings,
+                self.doc_config,
+                memmap_path=None,  # 메모리에서 직접 처리
+                max_bytes_in_memory=2 * 1024**3,
+                log_every=1000,
+                flush_interval=atomic_batch_size  # atomic_batch_size 활용
+            )
+            
+            # Step 3: PCA 적용 (필요한 경우)
+            if os.path.exists(pca_model_path):
+                batch_fde = pca.transform(batch_fde)
+            
+            # Step 4: FDE 인덱스에 저장
+            fde_index[batch_start:batch_end] = batch_fde
+            
+            # Step 5: 배치별 flush (즉시 디스크 저장)
+            fde_index.flush()
+            
+            # Step 6: 배치 완료 후 메모리 해제
+            del batch_embeddings
+            del batch_fde
+            gc.collect()
+            
+            log_memory_usage(f"After atomic batch {batch_start//atomic_batch_size + 1}")
+        
+        # FDE 인덱스 저장 및 참조 설정
+        fde_index.flush()
+        self.fde_index = fde_index
+        
+        # FDE 인덱스 참조 해제 (메모리 절약)
+        del fde_index
         gc.collect()
         
+        logging.info(f"[Atomic Batch] Completed processing {len(self.doc_ids)} documents")
+        logging.info(f"[Atomic Batch] FDE index saved to: {fde_memmap_path}")
+        log_memory_usage("After atomic batch processing")
+
+        #[1014] ---------- 메모리 해제 ----------
         logging.info(f"[{self.__class__.__name__}] Memory cleanup completed")
         log_memory_usage("After memory cleanup")
 
