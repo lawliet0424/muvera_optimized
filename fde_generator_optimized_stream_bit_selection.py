@@ -314,17 +314,15 @@ def generate_document_fde_batch(
     final_fde_dim = config.num_repetitions * final_fde_dim_per_rep
 
     #----------bit selection related ----------
-    # 구조화 저장을 위한 memmap dictionary (repetition 단위만)
-    simhash_memmaps = {}
+    # 통합 memmap 생성 (구조화 저장용)
+    structured_memmap = None
     if use_structured_storage:
-        logging.info("[FDE Batch] Creating structured memmap files...")
-        for rep in range(config.num_repetitions):
-            key = f"rep{rep}"
-            mmap_path = os.path.join(structured_output_dir, f"{key}.mmap")
-            simhash_memmaps[key] = np.memmap(
-                mmap_path, mode='w+', dtype=np.float32,
-                shape=(num_docs, final_fde_dim_per_rep)
-            )
+        logging.info("[FDE Batch] Creating unified structured memmap...")
+        structured_mmap_path = os.path.join(structured_output_dir, "fde_structured.mmap")
+        structured_memmap = np.memmap(
+            structured_mmap_path, mode='w+', dtype=np.float32,
+            shape=(num_docs, final_fde_dim)
+        )
         
         # Metadata 저장
         metadata = {
@@ -334,7 +332,8 @@ def generate_document_fde_batch(
             "dimension": config.dimension,
             "projection_dimension": projection_dim,
             "simhash_dim": num_partitions * projection_dim,
-            "num_partitions": num_partitions
+            "num_partitions": num_partitions,
+            "memmap_path": structured_mmap_path
         }
         with open(os.path.join(structured_output_dir, "metadata.json"), 'w') as f:
             json.dump(metadata, f, indent=2)
@@ -458,20 +457,18 @@ def generate_document_fde_batch(
             out_fdes[d, rep_offset:rep_offset + final_fde_dim_per_rep] = rep_sum.reshape(-1)
 
             #----------bit selection related ----------
-            # 구조화 저장 (repetition 단위)
-            if use_structured_storage:
-                key = f"rep{rep_num}"
-                simhash_memmaps[key][d] = rep_sum.reshape(-1)
+            # 통합 memmap에 저장
+            if use_structured_storage and structured_memmap is not None:
+                rep_offset = rep_num * final_fde_dim_per_rep
+                structured_memmap[d, rep_offset:rep_offset + final_fde_dim_per_rep] = rep_sum.reshape(-1)
             #---------------------------------------------------
 
             # 배치별 flush (메모리 효율성)
             if (d + 1) % flush_interval == 0:
                 if memmap_used and hasattr(out_fdes, "flush"):
                     out_fdes.flush()
-                if use_structured_storage:
-                    for mmap in simhash_memmaps.values():
-                        if hasattr(mmap, "flush"):
-                            mmap.flush()
+                if use_structured_storage and structured_memmap is not None:
+                    structured_memmap.flush()
 
             if (d + 1) % log_every == 0:
                 logging.info(f"[FDE Batch] rep {rep_num} doc {d+1}/{num_docs} processed")
@@ -479,10 +476,8 @@ def generate_document_fde_batch(
         # If using memmap, ensure dirty pages are flushed each repetition
         if memmap_used and hasattr(out_fdes, "flush"):
             out_fdes.flush()
-        if use_structured_storage:
-            for mmap in simhash_memmaps.values():
-                if hasattr(mmap, "flush"):
-                    mmap.flush()
+        if use_structured_storage and structured_memmap is not None:
+            structured_memmap.flush()
 
     # Final projection (count-sketch) if requested — done per-doc to stay streaming
     if config.final_projection_dimension and config.final_projection_dimension > 0:
@@ -520,20 +515,16 @@ def generate_document_fde_batch(
             if (d + 1) % flush_interval == 0:
                 if hasattr(final_out, "flush"):
                     final_out.flush()
-                if use_structured_storage:
-                    for mmap in simhash_memmaps.values():
-                        if hasattr(mmap, "flush"):
-                            mmap.flush()
+                if use_structured_storage and structured_memmap is not None:
+                    structured_memmap.flush()
             
             if (d + 1) % log_every == 0:
                 logging.info(f"[FDE Batch] final-proj doc {d+1}/{num_docs}")
 
         if hasattr(final_out, "flush"):
             final_out.flush()
-        if use_structured_storage:
-            for mmap in simhash_memmaps.values():
-                if hasattr(mmap, "flush"):
-                    mmap.flush()
+        if use_structured_storage and structured_memmap is not None:
+            structured_memmap.flush()
         out_fdes = final_out  # replace with final
 
     total_time = time.perf_counter() - batch_start_time
@@ -676,14 +667,14 @@ def load_structured_fde_index(
     bit_selection_metadata: dict = None
 ) -> np.ndarray:
     """
-    구조화된 simhash memmap 파일들에서 FDE 인덱스를 로드
+    통합된 memmap 파일에서 FDE 인덱스를 로드 (직접 memmap 반환)
     
     Args:
         structured_output_dir: 구조화된 출력 디렉토리
         bit_selection_metadata: bit selection metadata (선택사항)
     
     Returns:
-        fde_index: 통합된 FDE 인덱스
+        fde_index: memmap 또는 압축된 FDE 인덱스
     """
     # Metadata 로드
     metadata_path = os.path.join(structured_output_dir, "metadata.json")
@@ -696,25 +687,23 @@ def load_structured_fde_index(
     num_docs = metadata["num_docs"]
     num_repetitions = metadata["num_repetitions"]
     simhash_dim = metadata["simhash_dim"]
+    total_dim = num_repetitions * simhash_dim
     
-    # FDE 인덱스 초기화
-    fde_index = np.zeros((num_docs, num_repetitions * simhash_dim), dtype=np.float32)
+    # 통합 memmap 파일 로드
+    memmap_path = metadata.get("memmap_path", os.path.join(structured_output_dir, "fde_structured.mmap"))
     
-    # 각 repetition별로 로드
-    for rep in range(num_repetitions):
-        key = f"rep{rep}"
-        mmap_path = os.path.join(structured_output_dir, f"{key}.mmap")
-        
-        if os.path.exists(mmap_path):
-            rep_mmap = np.memmap(mmap_path, mode='r', dtype=np.float32, 
-                               shape=(num_docs, simhash_dim))
-            fde_index[:, rep * simhash_dim:(rep + 1) * simhash_dim] = rep_mmap
-        else:
-            logging.warning(f"Repetition {rep} memmap file not found: {mmap_path}")
+    if not os.path.exists(memmap_path):
+        raise FileNotFoundError(f"Structured memmap file not found: {memmap_path}")
+    
+    # 직접 memmap 반환 (메모리 복사 없음)
+    fde_index = np.memmap(memmap_path, mode='r', dtype=np.float32, 
+                         shape=(num_docs, total_dim))
     
     # Bit selection 적용 (선택사항)
     if bit_selection_metadata:
-        fde_index = apply_bit_selection_to_query(fde_index.T, bit_selection_metadata).T
+        # 압축된 결과를 RAM에 생성 (필요시)
+        compressed_fde = apply_bit_selection_to_query(fde_index.T, bit_selection_metadata).T
+        return compressed_fde
     
     return fde_index
 
