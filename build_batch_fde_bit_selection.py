@@ -466,7 +466,7 @@ class ColbertFdeRetriever:
                 memmap_path=None,  # 메모리에서 직접 처리
                 max_bytes_in_memory=2 * 1024**3,
                 log_every=ATOMIC_BATCH_SIZE,
-                flush_interval=atomic_batch_size  # atomic_batch_size 활용
+                flush_interval=ATOMIC_BATCH_SIZE,  # atomic_batch_size 활용
                 enable_bit_selection=self.enable_bit_selection,
                 bit_selection_ratio=self.bit_selection_ratio,
                 structured_output_dir=self._cache_dir,
