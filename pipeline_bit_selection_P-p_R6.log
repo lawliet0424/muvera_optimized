@@ -1,0 +1,6 @@
+[pipeline] === STEP 1: Build FDE ===
+2025-10-16 17:23:19,931 - INFO - Using device: cuda
+usage: build_batch_fde.py [-h] --num_simhash_projections
+                          NUM_SIMHASH_PROJECTIONS --num_repetitions
+                          NUM_REPETITIONS [--output OUTPUT] [--force]
+build_batch_fde.py: error: argument --num_simhash_projections/--p: expected one argument

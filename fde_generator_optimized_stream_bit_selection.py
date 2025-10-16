@@ -824,3 +824,59 @@ if __name__ == "__main__":
     print(f"Correct vs Wrong method match: {np.allclose(compressed_query_fde, wrong_compressed_query)}")
     
     print("\nBit selection test completed successfully.")
+
+
+def apply_bit_selection_to_documents(
+    fde_batch: np.ndarray, 
+    selected_bits: np.ndarray, 
+    config: FixedDimensionalEncodingConfig
+) -> np.ndarray:
+    """
+    배치 FDE에 대해 simhash별로 독립적인 bit selection을 적용하여 압축된 FDE를 생성
+    
+    Args:
+        fde_batch: 배치 FDE (num_docs, original_dim)
+        selected_bits: 선택된 bit indices (per repetition)
+        config: FDE 설정
+    
+    Returns:
+        compressed_fde: 압축된 FDE (num_docs, compressed_dim)
+    """
+    if fde_batch.ndim != 2:
+        raise ValueError(f"Expected 2D array, got {fde_batch.ndim}D")
+    
+    num_docs, original_dim = fde_batch.shape
+    num_repetitions = config.num_repetitions
+    num_partitions = 2 ** config.num_simhash_projections
+    dim_per_rep = config.dimension
+    
+    # 각 repetition unit의 차원 계산
+    rep_dim = num_partitions * dim_per_rep
+    
+    # 압축된 차원 계산 (각 repetition마다 독립적으로 bit selection)
+    compressed_rep_dim = len(selected_bits) // num_repetitions
+    compressed_dim = num_repetitions * compressed_rep_dim
+    
+    # 결과 배열 초기화
+    compressed_fde = np.zeros((num_docs, compressed_dim), dtype=fde_batch.dtype)
+    
+    # 각 repetition unit별로 독립적으로 bit selection 적용
+    for rep_idx in range(num_repetitions):
+        start_idx = rep_idx * rep_dim
+        end_idx = start_idx + rep_dim
+        
+        # 현재 repetition의 FDE 추출
+        rep_fde = fde_batch[:, start_idx:end_idx]
+        
+        # 현재 repetition에 해당하는 selected bits 추출
+        rep_selected_bits = selected_bits[rep_idx * compressed_rep_dim:(rep_idx + 1) * compressed_rep_dim]
+        
+        # 현재 repetition에 bit selection 적용
+        compressed_rep_fde = rep_fde[:, rep_selected_bits]
+        
+        # 결과에 저장
+        compressed_start_idx = rep_idx * compressed_rep_dim
+        compressed_end_idx = compressed_start_idx + compressed_rep_dim
+        compressed_fde[:, compressed_start_idx:compressed_end_idx] = compressed_rep_fde
+    
+    return compressed_fde

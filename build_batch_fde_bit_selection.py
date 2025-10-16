@@ -406,13 +406,10 @@ class ColbertFdeRetriever:
         fde_index = np.memmap(fde_memmap_path, mode="w+", dtype=np.float32, 
                              shape=(len(self.doc_ids), final_fde_dim))
         
-        # Bit selection용 압축된 FDE 인덱스 초기화
+        # Bit selection용 변수 초기화
         compressed_fde_index = None
-        if self.enable_bit_selection:
-            compressed_memmap_path = os.path.join(self._cache_dir, f"compressed_fde_index_{P}_{R}.mmap")
-            # 첫 번째 배치에서만 압축된 차원을 알 수 있으므로, 임시로 원본 크기로 초기화
-            compressed_fde_index = np.memmap(compressed_memmap_path, mode="w+", dtype=np.float32, 
-                                           shape=(len(self.doc_ids), final_fde_dim))
+        selected_bits = None
+        bit_selection_metadata = None
         
         # Atomic 배치 처리 (1000개 문서씩)
         atomic_batch_size = ATOMIC_BATCH_SIZE  # 인코딩과 FDE 배치 크기 통일
@@ -472,39 +469,48 @@ class ColbertFdeRetriever:
                 structured_output_dir=self._cache_dir,
             )
 
-            #--------- bit selection related ----------
-            # Bit selection 결과 로드 (첫 번째 배치에서만)
-            if self.enable_bit_selection and batch_start == 0:
-                bits_path = os.path.join(self._cache_dir, "selected_bits.npy")
-                metadata_path = os.path.join(self._cache_dir, "bit_selection_metadata.json")
-                
-                if os.path.exists(bits_path):
-                    self.selected_bits = np.load(bits_path)
-                    logging.info(f"[Index] Loaded selected bits: {len(self.selected_bits)}")
-                
-                if os.path.exists(metadata_path):
-                    with open(metadata_path, 'r') as f:
-                        self.bit_selection_metadata = json.load(f)
-                    logging.info(f"[Index] Loaded bit selection metadata: "
-                               f"{self.bit_selection_metadata['total_original_dim']} → "
-                               f"{self.bit_selection_metadata['total_compressed_dim']} "
-                               f"({self.bit_selection_metadata['compression_ratio']*100:.1f}%)")
+            # Step 3: FDE 인덱스에 저장 및 Bit selection 적용
+            if self.enable_bit_selection:
+                if batch_start == 0:
+                    # 첫 번째 배치: bit selection 수행
+                    logging.info(f"[Index] First batch: applying bit selection...")
+                    from fde_generator_optimized_stream_bit_selection import _simhash_bit_selection_internal
                     
-                    # 압축된 FDE 인덱스 재생성
-                    compressed_dim = self.bit_selection_metadata['total_compressed_dim']
+                    selected_bits, compressed_fde, bit_selection_metadata = _simhash_bit_selection_internal(
+                        batch_fde, self.doc_config, self.bit_selection_ratio
+                    )
+                    
+                    # 압축된 FDE 인덱스 생성
                     compressed_memmap_path = os.path.join(self._cache_dir, f"compressed_fde_index_{P}_{R}.mmap")
                     compressed_fde_index = np.memmap(compressed_memmap_path, mode="w+", dtype=np.float32, 
-                                                   shape=(len(self.doc_ids), compressed_dim))
-                    logging.info(f"[Index] Created compressed FDE index: {compressed_fde_index.shape}")
-            #---------------------------------------------------
-
-            # Step 3: FDE 인덱스에 저장
-            # Bit selection이 적용된 경우, 압축된 FDE를 저장
-            if self.enable_bit_selection and hasattr(self, 'selected_bits') and self.selected_bits is not None:
-                # 압축된 FDE를 압축된 인덱스에 저장
-                compressed_fde_index[batch_start:batch_end] = batch_fde
+                                                   shape=(len(self.doc_ids), compressed_fde.shape[1]))
+                    
+                    # 첫 번째 배치의 압축된 FDE 저장
+                    compressed_fde_index[batch_start:batch_end] = compressed_fde
+                    
+                    # Bit selection 메타데이터 저장
+                    bits_path = os.path.join(self._cache_dir, "selected_bits.npy")
+                    metadata_path = os.path.join(self._cache_dir, "bit_selection_metadata.json")
+                    
+                    np.save(bits_path, selected_bits)
+                    with open(metadata_path, 'w') as f:
+                        json.dump(bit_selection_metadata, f, indent=2)
+                    
+                    logging.info(f"[Index] Bit selection applied: {bit_selection_metadata['total_original_dim']} → {bit_selection_metadata['total_compressed_dim']} ({bit_selection_metadata['compression_ratio']*100:.1f}%)")
+                else:
+                    # 나머지 배치: 첫 번째 배치의 bit selection 결과 적용
+                    if selected_bits is not None:
+                        from fde_generator_optimized_stream_bit_selection import apply_bit_selection_to_documents
+                        compressed_batch_fde = apply_bit_selection_to_documents(batch_fde, selected_bits, self.doc_config)
+                        compressed_fde_index[batch_start:batch_end] = compressed_batch_fde
+                    else:
+                        logging.warning(f"[Index] No bit selection metadata available for batch {batch_start//atomic_batch_size + 1}")
+                        compressed_fde_index[batch_start:batch_end] = batch_fde
+                
+                # 원본 FDE도 저장 (호환성을 위해)
+                fde_index[batch_start:batch_end] = batch_fde
             else:
-                # 원본 FDE를 원본 인덱스에 저장
+                # Bit selection 비활성화: 원본 FDE만 저장
                 fde_index[batch_start:batch_end] = batch_fde
             
             # Step 4: 배치별 flush (즉시 디스크 저장)
@@ -523,8 +529,13 @@ class ColbertFdeRetriever:
         fde_index.flush()
         if compressed_fde_index is not None:
             compressed_fde_index.flush()
-            self.fde_index = compressed_fde_index  # 압축된 인덱스 사용
+        
+        # FDE 인덱스 참조 설정
+        if self.enable_bit_selection and compressed_fde_index is not None:
+            self.fde_index = compressed_fde_index
+            self.bit_selection_metadata = bit_selection_metadata
             logging.info(f"[Index] Using compressed FDE index: {compressed_fde_index.shape}")
+            logging.info(f"[Index] Bit selection applied: {bit_selection_metadata['total_original_dim']} → {bit_selection_metadata['total_compressed_dim']} ({bit_selection_metadata['compression_ratio']*100:.1f}%)")
         else:
             self.fde_index = fde_index  # 원본 인덱스 사용
             logging.info(f"[Index] Using original FDE index: {fde_index.shape}")

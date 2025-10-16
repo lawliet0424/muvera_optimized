@@ -48,10 +48,10 @@ FDE_PKL="fde_index_${P}_${R}.pkl"
 FAISS_OUT="ivf${NLIST}_ip_${P}_${R}.faiss"
 
 echo "[pipeline] === STEP 1: Build FDE ===" # build_fde.py build_fdeivf_indexing.py
-python3.10 build_batch_fde.py --p "${P}" --r "${R}" -o "${FDE_PKL}" ${FORCE} ${ENABLE_BIT_SELECTION} ${BIT_SELECTION_RATIO} ${STRUCTURED_OUTPUT_DIR}
+python3.10 build_batch_fde_bit_selection.py --num_simhash_projections "${P}" --num_repetitions "${R}" -o "${FDE_PKL}" ${FORCE} ${ENABLE_BIT_SELECTION} ${BIT_SELECTION_RATIO} ${STRUCTURED_OUTPUT_DIR}
 
 echo "[pipeline] === STEP 2: Build FAISS IVF-IP ==="
-python3.10 indexing_fdeivf_naive_batching_annrerank.py --p "${P}" --r "${R}" --nlist "${NLIST}" \
+python3.10 indexing_fdeivf_naive_batching_annrerank_bit_selection.py --p "${P}" --r "${R}" --nlist "${NLIST}" \
   -i "${FDE_PKL}" -o "${FAISS_OUT}" ${FORCE}
 
 echo "[pipeline] DONE: ${FDE_PKL} -> ${FAISS_OUT}"
