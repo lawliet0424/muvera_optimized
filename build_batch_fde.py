@@ -346,13 +346,13 @@ class ColbertFdeRetriever:
         
         # Atomic 배치 처리 (1000개 문서씩)
         atomic_batch_size = 1000  # 인코딩과 FDE 배치 크기 통일
-        logging.info(f"[{self.__class__.__name__}] Processing {len(self.doc_ids)} documents in atomic batches of {atomic_batch_size}...")
+        logging.info(f"[{self.__class__.__name__}] Processing {len(missing_doc_ids)} documents in atomic batches of {atomic_batch_size}...")
         
-        for batch_start in range(0, len(self.doc_ids), atomic_batch_size):
-            batch_end = min(batch_start + atomic_batch_size, len(self.doc_ids))
-            batch_doc_ids = self.doc_ids[batch_start:batch_end]
+        for batch_start in range(0, len(missing_doc_ids), atomic_batch_size):
+            batch_end = min(batch_start + atomic_batch_size, len(missing_doc_ids))
+            batch_doc_ids = missing_doc_ids[batch_start:batch_end]
             
-            logging.info(f"[Atomic Batch] Processing batch {batch_start//atomic_batch_size + 1}/{(len(self.doc_ids) + atomic_batch_size - 1)//atomic_batch_size}: docs {batch_start}-{batch_end-1}")
+            logging.info(f"[Atomic Batch] Processing batch {batch_start//atomic_batch_size + 1}/{(len(missing_doc_ids) + atomic_batch_size - 1)//atomic_batch_size}: docs {batch_start}-{batch_end-1}")
             
             # Step 1: 배치용 임베딩 수집 (파일에서 직접 로드)
             batch_embeddings = []
