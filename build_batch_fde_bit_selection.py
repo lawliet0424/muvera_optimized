@@ -402,14 +402,16 @@ class ColbertFdeRetriever:
         final_fde_dim_per_rep = num_partitions * (self.doc_config.projection_dimension or self.doc_config.dimension)
         final_fde_dim = self.doc_config.num_repetitions * final_fde_dim_per_rep
         
-        # FDE 인덱스 memmap 생성
-        fde_index = np.memmap(fde_memmap_path, mode="w+", dtype=np.float32, 
-                             shape=(len(self.doc_ids), final_fde_dim))
-        
         # Bit selection용 변수 초기화
+        fde_index = None
         compressed_fde_index = None
         selected_bits = None
         bit_selection_metadata = None
+        
+        # FDE 인덱스 memmap 생성 (bit selection 비활성화시에만)
+        if not self.enable_bit_selection:
+            fde_index = np.memmap(fde_memmap_path, mode="w+", dtype=np.float32, 
+                                 shape=(len(self.doc_ids), final_fde_dim))
         
         # Atomic 배치 처리 (1000개 문서씩)
         atomic_batch_size = ATOMIC_BATCH_SIZE  # 인코딩과 FDE 배치 크기 통일
@@ -467,6 +469,7 @@ class ColbertFdeRetriever:
                 enable_bit_selection=self.enable_bit_selection,
                 bit_selection_ratio=self.bit_selection_ratio,
                 structured_output_dir=self._cache_dir,
+                is_first_batch=(batch_start == 0),
             )
 
             # Step 3: FDE 인덱스에 저장 및 Bit selection 적용
@@ -507,14 +510,14 @@ class ColbertFdeRetriever:
                         logging.warning(f"[Index] No bit selection metadata available for batch {batch_start//atomic_batch_size + 1}")
                         compressed_fde_index[batch_start:batch_end] = batch_fde
                 
-                # 원본 FDE도 저장 (호환성을 위해)
-                fde_index[batch_start:batch_end] = batch_fde
+                # 압축된 FDE만 사용하므로 원본 FDE 저장 생략
             else:
                 # Bit selection 비활성화: 원본 FDE만 저장
                 fde_index[batch_start:batch_end] = batch_fde
             
             # Step 4: 배치별 flush (즉시 디스크 저장)
-            fde_index.flush()
+            if fde_index is not None:
+                fde_index.flush()
             if compressed_fde_index is not None:
                 compressed_fde_index.flush()
             
@@ -526,7 +529,8 @@ class ColbertFdeRetriever:
             log_memory_usage(f"After atomic batch {batch_start//atomic_batch_size + 1}")
         
         # FDE 인덱스 저장 및 참조 설정
-        fde_index.flush()
+        if fde_index is not None:
+            fde_index.flush()
         if compressed_fde_index is not None:
             compressed_fde_index.flush()
         
@@ -541,7 +545,8 @@ class ColbertFdeRetriever:
             logging.info(f"[Index] Using original FDE index: {fde_index.shape}")
         
         # FDE 인덱스 참조 해제 (메모리 절약)
-        del fde_index
+        if fde_index is not None:
+            del fde_index
         if compressed_fde_index is not None:
             del compressed_fde_index
         gc.collect()
