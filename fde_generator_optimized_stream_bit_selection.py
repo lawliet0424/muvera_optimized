@@ -263,7 +263,8 @@ def generate_document_fde_batch(
     #----------bit selection related parameters----------
     structured_output_dir: Optional[str] = None,  # 구조화된 출력 디렉토리
     enable_bit_selection: bool = False,            # 비트 선택 사용 여부
-    bit_selection_ratio: float = 0.5               # 비트 선택 비율
+    bit_selection_ratio: float = 0.5,              # 비트 선택 비율
+    is_first_batch: bool = False                   # 첫 번째 배치 여부
     #---------------------------------------------------
 ) -> np.ndarray:
     """
@@ -532,8 +533,8 @@ def generate_document_fde_batch(
     logging.info(f"[FDE Batch] Output shape: {out_fdes.shape}")
 
     #--------- bit selection related ----------
-    # Bit selection
-    if enable_bit_selection:
+    # Bit selection (첫 번째 배치에서만 수행)
+    if enable_bit_selection and is_first_batch:
         logging.info(f"[FDE Batch] Applying SimHash-aware bit selection (ratio={bit_selection_ratio})")
         selected_bits, out_fdes, bit_selection_metadata = _simhash_bit_selection_internal(
             out_fdes, config, bit_selection_ratio
@@ -850,8 +851,8 @@ def apply_bit_selection_to_documents(
     num_partitions = 2 ** config.num_simhash_projections
     dim_per_rep = config.dimension
     
-    # 각 repetition unit의 차원 계산
-    rep_dim = num_partitions * dim_per_rep
+    # 각 repetition unit의 차원 계산 (실제 FDE 차원 사용)
+    rep_dim = original_dim // num_repetitions
     
     # 압축된 차원 계산 (각 repetition마다 독립적으로 bit selection)
     compressed_rep_dim = len(selected_bits) // num_repetitions
@@ -868,8 +869,8 @@ def apply_bit_selection_to_documents(
         # 현재 repetition의 FDE 추출
         rep_fde = fde_batch[:, start_idx:end_idx]
         
-        # 현재 repetition에 해당하는 selected bits 추출
-        rep_selected_bits = selected_bits[rep_idx * compressed_rep_dim:(rep_idx + 1) * compressed_rep_dim]
+        # 현재 repetition에 해당하는 selected bits 추출 (전체 인덱스에서 repetition 범위로 변환)
+        rep_selected_bits = selected_bits[rep_idx * compressed_rep_dim:(rep_idx + 1) * compressed_rep_dim] - start_idx
         
         # 현재 repetition에 bit selection 적용
         compressed_rep_fde = rep_fde[:, rep_selected_bits]
