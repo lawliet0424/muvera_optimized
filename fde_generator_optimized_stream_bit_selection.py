@@ -4,7 +4,7 @@ import time, pathlib, os, json
 import numpy as np
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from joblib import Parallel, delayed  # pip install joblib
 from sklearn.decomposition import PCA  # pip install scikit-learn
 
@@ -259,7 +259,7 @@ def generate_document_fde_batch(
     memmap_path: Optional[str] = None,           # e.g., "/path/to/fde_index.mmap"
     max_bytes_in_memory: int = 2 * 1024**3,      # 2GB safety threshold
     log_every: int = 10000,                       # progress logging
-    flush_interval: int = 1000                    # 배치별 flush 간격
+    flush_interval: int = 1000,                    # 배치별 flush 간격
     #----------bit selection related parameters----------
     structured_output_dir: Optional[str] = None,  # 구조화된 출력 디렉토리
     enable_bit_selection: bool = False,            # 비트 선택 사용 여부
