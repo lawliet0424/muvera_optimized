@@ -3,3 +3,4 @@ datasets/
 models--raphaelsty--neural-cherche-colbert/
 __pycache__/
 .locks/
+*.log
