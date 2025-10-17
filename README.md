@@ -28,3 +28,8 @@ python3 muvera_statistic.py latency.tsv --columns Search Rerank --metrics mean p
 * build_fde.py: FDE 생성하는 코드
 * indexing_fdeivf_search.py: 기 만들어진 FDE를 이용하여 document IVF Indexing
 * output: fde_index_3_2.mmap(이 때, 3: num_simHashPartition, 2: num_repetition), fde_index_3_2.pkl, ivf1000_ip_3_2.faiss, meta_3_2.json) 
+
+(10/17) New File [Batch 단위로, Encoding -> FDE 생성 -> FDE 인덱스 flush]
+* 1. build_batch_fde.py : 44 line에 있는 ATOMIC_BATCH_SIZE = 1000에 의해 문서 1000개 단위로 처리
+위의 수정에 따라 요구되는 코드 수정
+* run_fde_autopipeline.sh의 (index build)에 있는 파일 이름 변경 [build_fde.py -> build_batch_fde.py]
