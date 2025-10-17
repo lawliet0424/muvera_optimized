@@ -33,3 +33,11 @@ python3 muvera_statistic.py latency.tsv --columns Search Rerank --metrics mean p
 * 1. build_batch_fde.py : 44 line에 있는 ATOMIC_BATCH_SIZE = 1000에 의해 문서 1000개 단위로 처리
 위의 수정에 따라 요구되는 코드 수정
 * run_fde_autopipeline.sh의 (index build)에 있는 파일 이름 변경 [build_fde.py -> build_batch_fde.py]
+
+(1017) nDCG@K metrics, make brute-force sets for achieving more accurate results.
+    <br />
+    * Brute-force sets based recall/nDCG@K metric 구하기
+    <br />
+      - 한 번이라도, top-k에 대한 정답셋 파일을 생성했으면, 다음에 같은 실험을 할 때 이미 만든 정답셋을 활용하여 metric을 계산함. 데이터셋을 바꾸고 싶을 때는 DATASET_REPO_ID과 dataset 변수를 바꿔주면 됨.
+    <br />
+      - repeated_baseline.sh: rerank candidate 수를 다르게 하면서 반복실험. 이 파일을 내가 타겟하는 문제를 쉽게 보기 위해 만든 거라 참고만 하면됨(편의용).
