@@ -19,7 +19,7 @@ from beir.datasets.data_loader import GenericDataLoader
 import gc
 
 # FDE 구현 (업로드된 파일 사용)
-from fde_generator_optimized_stream_simhash_check import (
+from fde_generator_optimized_stream_weight import (
     FixedDimensionalEncodingConfig,
     generate_query_fde,
     generate_document_fde_batch,
@@ -390,7 +390,7 @@ class ColbertFdeRetriever:
             
             # Step 2: 배치 FDE 생성
             logging.info(f"[Atomic Batch] Generating FDE for {len(batch_embeddings)} documents...")
-            batch_fde, partition_counter = generate_document_fde_batch(
+            batch_fde = generate_document_fde_batch(
                 batch_embeddings,
                 self.doc_config,
                 memmap_path=None,  # 메모리에서 직접 처리
