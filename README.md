@@ -31,8 +31,10 @@ python3 muvera_statistic.py latency.tsv --columns Search Rerank --metrics mean p
 
 (10/17) New File [Batch 단위로, Encoding -> FDE 생성 -> FDE 인덱스 flush]
 * 1. build_batch_fde.py : 44 line에 있는 ATOMIC_BATCH_SIZE = 1000에 의해 문서 1000개 단위로 처리
+* 2. build_batch_fde.py : 22 line에 있는 FDE 함수 import문 속 파일 이름 변경
 위의 수정에 따라 요구되는 코드 수정
 * run_fde_autopipeline.sh의 (index build)에 있는 파일 이름 변경 [build_fde.py -> build_batch_fde.py]
+* build_batch_fde.py의 22 line에 있는 import file 파일 변경 [fde_generator_optimized_stream.py -> fde_generator_optimized_stream_weight.py]
 
 (1017) nDCG@K metrics, make brute-force sets for achieving more accurate results.
     <br />

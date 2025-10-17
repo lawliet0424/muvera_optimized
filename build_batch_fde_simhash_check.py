@@ -458,7 +458,7 @@ class ColbertFdeRetriever:
             query_embeddings_map = self.ranker.encode_queries(queries=[qtext])
             query_embeddings = to_numpy(next(iter(query_embeddings_map.values())))
             query_config = replace(self.doc_config, fill_empty_partitions=False)
-            query_fde = generate_query_fde(query_embeddings, query_config)
+            query_fde = generate_query_fde(query_embeddings, query_config, query_or_doc=True)
             self._save_query_cache(key, query_embeddings, query_fde)
             missing += 1
         logging.info(f"[{self.__class__.__name__}] Precomputed {missing} uncached queries.")
@@ -478,7 +478,7 @@ class ColbertFdeRetriever:
             query_embeddings_map = self.ranker.encode_queries(queries=[query])
             query_embeddings = to_numpy(next(iter(query_embeddings_map.values())))
             query_config = replace(self.doc_config, fill_empty_partitions=False)
-            query_fde = generate_query_fde(query_embeddings, query_config)
+            query_fde = generate_query_fde(query_embeddings, query_config, query_or_doc=True)
             self._save_query_cache(key, query_embeddings, query_fde)
         else:
             query_embeddings = cached_emb
