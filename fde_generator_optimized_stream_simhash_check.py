@@ -5,6 +5,7 @@ import numpy as np
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Optional, List
+from collections import defaultdict
 from joblib import Parallel, delayed  # pip install joblib
 
 class EncodingType(Enum):
@@ -142,7 +143,7 @@ def _fill_empty_partitions_for_doc(
 # Core FDE generation routines
 # -----------------------------
 def _generate_fde_internal(
-    point_cloud: np.ndarray, config: FixedDimensionalEncodingConfig
+    point_cloud: np.ndarray, config: FixedDimensionalEncodingConfig, query_or_doc: bool
 ) -> np.ndarray:
     if point_cloud.ndim != 2 or point_cloud.shape[1] != config.dimension:
         raise ValueError(
@@ -166,6 +167,10 @@ def _generate_fde_internal(
     final_fde_dim = config.num_repetitions * num_partitions * projection_dim
     out_fde = np.zeros(final_fde_dim, dtype=np.float32)
 
+    #[1017] simhash별 indice별 원소 개수 저장 필요------------------------------------
+    partition_counts = np.zeros((config.num_repetitions, num_partitions), dtype=np.int32)
+    #------------------------------------------------------------------------
+
     for rep_num in range(config.num_repetitions):
         current_seed = config.seed + rep_num
 
@@ -183,6 +188,7 @@ def _generate_fde_internal(
 
         rep_fde_sum = np.zeros(num_partitions * projection_dim, dtype=np.float32)
         partition_counts = np.zeros(num_partitions, dtype=np.int32)
+
         partition_indices = np.array(
             [_simhash_partition_index_gray(sketches[i]) for i in range(num_points)]
         )
@@ -191,6 +197,9 @@ def _generate_fde_internal(
             start_idx = partition_indices[i] * projection_dim
             rep_fde_sum[start_idx : start_idx + projection_dim] += projected_matrix[i]
             partition_counts[partition_indices[i]] += 1
+            #[1017] simhash별 indice별 원소 개수 저장 필요------------------------------------
+            partition_counts[rep_num][partition_indices[i]] += 1
+            #------------------------------------------------------------------------
 
         if config.encoding_type == EncodingType.AVERAGE:
             for i in range(num_partitions):
@@ -217,10 +226,10 @@ def _generate_fde_internal(
             out_fde, config.final_projection_dimension, config.seed
         )
 
-    return out_fde
+    return out_fde, partition_counts
 
 def generate_query_fde(
-    point_cloud: np.ndarray, config: FixedDimensionalEncodingConfig
+    point_cloud: np.ndarray, config: FixedDimensionalEncodingConfig, query_or_doc: bool
 ) -> np.ndarray:
     """Generates a Fixed Dimensional Encoding for a query point cloud (using SUM)."""
     if config.fill_empty_partitions:
@@ -228,22 +237,22 @@ def generate_query_fde(
             "Query FDE generation does not support 'fill_empty_partitions'."
         )
     query_config = replace(config, encoding_type=EncodingType.DEFAULT_SUM)
-    return _generate_fde_internal(point_cloud, query_config)
+    return _generate_fde_internal(point_cloud, query_config, query_or_doc)
 
 def generate_document_fde(
-    point_cloud: np.ndarray, config: FixedDimensionalEncodingConfig
+    point_cloud: np.ndarray, config: FixedDimensionalEncodingConfig, query_or_doc: bool
 ) -> np.ndarray:
     """Generates a Fixed Dimensional Encoding for a document point cloud (using AVERAGE)."""
     doc_config = replace(config, encoding_type=EncodingType.AVERAGE)
-    return _generate_fde_internal(point_cloud, doc_config)
+    return _generate_fde_internal(point_cloud, doc_config, query_or_doc)
 
 def generate_fde(
-    point_cloud: np.ndarray, config: FixedDimensionalEncodingConfig
+    point_cloud: np.ndarray, config: FixedDimensionalEncodingConfig, query_or_doc: bool
 ) -> np.ndarray:
     if config.encoding_type == EncodingType.DEFAULT_SUM:
-        return generate_query_fde(point_cloud, config)
+        return generate_query_fde(point_cloud, config, query_or_doc)
     elif config.encoding_type == EncodingType.AVERAGE:
-        return generate_document_fde(point_cloud, config)
+        return generate_document_fde(point_cloud, config, query_or_doc)
     else:
         raise ValueError(f"Unsupported encoding type in config: {config.encoding_type}")
 
@@ -258,7 +267,11 @@ def generate_document_fde_batch(
     memmap_path: Optional[str] = None,           # e.g., "/path/to/fde_index.mmap"
     max_bytes_in_memory: int = 2 * 1024**3,      # 2GB safety threshold
     log_every: int = 10000,                       # progress logging
-    flush_interval: int = 1000                    # 배치별 flush 간격
+    flush_interval: int = 1000,                   # 배치별 flush 간격
+    #[1017] simhash별 indice별 원소 개수 저장 필요------------------------------------
+    simhash_count_path: Optional[str] = None,
+    simhash_counter_array: Optional[np.ndarray] = None,
+    #------------------------------------------------------------------------
 ) -> np.ndarray:
     """
     Streaming implementation: no np.vstack; processes docs one by one.
@@ -299,8 +312,6 @@ def generate_document_fde_batch(
     final_fde_dim_per_rep = num_partitions * projection_dim
     final_fde_dim = config.num_repetitions * final_fde_dim_per_rep
 
-    output_dim = final_fde_dim
-
     # Decide where to place output (RAM or memmap)
     out_bytes = num_docs * final_fde_dim * 4  # float32
     
@@ -333,6 +344,10 @@ def generate_document_fde_batch(
         return bits
 
     part_bits_tbl = _partition_bits_table(config.num_simhash_projections) if config.fill_empty_partitions else None
+
+    # partition_counter[doc_idx][rep_num][partition_idx] = count
+    # 3D numpy array: (num_docs, num_repetitions, num_partitions)
+    partition_counter = np.zeros((num_docs, config.num_repetitions, num_partitions), dtype=np.int32)
 
     # For each repetition, stream over docs
     for rep_num in range(config.num_repetitions):
@@ -411,6 +426,9 @@ def generate_document_fde_batch(
                 nearest_local = np.argmin(distances, axis=1)   # [E]
                 rep_sum[empties, :] = Pts[nearest_local, :]
 
+            # Store partition counts for this document and repetition
+            partition_counter[d, rep_num, :] = counts
+
             # Write this doc's rep chunk
             out_fdes[d, rep_offset:rep_offset + final_fde_dim_per_rep] = rep_sum.reshape(-1)
 
@@ -468,8 +486,9 @@ def generate_document_fde_batch(
     total_time = time.perf_counter() - batch_start_time
     logging.info(f"[FDE Batch] Batch generation completed in {total_time:.3f}s")
     logging.info(f"[FDE Batch] Output shape: {out_fdes.shape}")
+    logging.info(f"[FDE Batch] Partition counter keys: {len(partition_counter)} documents")
 
-    return out_fdes
+    return out_fdes, partition_counter
 
 # -------------------------
 # Simple sanity test runner
@@ -488,9 +507,17 @@ if __name__ == "__main__":
     doc_data = np.random.randn(80, base_config.dimension).astype(np.float32)
 
     # FDE 생성
-    query_fde = generate_query_fde(query_data, base_config)
-    doc_fde = generate_document_fde(
-        doc_data, replace(base_config, fill_empty_partitions=True)
+    #[1017] simhash별 indice별 원소 개수 저장 필요------------------------------------
+    query_or_doc = True  # True: query, False: doc
+    #------------------------------------------------------------------------
+
+    query_fde, partition_counts, partition_base_counts = generate_query_fde(query_data, base_config, query_or_doc)
+
+    #[1017] simhash bool 변경 필요------------------------------------
+    query_or_doc = False
+    #------------------------------------------------------------------------
+    doc_fde, partition_counts, partition_base_counts = generate_document_fde(
+        doc_data, replace(base_config, fill_empty_partitions=True), query_or_doc
     )
 
     expected_dim = (
@@ -508,7 +535,7 @@ if __name__ == "__main__":
     ams_config = replace(
         base_config, projection_type=ProjectionType.AMS_SKETCH, projection_dimension=16
     )
-    query_fde_ams = generate_query_fde(query_data, ams_config)
+    query_fde_ams, _, _ = generate_query_fde(query_data, ams_config, query_or_doc)
     expected_dim_ams = (
         ams_config.num_repetitions
         * (2**ams_config.num_simhash_projections)
@@ -520,7 +547,7 @@ if __name__ == "__main__":
     print(f"\n{'=' * 20} SCENARIO 3: Final Projection (Count Sketch) {'=' * 20}")
 
     final_proj_config = replace(base_config, final_projection_dimension=1024)
-    query_fde_final = generate_query_fde(query_data, final_proj_config)
+    query_fde_final, _ = generate_query_fde(query_data, final_proj_config, query_or_doc)
     print(
         f"Final Projection FDE Shape: {query_fde_final.shape} (Expected: {final_proj_config.final_projection_dimension})"
     )
@@ -528,11 +555,11 @@ if __name__ == "__main__":
 
     print(f"\n{'=' * 20} SCENARIO 4: Top-level `generate_fde` wrapper {'=' * 20}")
 
-    query_fde_2 = generate_fde(
-        query_data, replace(base_config, encoding_type=EncodingType.DEFAULT_SUM)
+    query_fde_2, _ = generate_fde(
+        query_data, replace(base_config, encoding_type=EncodingType.DEFAULT_SUM), query_or_doc
     )
-    doc_fde_2 = generate_fde(
-        doc_data, replace(base_config, encoding_type=EncodingType.AVERAGE)
+    doc_fde_2, _ = generate_fde(
+        doc_data, replace(base_config, encoding_type=EncodingType.AVERAGE), query_or_doc
     )
 
     print(

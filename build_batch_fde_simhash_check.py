@@ -348,6 +348,12 @@ class ColbertFdeRetriever:
         # Atomic 배치 처리 (1000개 문서씩)
         atomic_batch_size = ATOMIC_BATCH_SIZE  # 인코딩과 FDE 배치 크기 통일
         logging.info(f"[{self.__class__.__name__}] Processing {len(missing_doc_ids)} documents in atomic batches of {atomic_batch_size}...")
+
+        #[1017] simhash별 indice별 원소 개수 csv 파일 저장 필요------------------------------------
+        simhash_count_path = os.path.join(self._cache_dir, f"simhash_count_{P}_{R}.csv")
+        with open(simhash_count_path, "w", encoding="utf-8") as f:
+            f.write("doc_idx,rep_num,partition_idx,count\n")
+        #------------------------------------------------------------------------
         
         for batch_start in range(0, len(missing_doc_ids), atomic_batch_size):
             batch_end = min(batch_start + atomic_batch_size, len(missing_doc_ids))
@@ -398,6 +404,16 @@ class ColbertFdeRetriever:
                 log_every=atomic_batch_size,
                 flush_interval=atomic_batch_size,  # atomic_batch_size 활용
             )
+
+            #[1017] simhash별 indice별 원소 개수 저장 필요------------------------------------
+            # partition_counter shape: (num_docs_in_batch, num_repetitions, num_partitions)
+            for doc_idx in range(partition_counter.shape[0]):
+                for rep_num in range(partition_counter.shape[1]):
+                    for partition_idx in range(partition_counter.shape[2]):
+                        count = partition_counter[doc_idx, rep_num, partition_idx]
+                        with open(simhash_count_path, "a", encoding="utf-8") as f:
+                            f.write(f"{doc_idx},{rep_num},{partition_idx},{count}\n")
+            #------------------------------------------------------------------------
             
             # Step 3: FDE 인덱스에 저장
             fde_index[batch_start:batch_end] = batch_fde
