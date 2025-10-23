@@ -46,7 +46,7 @@ else:
     DEVICE = "cpu"
 
 # 캐시 루트
-CACHE_ROOT = os.path.join("/mnt/ssd", "muvera_optimized", "cache_muvera", DATASET_REPO_ID, FILENAME)
+CACHE_ROOT = os.path.join("/media/hyunji/7672b947-0099-4e49-8e90-525a208d54b8", "muvera_optimized", "cache_muvera", DATASET_REPO_ID, FILENAME)
 os.makedirs(CACHE_ROOT, exist_ok=True)
 
 # 쿼리 검색 디렉터리
@@ -67,7 +67,7 @@ def load_nanobeir_dataset(repo_id: str):
     """Loads BEIR dataset from local 'data_path' in test split."""
     # 데이터셋 준비 (BEIR trec-covid)
     url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip"
-    out_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "datasets")
+    out_dir = os.path.join("/media/hyunji/7672b947-0099-4e49-8e90-525a208d54b8", "muvera_optimized", "datasets")
 
     if not os.path.exists(os.path.join(out_dir, dataset)):
         data_path = util.download_and_unzip(url, out_dir)
@@ -450,11 +450,11 @@ class ColbertFdeRetriever:
         # ---------- FDE 인덱스 생성 ----------
         logging.info(f"[{self.__class__.__name__}] Generating FDEs from ColBERT embeddings...")
 
-        #[1017] simhash별 indice별 원소 개수 csv 파일 저장 필요------------------------------------
-        simhash_count_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_simhash{args.simhash}_rerank{args.rerank}")
-        os.makedirs(simhash_count_dir, exist_ok=True)
-        simhash_count_path = os.path.join(simhash_count_dir, "simhash_count.csv")
-        with open(simhash_count_path, "w", encoding="utf-8") as f:
+        #[1017] K-means partition별 indice별 원소 개수 csv 파일 저장 필요------------------------------------
+        partition_count_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_kmeans{args.simhash}_rerank{args.rerank}")
+        os.makedirs(partition_count_dir, exist_ok=True)
+        partition_count_path = os.path.join(partition_count_dir, "partition_count.csv")
+        with open(partition_count_path, "w", encoding="utf-8") as f:
             f.write("doc_idx,rep_num,partition_idx,count\n")
         #------------------------------------------------------------------------
         
@@ -476,14 +476,14 @@ class ColbertFdeRetriever:
 
         logging.info(f"[FDE Index] Final FDE index shape: {self.fde_index.shape}")
 
-        #[1017] simhash별 indice별 원소 개수 저장 필요------------------------------------
+        #[1017] K-means partition별 indice별 원소 개수 저장 필요------------------------------------
         # partition_counter shape: (num_docs_in_batch, num_repetitions, num_partitions)
         if partition_counter.size > 0:
             for doc_idx in range(partition_counter.shape[0]):
                 for rep_num in range(partition_counter.shape[1]):
                     for partition_idx in range(partition_counter.shape[2]):
                         count = partition_counter[doc_idx, rep_num, partition_idx]
-                        with open(simhash_count_path, "a", encoding="utf-8") as f:
+                        with open(partition_count_path, "a", encoding="utf-8") as f:
                             f.write(f"{doc_idx},{rep_num},{partition_idx},{count}\n")
         #------------------------------------------------------------------------
         
@@ -621,7 +621,7 @@ if __name__ == "__main__":
             enable_rerank=True,
             save_doc_embeds=True,
             latency_log_path=os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_simhash{args.simhash}_rerank{args.rerank}", "latency.tsv"),  # QID\tSearch\tRerank
-            external_doc_embeds_dir=f"/mnt/ssd/muvera_optimized/cache_muvera/{DATASET_REPO_ID}/{FILENAME}/{args.rep}_{args.simhash}/doc_embeds",  # ★ 외부 임베딩 디렉터리 지정
+            external_doc_embeds_dir=f"/media/hyunji/7672b947-0099-4e49-8e90-525a208d54b8/muvera_optimized/cache_muvera/{DATASET_REPO_ID}/{FILENAME}/doc_embeds",  # ★ 공통 문서 
             num_repetitions=args.rep,
             num_simhash_projections=args.simhash,
         )
