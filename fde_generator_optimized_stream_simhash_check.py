@@ -168,7 +168,7 @@ def _generate_fde_internal(
     out_fde = np.zeros(final_fde_dim, dtype=np.float32)
 
     #[1017] simhash별 indice별 원소 개수 저장 필요------------------------------------
-    partition_counts = np.zeros((config.num_repetitions, num_partitions), dtype=np.int32)
+    partition_counts_all = np.zeros((config.num_repetitions, num_partitions), dtype=np.int32)
     #------------------------------------------------------------------------
 
     for rep_num in range(config.num_repetitions):
@@ -198,7 +198,7 @@ def _generate_fde_internal(
             rep_fde_sum[start_idx : start_idx + projection_dim] += projected_matrix[i]
             partition_counts[partition_indices[i]] += 1
             #[1017] simhash별 indice별 원소 개수 저장 필요------------------------------------
-            partition_counts[rep_num][partition_indices[i]] += 1
+            partition_counts_all[rep_num][partition_indices[i]] += 1
             #------------------------------------------------------------------------
 
         if config.encoding_type == EncodingType.AVERAGE:
@@ -226,7 +226,7 @@ def _generate_fde_internal(
             out_fde, config.final_projection_dimension, config.seed
         )
 
-    return out_fde, partition_counts
+    return out_fde, partition_counts_all
 
 def generate_query_fde(
     point_cloud: np.ndarray, config: FixedDimensionalEncodingConfig, query_or_doc: bool
@@ -426,7 +426,7 @@ def generate_document_fde_batch(
                 nearest_local = np.argmin(distances, axis=1)   # [E]
                 rep_sum[empties, :] = Pts[nearest_local, :]
 
-            # Store partition counts for this document and repetition
+            # [Changed] Store partition counts for this document and repetition
             partition_counter[d, rep_num, :] = counts
 
             # Write this doc's rep chunk
@@ -511,12 +511,12 @@ if __name__ == "__main__":
     query_or_doc = True  # True: query, False: doc
     #------------------------------------------------------------------------
 
-    query_fde, partition_counts, partition_base_counts = generate_query_fde(query_data, base_config, query_or_doc)
+    query_fde, partition_counts = generate_query_fde(query_data, base_config, query_or_doc)
 
     #[1017] simhash bool 변경 필요------------------------------------
     query_or_doc = False
     #------------------------------------------------------------------------
-    doc_fde, partition_counts, partition_base_counts = generate_document_fde(
+    doc_fde, partition_counts = generate_document_fde(
         doc_data, replace(base_config, fill_empty_partitions=True), query_or_doc
     )
 
