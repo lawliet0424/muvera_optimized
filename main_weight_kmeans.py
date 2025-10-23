@@ -24,7 +24,7 @@ from beir.retrieval.search.dense import DenseRetrievalExactSearch as DRES
 import argparse
 
 # FDE 구현 (업로드된 파일 사용)
-from fde_generator_optimized_stream_simhash_check import (
+from fde_generator_optimized_stream_kmeans import (
     FixedDimensionalEncodingConfig,
     generate_query_fde,
     generate_document_fde_batch,
@@ -218,9 +218,13 @@ class ColbertFdeRetriever:
             num_simhash_projections=self.num_simhash_projections,
             seed=42,
             fill_empty_partitions=True,
+            use_kmeans_partition=True,  # K-means 사용
+            use_memory_based_sampling=True,  # 메모리 기반 샘플링
+            target_memory_gb=2.0,  # 목표 메모리 2GB
         )
 
         self.fde_index: Optional[np.ndarray] = None
+        self.kmeans_centers: Optional[np.ndarray] = None  # K-means centers 저장
         self.doc_ids: List[str] = []
         self._doc_pos = {}     # doc_id -> position
         self._corpus = None    # for on-the-fly encoding
@@ -283,10 +287,16 @@ class ColbertFdeRetriever:
 
     # --------- 저장/로드 ---------
     def _cache_exists(self) -> bool:
-        return os.path.exists(self._fde_path) and os.path.exists(self._ids_path)
+        kmeans_path = os.path.join(self._cache_dir, "kmeans_centers.pkl")
+        return (os.path.exists(self._fde_path) and 
+                os.path.exists(self._ids_path) and 
+                os.path.exists(kmeans_path))
 
     def _save_cache(self):
         joblib.dump(self.fde_index, self._fde_path)
+        if self.kmeans_centers is not None:
+            kmeans_path = os.path.join(self._cache_dir, "kmeans_centers.pkl")
+            joblib.dump(self.kmeans_centers, kmeans_path)
         with open(self._ids_path, "w", encoding="utf-8") as f:
             json.dump(self.doc_ids, f, ensure_ascii=False)
         with open(self._meta_path, "w", encoding="utf-8") as f:
@@ -301,6 +311,9 @@ class ColbertFdeRetriever:
                         "num_simhash_projections": self.doc_config.num_simhash_projections,
                         "seed": self.doc_config.seed,
                         "fill_empty_partitions": self.doc_config.fill_empty_partitions,
+                        "use_kmeans_partition": self.doc_config.use_kmeans_partition,
+                        "use_memory_based_sampling": self.doc_config.use_memory_based_sampling,
+                        "target_memory_gb": self.doc_config.target_memory_gb,
                     },
                 },
                 f,
@@ -312,6 +325,9 @@ class ColbertFdeRetriever:
     def _load_cache(self) -> bool:
         # (사용자 코드 유지: 존재 체크 주석 처리)
         self.fde_index = joblib.load(self._fde_path)
+        kmeans_path = os.path.join(self._cache_dir, "kmeans_centers.pkl")
+        if os.path.exists(kmeans_path):
+            self.kmeans_centers = joblib.load(kmeans_path)
         with open(self._ids_path, "r", encoding="utf-8") as f:
             self.doc_ids = json.load(f)
         self._doc_pos = {d: i for i, d in enumerate(self.doc_ids)}
@@ -442,24 +458,33 @@ class ColbertFdeRetriever:
             f.write("doc_idx,rep_num,partition_idx,count\n")
         #------------------------------------------------------------------------
         
-        self.fde_index, partition_counter = generate_document_fde_batch(
+        fde_result = generate_document_fde_batch(
             doc_embeddings_list,
             self.doc_config,
             memmap_path=os.path.join(self._cache_dir, "fde_index.mmap"),
             max_bytes_in_memory=2 * 1024**3,  # optional guard
             log_every=50000,
         )
+        
+        if len(fde_result) == 3:
+            self.fde_index, partition_counter, self.kmeans_centers = fde_result
+        else:
+            # 빈 배열인 경우
+            self.fde_index = fde_result
+            partition_counter = np.array([])
+            self.kmeans_centers = np.array([])
 
         logging.info(f"[FDE Index] Final FDE index shape: {self.fde_index.shape}")
 
         #[1017] simhash별 indice별 원소 개수 저장 필요------------------------------------
         # partition_counter shape: (num_docs_in_batch, num_repetitions, num_partitions)
-        for doc_idx in range(partition_counter.shape[0]):
-            for rep_num in range(partition_counter.shape[1]):
-                for partition_idx in range(partition_counter.shape[2]):
-                    count = partition_counter[doc_idx, rep_num, partition_idx]
-                    with open(simhash_count_path, "a", encoding="utf-8") as f:
-                        f.write(f"{doc_idx},{rep_num},{partition_idx},{count}\n")
+        if partition_counter.size > 0:
+            for doc_idx in range(partition_counter.shape[0]):
+                for rep_num in range(partition_counter.shape[1]):
+                    for partition_idx in range(partition_counter.shape[2]):
+                        count = partition_counter[doc_idx, rep_num, partition_idx]
+                        with open(simhash_count_path, "a", encoding="utf-8") as f:
+                            f.write(f"{doc_idx},{rep_num},{partition_idx},{count}\n")
         #------------------------------------------------------------------------
         
         # 저장
@@ -477,7 +502,7 @@ class ColbertFdeRetriever:
             query_embeddings_map = self.ranker.encode_queries(queries=[qtext])
             query_embeddings = to_numpy(next(iter(query_embeddings_map.values())))
             query_config = replace(self.doc_config, fill_empty_partitions=False)
-            query_fde_result = generate_query_fde(query_embeddings, query_config, True)
+            query_fde_result = generate_query_fde(query_embeddings, query_config, True, self.kmeans_centers)
             
             # query_fde_result가 튜플인 경우 첫 번째 요소만 사용
             if isinstance(query_fde_result, tuple):
@@ -504,7 +529,7 @@ class ColbertFdeRetriever:
             query_embeddings_map = self.ranker.encode_queries(queries=[query])
             query_embeddings = to_numpy(next(iter(query_embeddings_map.values())))
             query_config = replace(self.doc_config, fill_empty_partitions=False)
-            query_fde_result = generate_query_fde(query_embeddings, query_config, True)
+            query_fde_result = generate_query_fde(query_embeddings, query_config, True, self.kmeans_centers)
             
             # query_fde_result가 튜플인 경우 첫 번째 요소만 사용
             if isinstance(query_fde_result, tuple):
