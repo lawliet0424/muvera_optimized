@@ -7,7 +7,8 @@ from enum import Enum
 from typing import Optional, List, Tuple
 from collections import defaultdict
 from joblib import Parallel, delayed  # pip install joblib
-from sklearn.cluster import KMeans  # pip install scikit-learn
+from sklearn.cluster import MiniBatchKMeans  # pip install scikit-learn
+from sklearn.cluster import KMeans
 
 class EncodingType(Enum):
     DEFAULT_SUM = 0
@@ -104,7 +105,8 @@ def _calculate_memory_based_sample_ratio(
     num_partitions: int,
     target_memory_gb: float = 2.0,
     min_ratio: float = 0.05,
-    max_ratio: float = 0.5
+    max_ratio: float = 0.3,
+    actual_tokens_per_doc: Optional[int] = None
 ) -> float:
     """문서 임베딩 크기와 메모리 사용량을 고려한 동적 샘플링 비율 계산"""
     
@@ -113,11 +115,14 @@ def _calculate_memory_based_sample_ratio(
     # 샘플링된 문서들의 projected points + K-means centers + 기타 오버헤드
     
     # 1. 샘플링된 문서들의 projected points 메모리
-    def calculate_memory_for_sample_ratio(sample_ratio: float) -> float:
+    def calculate_memory_for_sample_ratio(sample_ratio: float, actual_tokens_per_doc: Optional[int] = None) -> float:
         n_sample_docs = max(int(num_docs * sample_ratio), 1)
         
-        # 평균 문서당 토큰 수 추정 (일반적으로 50-200 토큰)
-        avg_tokens_per_doc = 100  # 보수적 추정
+        # 실제 토큰 수가 제공되면 사용, 아니면 보수적 추정
+        if actual_tokens_per_doc is not None:
+            avg_tokens_per_doc = actual_tokens_per_doc
+        else:
+            avg_tokens_per_doc = 100  # 보수적 추정
         
         # 샘플링된 문서들의 projected points 메모리
         sample_points_memory = n_sample_docs * avg_tokens_per_doc * embedding_dim * 4  # bytes
@@ -125,9 +130,30 @@ def _calculate_memory_based_sample_ratio(
         # K-means centers 메모리
         centers_memory = num_partitions * embedding_dim * 4  # bytes
         
-        # 기타 오버헤드 (거리 계산, 임시 배열 등)
-        overhead_memory = sample_points_memory * 0.5  # 50% 오버헤드
+        # psutil을 사용한 전체 시스템 메모리 기반 오버헤드 계산
+        try:
+            import psutil
+            # 전체 시스템 메모리 정보
+            total_memory_gb = psutil.virtual_memory().total / (1024**3)  # GB
+            available_memory_gb = psutil.virtual_memory().available / (1024**3)  # GB
+            
+            # 시스템 메모리 대비 오버헤드 팩터 계산 (일관된 비율)
+            if total_memory_gb > 0:
+                # 시스템 메모리 크기에 따라 오버헤드 조정
+                if total_memory_gb >= 32:  # 32GB 이상
+                    overhead_factor = 0.6
+                elif total_memory_gb >= 16:  # 16GB 이상
+                    overhead_factor = 0.7
+                elif total_memory_gb >= 8:   # 8GB 이상
+                    overhead_factor = 0.8
+                else:  # 8GB 미만
+                    overhead_factor = 1.0
+            else:
+                overhead_factor = 0.8  # 기본값
+        except ImportError:
+            overhead_factor = 0.8  # psutil 없을 때 기본값
         
+        overhead_memory = sample_points_memory * overhead_factor
         total_memory_bytes = sample_points_memory + centers_memory + overhead_memory
         total_memory_gb = total_memory_bytes / (1024**3)
         
@@ -137,9 +163,9 @@ def _calculate_memory_based_sample_ratio(
     low_ratio, high_ratio = min_ratio, max_ratio
     best_ratio = min_ratio
     
-    for _ in range(20):  # 최대 20회 반복
+    for _ in range(10):  # 최대 20회 반복
         mid_ratio = (low_ratio + high_ratio) / 2
-        memory_usage = calculate_memory_for_sample_ratio(mid_ratio)
+        memory_usage = calculate_memory_for_sample_ratio(mid_ratio, actual_tokens_per_doc)
         
         if memory_usage <= target_memory_gb:
             best_ratio = mid_ratio
@@ -183,7 +209,8 @@ def _sample_and_train_kmeans(
     all_projected_points: np.ndarray, 
     num_partitions: int, 
     seed: int,
-    sample_ratio: float = 0.1
+    sample_ratio: float = 0.1,
+    actual_tokens_per_doc: Optional[int] = None
 ) -> np.ndarray:
     """전체 데이터에서 샘플링하여 K-means centers 학습"""
     # 전체 데이터에서 임의 샘플링
@@ -192,8 +219,12 @@ def _sample_and_train_kmeans(
     sample_indices = rng.choice(len(all_projected_points), size=n_samples, replace=False)
     sampled_points = all_projected_points[sample_indices]
     
-    # K-means 학습
-    kmeans = KMeans(n_clusters=num_partitions, random_state=seed, n_init=10)
+    # CPU라서 1차 minibatch K-means 학습
+    mini_kmeans = MiniBatchKMeans(n_clusters=num_partitions, init="k-means++", random_state=seed, n_init=3, batch_size=16384, max_iter=100, verbose=0, reassignment_ratio=0.1)
+    mini_kmeans.fit(sampled_points)
+
+    # CPU라서 2차 정밀 K-means 학습
+    kmeans = KMeans(n_clusters=num_partitions, init=mini_kmeans.cluster_centers_, n_init=1, random_state=seed, max_iter=20, algorithm='elkan', tol=1e-3)
     kmeans.fit(sampled_points)
     return kmeans.cluster_centers_
 
@@ -397,6 +428,7 @@ def generate_document_fde_batch(
     max_bytes_in_memory: int = 2 * 1024**3,      # 2GB safety threshold
     log_every: int = 10000,                       # progress logging
     flush_interval: int = 1000,                   # 배치별 flush 간격
+    kmeans_centers: Optional[np.ndarray] = None,  # 사전 학습된 K-means centers
     #[1017] simhash별 indice별 원소 개수 저장 필요------------------------------------
     simhash_count_path: Optional[str] = None,
     simhash_counter_array: Optional[np.ndarray] = None,
@@ -500,40 +532,47 @@ def generate_document_fde_batch(
 
         rep_offset = rep_num * final_fde_dim_per_rep
         
-        # [수정] 각 repetition마다 랜덤 샘플링으로 K-means centers 학습
-        # 메모리 기반 또는 동적 샘플링 비율 계산
-        if config.use_memory_based_sampling:
-            dynamic_sample_ratio = _calculate_memory_based_sample_ratio(
-                num_docs, projection_dim, num_partitions, config.target_memory_gb
-            )
+        # [수정] 사전 학습된 K-means centers 사용 또는 새로 학습
+        if kmeans_centers is not None:
+            # 사전 학습된 centers 사용
+            kmeans_centers_all[rep_num] = kmeans_centers[rep_num]
+            num_centers = kmeans_centers[rep_num].shape[0]
+            logging.info(f"[FDE Batch] Rep {rep_num}: Using pre-trained K-means centers with {num_centers} partitions (shape: {kmeans_centers[rep_num].shape})")
         else:
-            dynamic_sample_ratio = _calculate_dynamic_sample_ratio(
-                config.num_simhash_projections, config.kmeans_sample_ratio
-            )
-        
-        # 랜덤으로 문서들을 선택하여 projected points 수집
-        rng = np.random.default_rng(current_seed)
-        n_sample_docs = max(int(num_docs * dynamic_sample_ratio), 1)
-        sample_doc_indices = rng.choice(num_docs, size=n_sample_docs, replace=False)
-        
-        logging.info(f"[FDE Batch] Rep {rep_num}: Dynamic sampling ratio={dynamic_sample_ratio:.3f}, "
-                    f"Sampling {n_sample_docs} docs from {num_docs} total docs for K-means")
-        
-        all_projected_points = []
-        for doc_idx in sample_doc_indices:
-            X_temp = doc_embeddings_list[doc_idx].astype(np.float32, copy=False)
-            if use_identity_proj:
-                Pts_temp = X_temp
+            # 기존 방식: 각 repetition마다 랜덤 샘플링으로 K-means centers 학습
+            if config.use_memory_based_sampling:
+                dynamic_sample_ratio = _calculate_memory_based_sample_ratio(
+                    num_docs, projection_dim, num_partitions, config.target_memory_gb,
+                    min_ratio=0.05, max_ratio=0.3
+                )
             else:
-                Pts_temp = X_temp @ ams_matrix
-            all_projected_points.append(Pts_temp)
-        
-        all_projected_points = np.vstack(all_projected_points)
-        kmeans_centers_all[rep_num] = _sample_and_train_kmeans(
-            all_projected_points, num_partitions, current_seed, dynamic_sample_ratio
-        )
-        
-        logging.info(f"[FDE Batch] Rep {rep_num}: K-means centers learned from {len(all_projected_points)} points")
+                dynamic_sample_ratio = _calculate_dynamic_sample_ratio(
+                    config.num_simhash_projections, config.kmeans_sample_ratio
+                )
+            
+            # 랜덤으로 문서들을 선택하여 projected points 수집
+            rng = np.random.default_rng(current_seed)
+            n_sample_docs = max(int(num_docs * dynamic_sample_ratio), 1)
+            sample_doc_indices = rng.choice(num_docs, size=n_sample_docs, replace=False)
+            
+            logging.info(f"[FDE Batch] Rep {rep_num}: Dynamic sampling ratio={dynamic_sample_ratio:.3f}, "
+                        f"Sampling {n_sample_docs} docs from {num_docs} total docs for K-means")
+            
+            all_projected_points = []
+            for doc_idx in sample_doc_indices:
+                X_temp = doc_embeddings_list[doc_idx].astype(np.float32, copy=False)
+                if use_identity_proj:
+                    Pts_temp = X_temp
+                else:
+                    Pts_temp = X_temp @ ams_matrix
+                all_projected_points.append(Pts_temp)
+            
+            all_projected_points = np.vstack(all_projected_points)
+            kmeans_centers_all[rep_num] = _sample_and_train_kmeans(
+                all_projected_points, num_partitions, current_seed, dynamic_sample_ratio
+            )
+            
+            logging.info(f"[FDE Batch] Rep {rep_num}: K-means centers learned with {num_partitions} partitions from {len(all_projected_points)} points")
 
         # Stream over documents (no vstack)
         for d in range(num_docs):
@@ -571,16 +610,17 @@ def generate_document_fde_batch(
             if nz.any():
                 rep_sum[nz, :] /= counts[nz, None]
 
-            # Optional: fill empty partitions with nearest point (by Hamming dist in sketch space)
+            # Optional: fill empty partitions with nearest point (by Euclidean distance)
             if config.fill_empty_partitions and (~nz).any():
                 empties = np.flatnonzero(~nz)
-                # Build doc bit table once: [Ld, b]
-                doc_bits = (sketches > 0).astype(np.uint8)     # [Ld, b]
-                tgt_bits = part_bits_tbl[empties]              # [E, b]
-                # distances: [E, Ld]
-                distances = np.sum(tgt_bits[:, None, :] ^ doc_bits[None, :, :], axis=2)
-                nearest_local = np.argmin(distances, axis=1)   # [E]
-                rep_sum[empties, :] = Pts[nearest_local, :]
+                # Find nearest points using Euclidean distance in projected space
+                if len(Pts) > 0:
+                    # Calculate distances from empty partition centers to all points
+                    empty_centers = kmeans_centers_all[rep_num][empties]  # [E, projection_dim]
+                    # distances: [E, Ld] - distance from each empty center to each point
+                    distances = np.sqrt(np.sum((empty_centers[:, None, :] - Pts[None, :, :]) ** 2, axis=2))
+                    nearest_local = np.argmin(distances, axis=1)   # [E]
+                    rep_sum[empties, :] = Pts[nearest_local, :]
 
             # [Changed] Store partition counts for this document and repetition
             partition_counter[d, rep_num, :] = counts

@@ -36,7 +36,7 @@ from fde_generator_optimized_stream_kmeans import (
 DATASET_REPO_ID = "scidocs"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
 TOP_K = 10
-FILENAME = "main_weight"
+FILENAME = "main_weight_kmeans"
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -48,6 +48,13 @@ else:
 # 캐시 루트
 CACHE_ROOT = os.path.join("/media/hyunji/7672b947-0099-4e49-8e90-525a208d54b8", "muvera_optimized", "cache_muvera", DATASET_REPO_ID, FILENAME)
 os.makedirs(CACHE_ROOT, exist_ok=True)
+
+# 공통 문서 임베딩 디렉터리 설정
+COMMON_EMBEDS_DIR = os.path.join("/media/hyunji/7672b947-0099-4e49-8e90-525a208d54b8", "muvera_optimized", "cache_muvera", DATASET_REPO_ID)
+COMMON_DOC_EMBEDS_DIR = os.path.join(COMMON_EMBEDS_DIR, "doc_embeds")
+COMMON_QUERY_EMBEDS_DIR = os.path.join(COMMON_EMBEDS_DIR, "query_embeds")
+os.makedirs(COMMON_DOC_EMBEDS_DIR, exist_ok=True)
+os.makedirs(COMMON_QUERY_EMBEDS_DIR, exist_ok=True)
 
 # 쿼리 검색 디렉터리
 dataset = "scidocs"
@@ -233,6 +240,12 @@ class ColbertFdeRetriever:
         self.rerank_candidates = rerank_candidates
         self.save_doc_embeds = save_doc_embeds
         self.external_doc_embeds_dir = external_doc_embeds_dir  # ★
+        
+        # 공통 문서 임베딩 디렉터리 설정
+        self.common_doc_embeds_dir = COMMON_DOC_EMBEDS_DIR
+        
+        # 공통 쿼리 임베딩 디렉터리 설정
+        self.common_query_embeds_dir = COMMON_QUERY_EMBEDS_DIR
 
         # 캐시 경로
         self._model_name = model_name
@@ -247,8 +260,7 @@ class ColbertFdeRetriever:
 
         os.makedirs(self._cache_dir, exist_ok=True)
         os.makedirs(self._queries_dir, exist_ok=True)
-        if self.save_doc_embeds:
-            os.makedirs(self._doc_emb_dir, exist_ok=True)
+        # 개별 하위 디렉터리에 doc_embeds 저장하지 않음 (공통 디렉터리 사용)
 
         # 지연시간 로그 파일 (헤더 없이 누적)
         self._latency_log_path = latency_log_path or os.path.join(self._cache_dir, "latency.tsv")
@@ -284,6 +296,15 @@ class ColbertFdeRetriever:
         if pos is None:
             return None
         return os.path.join(self.external_doc_embeds_dir, f"{pos:08d}.npy")
+
+    def _common_doc_emb_path(self, doc_id: str) -> Optional[str]:
+        """공통 디렉터리에서 기대하는 파일 경로(문서 순번 8자리 파일명)."""
+        if not self.common_doc_embeds_dir:
+            return None
+        pos = self._doc_pos.get(doc_id)
+        if pos is None:
+            return None
+        return os.path.join(self.common_doc_embeds_dir, f"{pos:08d}.npy")
 
     # --------- 저장/로드 ---------
     def _cache_exists(self) -> bool:
@@ -338,11 +359,31 @@ class ColbertFdeRetriever:
         return True
 
     def _save_query_cache(self, key: str, query_embeddings: np.ndarray, query_fde: np.ndarray):
-        emb_path, fde_path = self._query_paths(key)
-        np.save(emb_path, query_embeddings)
+        # 공통 디렉터리에 쿼리 임베딩 저장 (기존과 동일한 해시 기반 파일명 사용)
+        if hasattr(self, 'common_query_embeds_dir') and self.common_query_embeds_dir:
+            # 기존과 동일한 해시 기반 파일명 사용
+            common_emb_path = os.path.join(self.common_query_embeds_dir, f"{key}.emb.npy")
+            if not os.path.exists(common_emb_path):
+                os.makedirs(os.path.dirname(common_emb_path), exist_ok=True)
+                np.save(common_emb_path, query_embeddings)
+                logging.info(f"[query-embed] saved to common directory: {common_emb_path}")
+        
+        # FDE만 개별 하위 디렉터리에 저장 (백업 제거)
+        _, fde_path = self._query_paths(key)
         np.save(fde_path, query_fde)
 
     def _load_query_cache(self, key: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        # 공통 디렉터리에서 쿼리 임베딩 로드 시도 (기존과 동일한 해시 기반 파일명 사용)
+        if hasattr(self, 'common_query_embeds_dir') and self.common_query_embeds_dir:
+            common_emb_path = os.path.join(self.common_query_embeds_dir, f"{key}.emb.npy")
+            if os.path.exists(common_emb_path):
+                emb = np.load(common_emb_path)
+                # FDE는 개별 하위 디렉터리에서 로드
+                _, fde_path = self._query_paths(key)
+                fde = np.load(fde_path) if os.path.exists(fde_path) else None
+                return emb, fde
+        
+        # 공통 디렉터리에 없으면 개별 하위 디렉터리에서 로드 (fallback)
         emb_path, fde_path = self._query_paths(key)
         emb = np.load(emb_path) if os.path.exists(emb_path) else None
         fde = np.load(fde_path) if os.path.exists(fde_path) else None
@@ -355,22 +396,16 @@ class ColbertFdeRetriever:
         return float(sim.max(axis=1).sum())
 
     def _get_doc_embeddings(self, doc_id: str, allow_build: bool = True) -> np.ndarray:
-        """재랭킹 시 문서 임베딩 로드: 외부 디렉터리 → 내부 캐시 → 필요시 on-the-fly 인코딩"""
-        # 1) 외부 디렉터리 우선
+        """재랭킹 시 문서 임베딩 로드: 공통 디렉터리 → 필요시 on-the-fly 인코딩"""
+        # 1) 공통 디렉터리에서 로드
         ext_path = self._external_doc_emb_path(doc_id)
         if ext_path and os.path.exists(ext_path):
-            #logging.info(f"[doc-embed] external load: id={doc_id} path={ext_path}")
+            #logging.info(f"[doc-embed] common load: id={doc_id} path={ext_path}")
             return np.load(ext_path)
 
-        # 2) 내부 캐시
-        int_path = self._doc_emb_path(doc_id)
-        if os.path.exists(int_path):
-            #logging.info(f"[doc-embed] internal load: id={doc_id} path={int_path}")
-            return np.load(int_path)
-
-        # 3) 필요 시 빌드
+        # 2) 필요 시 빌드 (개별 저장 없이)
         if not allow_build:
-            raise FileNotFoundError(ext_path or int_path)
+            raise FileNotFoundError(ext_path)
 
         if self._corpus is None:
             raise RuntimeError("Corpus not set; cannot build document embeddings on the fly.")
@@ -378,9 +413,11 @@ class ColbertFdeRetriever:
         emap = self.ranker.encode_documents(documents=[doc])
         arr = to_numpy(emap[doc_id])
 
-        # 내부 캐시에 저장(선택)
-        np.save(int_path, arr)
-        #logging.info(f"[doc-embed] built & saved: id={doc_id} path={int_path}")
+        # 공통 디렉터리에 저장
+        if ext_path:
+            os.makedirs(os.path.dirname(ext_path), exist_ok=True)
+            np.save(ext_path, arr)
+            #logging.info(f"[doc-embed] built & saved to common: id={doc_id} path={ext_path}")
         return arr
 
     # --------- Latency log ---------
@@ -404,51 +441,8 @@ class ColbertFdeRetriever:
         self._doc_pos = {d: i for i, d in enumerate(self.doc_ids)}
         documents_for_ranker = [{"id": doc_id, **corpus[doc_id]} for doc_id in self.doc_ids]
 
-        # ---------- 외부/내부 임베딩 로드 & 부족분만 인코딩 ----------
-        doc_embeddings_map = {}
-        missing_doc_ids: List[str] = []
-
-        # 1) 외부/내부에서 가능한 만큼 채운다
-        for doc_id in self.doc_ids:
-            ext = self._external_doc_emb_path(doc_id)            
-            if ext and os.path.exists(ext):
-                doc_embeddings_map[doc_id] = np.load(ext).astype(np.float32)                
-                # 필요 시 내부 캐시에도 채움
-                if self.save_doc_embeds:
-                    dst = self._doc_emb_path(doc_id)
-                    if not os.path.exists(dst):
-                        np.save(dst, doc_embeddings_map[doc_id])
-                continue
-
-            # 내부 캐시 확인
-            dst = self._doc_emb_path(doc_id)
-            if os.path.exists(dst): # shape(256, 128)
-                print(f"[inner shape]: {np.load(dst).shape}")
-                doc_embeddings_map[doc_id] = np.load(dst).astype(np.float32)
-            else:
-                missing_doc_ids.append(doc_id)
-
-        logging.info(
-            f"[index] preloaded from external/internal: {len(doc_embeddings_map)} / {len(self.doc_ids)}, "
-            f"to-encode: {len(missing_doc_ids)}"
-        )
-
-        # 2) 외부/내부에 없는 문서만 배치 인코딩
-        if missing_doc_ids:
-            to_encode_docs = [{"id": did, **corpus[did]} for did in missing_doc_ids]
-            logging.info(f"[index] encoding {len(to_encode_docs)} documents that are missing from precomputed files...")
-            encoded_map = self.ranker.encode_documents(documents=to_encode_docs)
-            for did in missing_doc_ids:
-                arr = to_numpy(encoded_map[did])
-                doc_embeddings_map[did] = arr
-                if self.save_doc_embeds:
-                    np.save(self._doc_emb_path(did), arr)
-
-        # 3) 리스트로 정렬
-        doc_embeddings_list = [doc_embeddings_map[doc_id] for doc_id in self.doc_ids]
-
-        # ---------- FDE 인덱스 생성 ----------
-        logging.info(f"[{self.__class__.__name__}] Generating FDEs from ColBERT embeddings...")
+        # ---------- 배치 단위 처리: 인코딩 → FDE 생성 → 저장 ----------
+        ATOMIC_BATCH_SIZE = 1000  # 배치 크기 (메모리 매핑으로 안전하게 처리)
 
         #[1017] K-means partition별 indice별 원소 개수 csv 파일 저장 필요------------------------------------
         partition_count_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_kmeans{args.simhash}_rerank{args.rerank}")
@@ -458,34 +452,240 @@ class ColbertFdeRetriever:
             f.write("doc_idx,rep_num,partition_idx,count\n")
         #------------------------------------------------------------------------
         
-        fde_result = generate_document_fde_batch(
-            doc_embeddings_list,
-            self.doc_config,
-            memmap_path=os.path.join(self._cache_dir, "fde_index.mmap"),
-            max_bytes_in_memory=2 * 1024**3,  # optional guard
-            log_every=50000,
+        # FDE 인덱스 초기화 (메모리 매핑으로)
+        num_partitions = 2 ** self.doc_config.num_simhash_projections
+        final_fde_dim_per_rep = num_partitions * (self.doc_config.projection_dimension or self.doc_config.dimension)
+        final_fde_dim = self.doc_config.num_repetitions * final_fde_dim_per_rep
+        
+        # FDE 인덱스 memmap 생성
+        fde_memmap_path = os.path.join(self._cache_dir, f"fde_index_memmap_{args.rep}_{args.simhash}.mmap")
+        fde_index = np.memmap(fde_memmap_path, mode="w+", dtype=np.float32, 
+                             shape=(len(self.doc_ids), final_fde_dim))
+        
+        # Step 0: 전체 문서에 대해 K-means centers 사전 학습
+        logging.info(f"[K-means Pre-training] Learning centers from all {len(self.doc_ids)} documents...")
+        
+        # K-means centers 사전 학습
+        from fde_generator_optimized_stream_kmeans import _calculate_memory_based_sample_ratio, _sample_and_train_kmeans
+        
+        # 먼저 샘플 문서 하나를 로드해서 실제 토큰 수 확인
+        actual_tokens_per_doc = None
+        for doc_id in self.doc_ids[:10]:  # 처음 10개 문서 중 하나 찾기
+            ext = self._external_doc_emb_path(doc_id)
+            if ext and os.path.exists(ext):
+                loaded_emb = np.load(ext)
+                if loaded_emb.ndim == 2:
+                    actual_tokens_per_doc = loaded_emb.shape[0]
+                    break
+            dst = self._doc_emb_path(doc_id)
+            if os.path.exists(dst):
+                try:
+                    loaded_emb = np.load(dst)
+                    if loaded_emb.ndim == 2 and loaded_emb.shape[1] == 128:
+                        actual_tokens_per_doc = loaded_emb.shape[0]
+                        break
+                except:
+                    pass
+        
+        if actual_tokens_per_doc is not None:
+            logging.info(f"[K-means Pre-training] Detected actual tokens per doc: {actual_tokens_per_doc}")
+        else:
+            logging.warning(f"[K-means Pre-training] Could not detect actual tokens per doc, using default estimate")
+        
+        # 메모리 기반 샘플링 비율 계산 (실제 토큰 수 사용) - 한 번만 계산
+        dynamic_sample_ratio = _calculate_memory_based_sample_ratio(
+            len(self.doc_ids), 128, num_partitions, self.doc_config.target_memory_gb, 
+            min_ratio=0.05, max_ratio=0.3, actual_tokens_per_doc=actual_tokens_per_doc
         )
         
-        if len(fde_result) == 3:
-            self.fde_index, partition_counter, self.kmeans_centers = fde_result
-        else:
-            # 빈 배열인 경우
-            self.fde_index = fde_result
-            partition_counter = np.array([])
-            self.kmeans_centers = np.array([])
-
-        logging.info(f"[FDE Index] Final FDE index shape: {self.fde_index.shape}")
-
-        #[1017] K-means partition별 indice별 원소 개수 저장 필요------------------------------------
-        # partition_counter shape: (num_docs_in_batch, num_repetitions, num_partitions)
-        if partition_counter.size > 0:
-            for doc_idx in range(partition_counter.shape[0]):
-                for rep_num in range(partition_counter.shape[1]):
-                    for partition_idx in range(partition_counter.shape[2]):
-                        count = partition_counter[doc_idx, rep_num, partition_idx]
-                        with open(partition_count_path, "a", encoding="utf-8") as f:
-                            f.write(f"{doc_idx},{rep_num},{partition_idx},{count}\n")
-        #------------------------------------------------------------------------
+        n_sample_docs = max(int(len(self.doc_ids) * dynamic_sample_ratio), 1)
+        logging.info(f"[K-means Pre-training] Calculated sample ratio: {dynamic_sample_ratio:.3f} -> {n_sample_docs} docs per repetition")
+        
+        # 각 repetition별로 K-means centers 학습 (각각 다른 random sampling)
+        self.kmeans_centers = np.zeros((self.doc_config.num_repetitions, num_partitions, 128), dtype=np.float32)
+        
+        for rep_num in range(self.doc_config.num_repetitions):
+            # 각 repetition마다 다른 random seed로 샘플링
+            current_seed = self.doc_config.seed + rep_num
+            rng = np.random.default_rng(current_seed)
+            sample_doc_indices = rng.choice(len(self.doc_ids), size=n_sample_docs, replace=False)
+            
+            logging.info(f"[K-means Pre-training] Rep {rep_num}: Sampling {n_sample_docs} docs with seed {current_seed}")
+            
+            # 샘플링된 문서들의 임베딩만 선택적으로 로드
+            rep_projected_points = []
+            
+            for doc_idx in sample_doc_indices:
+                doc_id = self.doc_ids[doc_idx]
+                
+                # 외부 디렉터리에서 로드
+                ext = self._external_doc_emb_path(doc_id)
+                if ext and os.path.exists(ext):
+                    loaded_emb = np.load(ext).astype(np.float32)
+                    rep_projected_points.append(loaded_emb)
+                    continue
+                
+                # 내부 캐시에서 로드
+                dst = self._doc_emb_path(doc_id)
+                if os.path.exists(dst):
+                    try:
+                        loaded_emb = np.load(dst)
+                        if loaded_emb.ndim == 2 and loaded_emb.shape[1] == 128:
+                            rep_projected_points.append(loaded_emb.astype(np.float32))
+                            continue
+                    except Exception as e:
+                        print(f"[inner load error]: {e}, will regenerate")
+                
+                # 누락된 문서는 나중에 배치에서 처리
+                pass
+            
+            rep_projected_points = np.vstack(rep_projected_points)
+            logging.info(f"[K-means Pre-training] Rep {rep_num}: Collected {len(rep_projected_points)} points for K-means learning")
+            
+            # 이 repetition의 K-means centers 학습 (계산된 sample rate 사용)
+            self.kmeans_centers[rep_num] = _sample_and_train_kmeans(
+                rep_projected_points, num_partitions, current_seed, dynamic_sample_ratio, actual_tokens_per_doc
+            )
+            logging.info(f"[K-means Pre-training] Rep {rep_num}: Learned {num_partitions} partitions from {len(rep_projected_points)} points")
+            
+            # 메모리 해제
+            del rep_projected_points
+            import gc
+            gc.collect()
+        
+        logging.info(f"[K-means Pre-training] Completed centers learning. Shape: {self.kmeans_centers.shape}")
+        logging.info(f"[K-means Pre-training] Total partitions learned: {self.doc_config.num_repetitions} repetitions × {num_partitions} partitions = {self.doc_config.num_repetitions * num_partitions} total partitions")
+        
+        logging.info(f"[{self.__class__.__name__}] Processing {len(self.doc_ids)} documents in atomic batches of {ATOMIC_BATCH_SIZE}...")
+        
+        for batch_start in range(0, len(self.doc_ids), ATOMIC_BATCH_SIZE):
+            batch_end = min(batch_start + ATOMIC_BATCH_SIZE, len(self.doc_ids))
+            batch_doc_ids = self.doc_ids[batch_start:batch_end]
+            
+            logging.info(f"[Atomic Batch] Processing batch {batch_start//ATOMIC_BATCH_SIZE + 1}/{(len(self.doc_ids) + ATOMIC_BATCH_SIZE - 1)//ATOMIC_BATCH_SIZE}: docs {batch_start}-{batch_end-1}")
+            
+            # Step 1: 배치용 임베딩 수집 (파일에서 직접 로드)
+            batch_embeddings = []
+            batch_missing_ids = []
+            
+            for doc_id in batch_doc_ids:
+                # 외부 디렉터리에서 로드
+                ext = self._external_doc_emb_path(doc_id)
+                if ext and os.path.exists(ext):
+                    batch_embeddings.append(np.load(ext).astype(np.float32))
+                    continue
+                
+                # 내부 캐시에서 로드
+                dst = self._doc_emb_path(doc_id)
+                if os.path.exists(dst):
+                    try:
+                        loaded_emb = np.load(dst)
+                        if loaded_emb.ndim == 2 and loaded_emb.shape[1] == 128:
+                            batch_embeddings.append(loaded_emb.astype(np.float32))
+                            continue
+                        else:
+                            print(f"[inner shape invalid]: {loaded_emb.shape}, will regenerate")
+                    except Exception as e:
+                        print(f"[inner load error]: {e}, will regenerate")
+                
+                batch_missing_ids.append(doc_id)
+            
+            # Step 2: 누락된 문서들 배치 인코딩
+            if batch_missing_ids:
+                logging.info(f"[Atomic Batch] Encoding {len(batch_missing_ids)} missing documents...")
+                to_encode_docs = [{"id": did, **corpus[did]} for did in batch_missing_ids]
+                encoded_map = self.ranker.encode_documents(documents=to_encode_docs)
+                
+                for did in batch_missing_ids:
+                    arr = to_numpy(encoded_map[did])
+                    batch_embeddings.append(arr)
+                    
+                    # 공통 디렉터리에 저장 (없을 때만)
+                    common_path = self._common_doc_emb_path(did)
+                    if common_path and not os.path.exists(common_path):
+                        os.makedirs(os.path.dirname(common_path), exist_ok=True)
+                        np.save(common_path, arr)
+                        logging.info(f"[doc-embed] saved to common directory: {common_path}")
+                    
+                    del encoded_map[did]
+                    del arr
+                
+                del to_encode_docs
+                del encoded_map
+            
+            # Step 3: 배치 FDE 생성
+            logging.info(f"[Atomic Batch] Generating FDE for {len(batch_embeddings)} documents...")
+            # 배치별 임시 memmap 파일 생성
+            batch_memmap_path = os.path.join(self._cache_dir, f"batch_{batch_start//ATOMIC_BATCH_SIZE}.mmap")
+            batch_fde_result = generate_document_fde_batch(
+                batch_embeddings,
+                self.doc_config,
+                memmap_path=batch_memmap_path,  # 배치별 memmap 사용
+                max_bytes_in_memory=512 * 1024**2,  # 512MB로 제한
+                log_every=ATOMIC_BATCH_SIZE,
+                flush_interval=ATOMIC_BATCH_SIZE,
+                kmeans_centers=self.kmeans_centers,  # 사전 학습된 centers 전달
+            )
+            
+            if isinstance(batch_fde_result, tuple):
+                batch_fde, partition_counter, kmeans_centers_batch = batch_fde_result
+                # K-means centers는 이미 사전 학습됨 (저장 불필요)
+            else:
+                batch_fde = batch_fde_result
+                partition_counter = None
+            
+            # Step 4: FDE 인덱스에 통합 저장 (메모리 매핑에 직접 저장)
+            fde_index[batch_start:batch_end] = batch_fde
+            logging.info(f"[FDE Integration] Integrated batch {batch_start//ATOMIC_BATCH_SIZE + 1} into final memmap")
+            
+            # Step 5: 배치별 flush (즉시 디스크 저장)
+            fde_index.flush()
+            
+            # Step 6: K-means 통계 저장
+            if partition_counter is not None:
+                for doc_idx in range(partition_counter.shape[0]):
+                    global_doc_idx = batch_start + doc_idx
+                    for rep_num in range(partition_counter.shape[1]):
+                        for partition_idx in range(partition_counter.shape[2]):
+                            count = partition_counter[doc_idx, rep_num, partition_idx]
+                            with open(partition_count_path, "a", encoding="utf-8") as f:
+                                f.write(f"{global_doc_idx},{rep_num},{partition_idx},{count}\n")
+            
+            # Step 7: 배치 완료 후 메모리 해제
+            del batch_embeddings
+            if not (batch_memmap_path and os.path.exists(batch_memmap_path)):
+                del batch_fde  # memmap이 아닌 경우만 삭제
+            if partition_counter is not None:
+                del partition_counter
+            import gc
+            gc.collect()
+            
+            # Step 8: 임시 배치 memmap 파일 정리
+            if batch_memmap_path and os.path.exists(batch_memmap_path):
+                try:
+                    os.remove(batch_memmap_path)
+                    logging.info(f"[Atomic Batch] Cleaned up batch memmap: {batch_memmap_path}")
+                except Exception as e:
+                    logging.warning(f"[Atomic Batch] Failed to clean up {batch_memmap_path}: {e}")
+        
+        # Step 8: 최종 통합 memmap 완성 및 저장
+        fde_index.flush()
+        logging.info(f"[FDE Integration] Final integrated memmap completed: {fde_memmap_path}")
+        logging.info(f"[FDE Integration] Final shape: {fde_index.shape}")
+        
+        # 최종 통합 memmap을 인스턴스에 할당
+        self.fde_index = fde_index
+        
+        # FDE 인덱스 참조 해제 (메모리 절약)
+        del fde_index
+        import gc
+        gc.collect()
+        
+        logging.info(f"[Atomic Batch] Completed processing {len(self.doc_ids)} documents")
+        logging.info(f"[Atomic Batch] Integrated FDE index saved to: {fde_memmap_path}")
+        
+        # 메모리 해제
+        logging.info(f"[{self.__class__.__name__}] Memory cleanup completed")
         
         # 저장
         self._save_cache()
@@ -619,9 +819,9 @@ if __name__ == "__main__":
             model_name=COLBERT_MODEL_NAME,
             rerank_candidates=args.rerank,
             enable_rerank=True,
-            save_doc_embeds=True,
-            latency_log_path=os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_simhash{args.simhash}_rerank{args.rerank}", "latency.tsv"),  # QID\tSearch\tRerank
-            external_doc_embeds_dir=f"/media/hyunji/7672b947-0099-4e49-8e90-525a208d54b8/muvera_optimized/cache_muvera/{DATASET_REPO_ID}/{FILENAME}/doc_embeds",  # ★ 공통 문서 
+            save_doc_embeds=False,  # 공통 디렉터리에만 저장, 하위 디렉터리 중복 저장 방지
+            latency_log_path=os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_kmeans{args.simhash}_rerank{args.rerank}", "latency.tsv"),  # QID\tSearch\tRerank
+            external_doc_embeds_dir=COMMON_DOC_EMBEDS_DIR,  # ★ 공통 문서 임베딩 디렉터리 
             num_repetitions=args.rep,
             num_simhash_projections=args.simhash,
         )
@@ -647,7 +847,7 @@ if __name__ == "__main__":
         results = {}
 
         # 지연시간 로그 파일 초기화
-        latency_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_simhash{args.simhash}_rerank{args.rerank}")
+        latency_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_kmeans{args.simhash}_rerank{args.rerank}")
         os.makedirs(latency_dir, exist_ok=True)
         with open(os.path.join(latency_dir, "latency.tsv"), "w", encoding="utf-8") as f:
             f.write("QID\tSearch\tRerank\n")

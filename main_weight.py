@@ -56,6 +56,13 @@ dataset = "trec-covid"
 QUERY_SEARCH_DIR = os.path.join(CACHE_ROOT, "query_search")
 os.makedirs(QUERY_SEARCH_DIR, exist_ok=True)
 
+# 공통 문서 임베딩 디렉터리 설정
+COMMON_EMBEDS_DIR = os.path.join("/media/hyunji/7672b947-0099-4e49-8e90-525a208d54b8", "muvera_optimized", "cache_muvera", DATASET_REPO_ID)
+COMMON_DOC_EMBEDS_DIR = os.path.join(COMMON_EMBEDS_DIR, "doc_embeds")
+COMMON_QUERY_EMBEDS_DIR = os.path.join(COMMON_EMBEDS_DIR, "query_embeds")
+os.makedirs(COMMON_DOC_EMBEDS_DIR, exist_ok=True)
+os.makedirs(COMMON_QUERY_EMBEDS_DIR, exist_ok=True)
+
 # ======================
 # --- Logging Setup ----
 # ======================
@@ -243,7 +250,10 @@ class ColbertFdeRetriever:
         self.external_doc_embeds_dir = external_doc_embeds_dir  # ★
         
         # 공통 문서 임베딩 디렉터리 설정
-        self.common_doc_embeds_dir = external_doc_embeds_dir
+        self.common_doc_embeds_dir = COMMON_DOC_EMBEDS_DIR
+        
+        # 공통 쿼리 임베딩 디렉터리 설정
+        self.common_query_embeds_dir = COMMON_QUERY_EMBEDS_DIR
 
         # 캐시 경로
         self._model_name = model_name
@@ -258,8 +268,7 @@ class ColbertFdeRetriever:
 
         os.makedirs(self._cache_dir, exist_ok=True)
         os.makedirs(self._queries_dir, exist_ok=True)
-        if self.save_doc_embeds:
-            os.makedirs(self._doc_emb_dir, exist_ok=True)
+        # 개별 하위 디렉터리에 doc_embeds 저장하지 않음 (공통 디렉터리 사용)
 
         # 지연시간 로그 파일 (헤더 없이 누적)
         self._latency_log_path = latency_log_path or os.path.join(self._cache_dir, "latency.tsv")
@@ -346,11 +355,35 @@ class ColbertFdeRetriever:
         return True
 
     def _save_query_cache(self, key: str, query_embeddings: np.ndarray, query_fde: np.ndarray):
-        emb_path, fde_path = self._query_paths(key)
-        np.save(emb_path, query_embeddings)
+        # 공통 디렉터리에 쿼리 임베딩 저장
+        if hasattr(self, 'common_query_embeds_dir') and self.common_query_embeds_dir:
+            # query_id 추출 (key에서)
+            query_id = key.split('||')[0] if '||' in key else None
+            if query_id and query_id.strip():  # 빈 문자열 체크 추가
+                common_emb_path = os.path.join(self.common_query_embeds_dir, f"query_{query_id}.npy")
+                if not os.path.exists(common_emb_path):
+                    os.makedirs(os.path.dirname(common_emb_path), exist_ok=True)
+                    np.save(common_emb_path, query_embeddings)
+                    logging.info(f"[query-embed] saved to common directory: {common_emb_path}")
+        
+        # FDE만 개별 하위 디렉터리에 저장 (백업 제거)
+        _, fde_path = self._query_paths(key)
         np.save(fde_path, query_fde)
 
     def _load_query_cache(self, key: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        # 공통 디렉터리에서 쿼리 임베딩 로드 시도
+        if hasattr(self, 'common_query_embeds_dir') and self.common_query_embeds_dir:
+            query_id = key.split('||')[0] if '||' in key else None
+            if query_id and query_id.strip():  # 빈 문자열 체크 추가
+                common_emb_path = os.path.join(self.common_query_embeds_dir, f"query_{query_id}.npy")
+                if os.path.exists(common_emb_path):
+                    emb = np.load(common_emb_path)
+                    # FDE는 개별 하위 디렉터리에서 로드
+                    _, fde_path = self._query_paths(key)
+                    fde = np.load(fde_path) if os.path.exists(fde_path) else None
+                    return emb, fde
+        
+        # 공통 디렉터리에 없으면 개별 하위 디렉터리에서 로드 (fallback)
         emb_path, fde_path = self._query_paths(key)
         emb = np.load(emb_path) if os.path.exists(emb_path) else None
         fde = np.load(fde_path) if os.path.exists(fde_path) else None
@@ -363,22 +396,16 @@ class ColbertFdeRetriever:
         return float(sim.max(axis=1).sum())
 
     def _get_doc_embeddings(self, doc_id: str, allow_build: bool = True) -> np.ndarray:
-        """재랭킹 시 문서 임베딩 로드: 외부 디렉터리 → 내부 캐시 → 필요시 on-the-fly 인코딩"""
-        # 1) 외부 디렉터리 우선
+        """재랭킹 시 문서 임베딩 로드: 공통 디렉터리 → 필요시 on-the-fly 인코딩"""
+        # 1) 공통 디렉터리에서 로드
         ext_path = self._external_doc_emb_path(doc_id)
         if ext_path and os.path.exists(ext_path):
-            #logging.info(f"[doc-embed] external load: id={doc_id} path={ext_path}")
+            #logging.info(f"[doc-embed] common load: id={doc_id} path={ext_path}")
             return np.load(ext_path)
 
-        # 2) 내부 캐시
-        int_path = self._doc_emb_path(doc_id)
-        if os.path.exists(int_path):
-            #logging.info(f"[doc-embed] internal load: id={doc_id} path={int_path}")
-            return np.load(int_path)
-
-        # 3) 필요 시 빌드
+        # 2) 필요 시 빌드 (개별 저장 없이)
         if not allow_build:
-            raise FileNotFoundError(ext_path or int_path)
+            raise FileNotFoundError(ext_path)
 
         if self._corpus is None:
             raise RuntimeError("Corpus not set; cannot build document embeddings on the fly.")
@@ -386,9 +413,11 @@ class ColbertFdeRetriever:
         emap = self.ranker.encode_documents(documents=[doc])
         arr = to_numpy(emap[doc_id])
 
-        # 내부 캐시에 저장(선택)
-        np.save(int_path, arr)
-        #logging.info(f"[doc-embed] built & saved: id={doc_id} path={int_path}")
+        # 공통 디렉터리에 저장
+        if ext_path:
+            os.makedirs(os.path.dirname(ext_path), exist_ok=True)
+            np.save(ext_path, arr)
+            #logging.info(f"[doc-embed] built & saved to common: id={doc_id} path={ext_path}")
         return arr
 
     # --------- Latency log ---------
@@ -421,11 +450,7 @@ class ColbertFdeRetriever:
             ext = self._external_doc_emb_path(doc_id)            
             if ext and os.path.exists(ext):
                 doc_embeddings_map[doc_id] = np.load(ext).astype(np.float32)                
-                # 필요 시 내부 캐시에도 채움
-                if self.save_doc_embeds:
-                    dst = self._doc_emb_path(doc_id)
-                    if not os.path.exists(dst):
-                        np.save(dst, doc_embeddings_map[doc_id])
+                # 공통 디렉터리에서 로드했으므로 개별 저장 불필요
                 continue
 
             # 내부 캐시 확인
@@ -525,8 +550,7 @@ class ColbertFdeRetriever:
                         np.save(common_path, arr)
                         logging.info(f"[doc-embed] saved to common directory: {common_path}")
                     
-                    if self.save_doc_embeds:
-                        np.save(self._doc_emb_path(did), arr)
+                    # 공통 디렉터리에 저장했으므로 개별 저장 불필요
                     del encoded_map[did]
                     del arr
                 
@@ -541,7 +565,7 @@ class ColbertFdeRetriever:
                 batch_embeddings,
                 self.doc_config,
                 memmap_path=batch_memmap_path,  # 배치별 memmap 사용
-                max_bytes_in_memory=512 * 1024**2,  # 2MB로 제한
+                max_bytes_in_memory=512 * 1024**2,  # 512MB로 제한
                 log_every=ATOMIC_BATCH_SIZE,
                 flush_interval=ATOMIC_BATCH_SIZE,
             )
@@ -733,6 +757,7 @@ if __name__ == "__main__":
 
 
     logging.info("Initializing retrieval models...")
+
     retrievers = {
         "2. ColBERT + FDE (+Chamfer rerank)": ColbertFdeRetriever(
             model_name=COLBERT_MODEL_NAME,
@@ -740,7 +765,7 @@ if __name__ == "__main__":
             enable_rerank=True,
             save_doc_embeds=False,  # 공통 디렉터리에만 저장, 하위 디렉터리 중복 저장 방지
             latency_log_path=os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_simhash{args.simhash}_rerank{args.rerank}", "latency.tsv"),  # QID\tSearch\tRerank
-            external_doc_embeds_dir=f"/media/hyunji/7672b947-0099-4e49-8e90-525a208d54b8/muvera_optimized/cache_muvera/{DATASET_REPO_ID}/{FILENAME}/doc_embeds",  # ★ 공통 문서 임베딩 디렉터리
+            external_doc_embeds_dir=COMMON_DOC_EMBEDS_DIR,  # ★ 공통 문서 임베딩 디렉터리
             num_repetitions=args.rep,
             num_simhash_projections=args.simhash,
         )
