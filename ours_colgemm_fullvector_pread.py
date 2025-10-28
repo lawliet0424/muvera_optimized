@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Naive-baseline pipeline (+ Pack build & Half-Doc from pack):
+Naive-baseline pipeline (+ Pack/TPack & Half-Doc from pack):
   - ANN: 배치 검색 (FAISS)
-  - Rerank: 배치 모아 문서별 Chamfer (대형 GEMM/세그먼트 리듀스 없음)
-  - PackBuilder/PackReader 통합
-  - HALF_POLICY( front | back | stride2 )로 pack에서 문서 토큰의 절반만 읽기
+  - Rerank: 기본은 Big GEMM(+세그먼트 리듀스). vstack 없는 TPack(열-주 저장 B^T) 경로 제공
+  - PackBuilder/PackReader (row-pack, C-order) + TPackBuilder/TPackReader (col-pack B^T, F-order)
+  - HALF_POLICY(front/back/stride2)로 pack에서 문서 토큰의 절반만 읽기
   - (Two-Stage) ANN 상위 num_rank_candidates만 재랭크 + 스케치(idx 사이드카)로 해당 행만 읽기
 
 실험 파라미터:
@@ -21,10 +21,10 @@ from statistics import mean
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import islice
 
-import nltk
 import numpy as np
 import torch
 import joblib
+import nltk
 
 import neural_cherche.models as neural_cherche_models
 import neural_cherche.rank as neural_cherche_rank
@@ -89,8 +89,8 @@ FDE_NUM_REPETITIONS = 2
 FDE_NUM_SIMHASH = 3
 
 # --------- Two-Stage 설정 ----------
-ENABLE_TWO_STAGE = False         # --enable_two_stage 로 켬
-STAGE1_SKETCH_TOKENS = 256       # 스케치 크기 (문서 내 선택 행 수)
+ENABLE_TWO_STAGE = False
+STAGE1_SKETCH_TOKENS = 256
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -234,7 +234,7 @@ from fde_generator_optimized_stream import (
 )
 
 # =====================================
-# Pack Builder & Reader
+# Row Pack (C-order) Builder & Reader
 # =====================================
 @dataclass
 class PackPaths:
@@ -245,7 +245,6 @@ class PackPaths:
     pack_meta: str
 
 class PackBuilder:
-    """pack 파일(연속 row-major float32) 생성기"""
     def __init__(self, pack_dir: str, block_size: int, dim: int):
         os.makedirs(pack_dir, exist_ok=True)
         self.paths = PackPaths(
@@ -264,8 +263,7 @@ class PackBuilder:
         return np.sqrt((x * x).sum(axis=1))
 
     def build(self, retriever: "ColbertFdeRetrieverNaive", corpus: dict, doc_ids: List[str]):
-        logging.info(f"[PackBuilder] building pack to {os.path.dirname(self.paths.tokens_bin)} "
-                     f"(block_size={self.block_size})")
+        logging.info(f"[PackBuilder] building pack to {os.path.dirname(self.paths.tokens_bin)} (block_size={self.block_size})")
         f_tokens = open(self.paths.tokens_bin, "wb", buffering=0)
         doc_ptrs: List[int] = [0]
         block_ptrs: List[int] = [0]
@@ -285,7 +283,7 @@ class PackBuilder:
             f_tokens.write(blk.tobytes(order="C"))
             total_rows += blk.shape[0]
             block_ptrs.append(total_rows)
-            cur_block_rows = []
+            cur_block_rows[:] = []
             cur_cnt = 0
 
         for did in doc_ids:
@@ -333,7 +331,6 @@ class PackBuilder:
         logging.info(f"[PackBuilder] done: rows={total_rows}, blocks={len(block_ptrs)-1}")
 
 class PackReader:
-    """pack 구조를 읽는 경량 리더: os.pread 기반 연속 블록/행 읽기 + 임의행(span) 읽기"""
     def __init__(self, pack_dir: str):
         meta_path = os.path.join(pack_dir, "pack_meta.json")
         with open(meta_path, "r", encoding="utf-8") as f:
@@ -342,9 +339,9 @@ class PackReader:
         self.dim = int(meta["dim"])
         self.itemsize = 4
         self.tokens_bin_path = os.path.join(pack_dir, meta["tokens_bin"])
-        self.doc_ptrs = np.load(os.path.join(pack_dir, meta["doc_ptrs"])).astype(np.int64)
-        self.block_ptrs = np.load(os.path.join(pack_dir, meta["block_ptrs"])).astype(np.int64)
-        self.block_max_norms = np.load(os.path.join(pack_dir, meta["block_max_norms"])).astype(np.float32)
+        self.doc_ptrs = np.load(os.path.join(pack_dir, meta["doc_ptrs"]), mmap_mode='r')# ).astype(np.int64)
+        self.block_ptrs = np.load(os.path.join(pack_dir, meta["block_ptrs"], mmap_mode='r')) #).astype(np.int64)
+        self.block_max_norms = np.load(os.path.join(pack_dir, meta["block_max_norms"], mmap_mode='r'))#).astype(np.float32)
         self.block_size = int(meta["block_size"])
         self.n_blocks = int(meta["n_blocks"])
         self.total_rows = int(meta["total_rows"])
@@ -355,10 +352,8 @@ class PackReader:
         return self.doc_ptrs.shape[0] - 1
 
     def close(self):
-        try:
-            os.close(self.fd)
-        except Exception:
-            pass
+        try: os.close(self.fd)
+        except Exception: pass
 
     def doc_row_span(self, doc_idx: int) -> Tuple[int, int]:
         s = int(self.doc_ptrs[doc_idx]); e = int(self.doc_ptrs[doc_idx+1])
@@ -374,7 +369,6 @@ class PackReader:
         return np.ascontiguousarray(arr.reshape(n_rows, self.dim))
 
     def pread_row_spans(self, spans: List[Tuple[int, int]]) -> np.ndarray:
-        """여러 (start_row, length) span을 순서대로 읽어 vstack"""
         if not spans:
             return np.empty((0, self.dim), dtype=np.float32)
         chunks = [self.pread_rows(s, n) for (s, n) in spans if n > 0]
@@ -382,7 +376,6 @@ class PackReader:
 
     @staticmethod
     def rows_to_spans(row_ids: np.ndarray) -> List[Tuple[int, int]]:
-        """정렬되지 않은 row id 집합을 정렬/중복제거하고 연속 구간으로 합쳐 span으로 반환"""
         if row_ids.size == 0: return []
         r = np.unique(row_ids.astype(np.int64))
         spans = []
@@ -395,6 +388,73 @@ class PackReader:
             s, prev = x, x
         spans.append((s, prev - s + 1))
         return spans
+
+# =====================================
+# TPack (col-major B^T) Builder & Reader
+# =====================================
+class TPackBuilder:
+    def __init__(self, tpack_dir: str, dim: int):
+        os.makedirs(tpack_dir, exist_ok=True)
+        self.tokensF = os.path.join(tpack_dir, "tokensF.bin")       # col-major B^T bytes
+        self.doc_col_ptrs = os.path.join(tpack_dir, "doc_col_ptrs.npy")
+        self.meta = os.path.join(tpack_dir, "tpack_meta.json")
+        self.D = int(dim)  # build()에서 실제 D_doc로 덮어씀
+
+    def build(self, retriever: "ColbertFdeRetrieverNaive", doc_ids: List[str]):
+        logging.info(f"[TPackBuilder] building col-major B^T...")
+        ptrs = [0]
+        total_cols = 0
+        true_D = None
+        with open(self.tokensF, "wb", buffering=0) as f:
+            for did in doc_ids:
+                X = retriever._get_doc_embeddings(did, allow_build=True).astype(np.float32, copy=False)  # [n_i, D_doc]
+                if true_D is None:
+                    true_D = int(X.shape[1])
+                elif int(X.shape[1]) != true_D:
+                    raise ValueError(f"[TPackBuilder] doc dim mismatch: got {X.shape[1]} vs expected {true_D}")
+                XT = np.asfortranarray(X.T)  # (D_doc, n_i), F-contig
+                f.write(XT.tobytes(order="F"))
+                total_cols += int(X.shape[0])
+                ptrs.append(total_cols)
+        if true_D is None:
+            true_D = int(self.D)
+        np.save(self.doc_col_ptrs, np.asarray(ptrs, dtype=np.int64))
+        with open(self.meta, "w", encoding="utf-8") as f:
+            json.dump({"dtype": "float32", "order": "F", "D": int(true_D), "total_cols": int(total_cols),
+                       "tokensF": "tokensF.bin", "doc_col_ptrs": "doc_col_ptrs.npy"}, f, indent=2)
+        logging.info(f"[TPackBuilder] done: W={total_cols}, D={true_D}")
+
+class TPackReader:
+    def __init__(self, tpack_dir: str):
+        meta_path = os.path.join(tpack_dir, "tpack_meta.json")
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        assert meta["dtype"] == "float32" and meta["order"] == "F"
+        self.D = int(meta["D"])                 # 문서 토큰 차원(=쿼리 토큰 차원)
+        self.total_cols = int(meta["total_cols"])
+        self.tokensF_path = os.path.join(tpack_dir, meta["tokensF"])
+        self.doc_col_ptrs = np.load(os.path.join(tpack_dir, meta["doc_col_ptrs"]), mmap_mode='r') #).astype(np.int64)
+        self.fd = os.open(self.tokensF_path, os.O_RDONLY)
+        self.itemsize = 4
+
+    def close(self):
+        try: os.close(self.fd)
+        except Exception: pass
+
+    def doc_col_span(self, doc_idx: int) -> Tuple[int, int]:
+        s = int(self.doc_col_ptrs[doc_idx]); e = int(self.doc_col_ptrs[doc_idx+1])
+        return s, e  # [s, e) over columns of B^T
+
+    def pread_cols(self, start_col: int, n_cols: int) -> np.ndarray:
+        """열 범위 [start, start+n) 만 읽어 (D, n) F-order view로 반환(복사 없이)"""
+        if n_cols <= 0:
+            return np.empty((self.D, 0), dtype=np.float32, order="F")
+        byte_off = start_col * self.D * self.itemsize
+        byte_len = n_cols * self.D * self.itemsize
+        buf = os.pread(self.fd, byte_len, byte_off)
+        arr = np.frombuffer(buf, dtype=np.float32, count=n_cols * self.D)
+        # (D, n) F-order 로 reshape. 이 배열은 읽기 전용(view)
+        return np.ndarray(shape=(self.D, n_cols), dtype=np.float32, buffer=arr, order="F")
 
 # =====================================
 # Retriever
@@ -417,10 +477,13 @@ class ColbertFdeRetrieverNaive:
         fde_reps: int = FDE_NUM_REPETITIONS,
         fde_simhash: int = FDE_NUM_SIMHASH,
         # pack/half 옵션
-        use_pack_half: bool = False,
+        use_pack_half: bool = True,
         half_policy: str = "front",             # "front" | "back" | "stride2"
         pack_block_size: int = 512,
         build_pack_if_missing: bool = False,
+        # TPack(B^T) 옵션
+        use_tpack: bool = False,
+        build_tpack_if_missing: bool = False,
     ):
         self.faiss_num_threads = max(1, int(faiss_num_threads))
         model = neural_cherche_models.ColBERT(model_name_or_path=model_name, device=DEVICE)
@@ -462,7 +525,6 @@ class ColbertFdeRetrieverNaive:
         if self.save_doc_embeds:
             os.makedirs(self._doc_emb_dir, exist_ok=True)
 
-        # (NEW) sketch sidecar 저장 위치
         self._sketch_dir = os.path.join(self._cache_dir, "doc_stage")
         os.makedirs(self._sketch_dir, exist_ok=True)
 
@@ -475,7 +537,7 @@ class ColbertFdeRetrieverNaive:
             self._lru = _OD()
             self._lru_lock = threading.Lock()
             self._lru_cap = DOC_EMB_LRU_SIZE
-        
+
         try:
             with self._log_lock:
                 if not os.path.exists(self._latency_log_path):
@@ -486,23 +548,29 @@ class ColbertFdeRetrieverNaive:
                         )
         except Exception as e:
             logging.warning(f"[{self.__class__.__name__}] Failed to write latency header: {e}")
-        
+
         self._per_query_log_path = os.path.join(CACHE_ROOT, f"per_query_{TOP_K}.tsv")
         try:
-            with self._log_lock:                
-                if not os.path.exists(self._per_query_log_path):                    
-                    with open(self._per_query_log_path, "a", encoding="utf-8") as f:                        
+            with self._log_lock:
+                if not os.path.exists(self._per_query_log_path):
+                    with open(self._per_query_log_path, "a", encoding="utf-8") as f:
                         f.write("qid\trecall_at_k\n")
         except Exception as e:
             logging.warning(f"[{self.__class__.__name__}] Failed to write per-query header: {e}")
 
-        # pack 관련 상태
+        # pack 상태
         self.use_pack_half = bool(use_pack_half)
         self.half_policy = str(half_policy)
         self.pack_block_size = int(pack_block_size)
         self.build_pack_if_missing = bool(build_pack_if_missing)
         self.pack_dir = os.path.join(self._cache_dir, "pack")
-        self.pack: Optional[PackReader] = None  # ensure_pack()에서 채움
+        self.pack: Optional[PackReader] = None
+
+        # tpack 상태
+        self.use_tpack = bool(use_tpack)
+        self.build_tpack_if_missing = bool(build_tpack_if_missing)
+        self._tpack_dir = os.path.join(self._cache_dir, "tpack")
+        self.tpack: Optional[TPackReader] = None
 
     def _compute_cache_dir(self, dataset: str) -> str:
         return os.path.join(CACHE_ROOT, dataset)
@@ -537,21 +605,12 @@ class ColbertFdeRetrieverNaive:
         pos = self._doc_pos[doc_id]
         return os.path.join(self._doc_emb_dir, f"{pos:08d}.npy")
 
-    # ---- sketch sidecar paths
-    def _doc_sketch_path(self, doc_id: str) -> str:
-        pos = self._doc_pos[doc_id]
-        return os.path.join(self._sketch_dir, f"{pos:08d}.npy")
-    def _doc_sketch_idx_path(self, doc_id: str) -> str:
-        pos = self._doc_pos[doc_id]
-        return os.path.join(self._sketch_dir, f"{pos:08d}.idx.npy")
-
     def _load_cache(self) -> bool:
         self.fde_index = joblib.load(self._fde_path)
         with open(self._ids_path, "r", encoding="utf-8") as f:
             self.doc_ids = json.load(f)
         self._doc_pos = {d: i for i, d in enumerate(self.doc_ids)}
-        logging.info(f"[{self.__class__.__name__}] Loaded FDE index cache: "
-                     f"{self.fde_index.shape} for {len(self.doc_ids)} docs")
+        logging.info(f"[{self.__class__.__name__}] Loaded FDE index cache: {self.fde_index.shape} for {len(self.doc_ids)} docs")
 
     def ensure_pack(self, corpus: dict):
         if not (self.use_pack_half or ENABLE_TWO_STAGE):
@@ -561,15 +620,28 @@ class ColbertFdeRetrieverNaive:
                        ["tokens.bin", "doc_ptrs.npy", "block_ptrs.npy", "block_max_norms.npy", "pack_meta.json"])
         if need:
             if not self.build_pack_if_missing:
-                raise FileNotFoundError(
-                    f"[Pack] pack files not found in {self.pack_dir}. "
-                    f"Run with --build_pack_if_missing or prebuild them."
-                )
+                raise FileNotFoundError(f"[Pack] pack files not found in {self.pack_dir}. Run with --build_pack_if_missing.")
             logging.info("[Pack] building pack (missing files detected)...")
             builder = PackBuilder(self.pack_dir, block_size=self.pack_block_size, dim=int(self.fde_index.shape[1]))
             builder.build(self, corpus, self.doc_ids)
         self.pack = PackReader(self.pack_dir)
         logging.info("[Pack] ready.")
+
+    def ensure_tpack(self):
+        """열-주 저장된 B^T(tpack) 준비. build()는 실제 문서 차원 D_doc로 메타를 저장."""
+        if not self.use_tpack:
+            return
+        os.makedirs(self._tpack_dir, exist_ok=True)
+        need = not all(os.path.exists(os.path.join(self._tpack_dir, p)) for p in
+                       ["tokensF.bin", "doc_col_ptrs.npy", "tpack_meta.json"])
+        if need:
+            if not self.build_tpack_if_missing:
+                raise FileNotFoundError("[TPack] tpack files missing; pass --build_tpack_if_missing or prebuild.")
+            # 주의: dim=fde_index.shape[1]은 FDE 차원. build()가 실제 문서 토큰 차원으로 덮어씀.
+            builder = TPackBuilder(self._tpack_dir, dim=int(self.fde_index.shape[1]))
+            builder.build(self, self.doc_ids)
+        self.tpack = TPackReader(self._tpack_dir)
+        logging.info("[TPack] ready.")
 
     def _save_query_cache(self, key: str, query_embeddings: np.ndarray, query_fde: np.ndarray):
         emb_path, fde_path = self._query_paths(key)
@@ -589,7 +661,6 @@ class ColbertFdeRetrieverNaive:
 
     def _get_doc_rows_half_from_pack(self, doc_id: str, policy: str) -> np.ndarray:
         assert self.pack is not None, "pack reader not ready"
-        # logging.info(f"[DDD] _get_doc_rows_half_from_pack")
         di = self._doc_pos[doc_id]
         s, e = self.pack.doc_row_span(di)
         n = max(0, e - s)
@@ -664,15 +735,21 @@ class ColbertFdeRetrieverNaive:
         idx = np.load(self._doc_sketch_idx_path(doc_id))
         return sk, idx
 
+    def _doc_sketch_path(self, doc_id: str) -> str:
+        pos = self._doc_pos[doc_id]
+        return os.path.join(self._sketch_dir, f"{pos:08d}.npy")
+
+    def _doc_sketch_idx_path(self, doc_id: str) -> str:
+        pos = self._doc_pos[doc_id]
+        return os.path.join(self._sketch_dir, f"{pos:08d}.idx.npy")
+
     def index(self, corpus: dict):
         self._corpus = corpus
-        # load FDE + doc_ids + faiss if any
         self.fde_index = joblib.load(self._fde_path)
         with open(self._ids_path, "r", encoding="utf-8") as f:
             self.doc_ids = json.load(f)
         self._doc_pos = {d: i for i, d in enumerate(self.doc_ids)}
-        logging.info(f"[{self.__class__.__name__}] Loaded FDE index cache: "
-                     f"{self.fde_index.shape} for {len(self.doc_ids)} docs")
+        logging.info(f"[{self.__class__.__name__}] Loaded FDE index cache: {self.fde_index.shape} for {len(self.doc_ids)} docs")
 
         try:
             with open(self._meta_path, "r", encoding="utf-8") as f:
@@ -698,9 +775,12 @@ class ColbertFdeRetrieverNaive:
             except Exception:
                 self.faiss_index = None
 
-        # (중요) two-stage 또는 pack-half가 켜져 있으면 pack 준비
         if self.use_pack_half or ENABLE_TWO_STAGE:
             self.ensure_pack(corpus)
+
+        # TPack은 독립적 옵션
+        if self.use_tpack:
+            self.ensure_tpack()
 
     def precompute_queries(self, queries: dict):
         missing = 0
@@ -798,7 +878,6 @@ class ColbertFdeRetrieverNaive:
                      dup_ratio: Optional[float] = None):
         try:
             divided_ann_s = ann_s / ANN_BATCH_SIZE
-            dr = -1.0 if (dup_ratio is None) else float(dup_ratio)            
             with self._log_lock:
                 with open(self._latency_log_path, "a", encoding="utf-8") as f:
                     f.write(
@@ -818,18 +897,12 @@ def _rerank_task_naive(
     N_compute = num_rank_candidates
     compute_ids = [did for (did, _) in task.initial_candidates[:N_compute]]
 
-    pos_seq: List[int] = []
-
     io_s = 0.0
     compute_s = 0.0
+    vstack_s = 0.0
     reranked_pairs: List[Tuple[str, float]] = []
 
     for did in compute_ids:
-        try:
-            pos_seq.append(int(retriever._doc_pos[did]))
-        except Exception:
-            pass
-
         t_io = time.perf_counter()
         d_tok = retriever._get_doc_embeddings(did, allow_build=True)
         io_s += time.perf_counter() - t_io
@@ -841,60 +914,95 @@ def _rerank_task_naive(
 
     t_sort0 = time.perf_counter()
     reranked_pairs.sort(key=lambda x: x[1], reverse=True)
-    computed_set = {did for (did, _) in reranked_pairs}
-    tail_pairs = [(did, sc) for (did, sc) in task.initial_candidates if did not in computed_set]
-
-    out = OrderedDict()
-    for did, sc in reranked_pairs:
-        out[did] = sc
-    for did, sc in tail_pairs:
-        out[did] = float(sc)
-
     sort_s = time.perf_counter() - t_sort0
     total_s = io_s + compute_s + sort_s
-    
     meta = dict()
-    return out, total_s, compute_s, io_s, meta
+    return OrderedDict(reranked_pairs), total_s, compute_s, io_s, meta, vstack_s
 
 # ============== Rerank (mega GEMM) ==============
 def _rerank_task_with_mega_gemm(retriever: ColbertFdeRetrieverNaive, task: "RerankTask", top_k: int):
-    q_emb = task.query_embeddings
+    q_emb = task.query_embeddings                      # shape: [Tq, Dq]
+    Tq, Dq = int(q_emb.shape[0]), int(q_emb.shape[1])
+
     N_compute = min(top_k if top_k > 0 else len(task.initial_candidates),
                     retriever.rerank_candidates if retriever.rerank_candidates > 0 else len(task.initial_candidates),
-                    len(task.initial_candidates))
-    compute_ids = [did for (did, _) in task.initial_candidates[:N_compute]]    
+                    len(task.initial_candidates))    
+    compute_ids = [did for (did, _) in task.initial_candidates[:N_compute]]
 
-    pos_seq: List[int] = []
+    # ---- (A) TPack 경로: vstack 제거, 열-주 저장된 B^T를 슬라이스해 블록별 GEMM ----
+    if retriever.tpack is not None:
+        tp = retriever.tpack
+        # logging.info(f"retriever.tpack option is enabled")
+        if int(tp.D) != Dq:
+            logging.warning(f"[TPack] D mismatch (tp.D={tp.D} vs query.D={Dq}) → fallback to row-pack/memory path.")
+        else:
+            t_io0 = time.perf_counter()
+            doc_spans: List[Tuple[str, int, int]] = []
+            col_start = 0
+            for did in compute_ids:
+                # full_vector read : retriever._get_doc_embeddings(did, allow_build=True)
+                di = retriever._doc_pos[did]
+                s, e = tp.doc_col_span(di) # columns in B^T
+                doc_spans.append((did, s, e))
+            io_s = time.perf_counter() - t_io0
 
+            # 블록 반복: 한 문서씩 읽으면 syscalls 과다, 그대로 전체 span을 한 번에 읽기 어려우니 그대로 per-doc로 처리
+            # 그래도 vstack이 없으니 VS=0
+            vstack_s = 0.0
+            compute_s = 0.0
+            reranked_pairs: List[Tuple[str, float]] = []
+            
+            for did, s, e in doc_spans:
+                ncols = max(0, e - s) # 256                
+                if ncols <= 0:
+                    reranked_pairs.append((did, -1e9))
+                    continue
+                t_read = time.perf_counter()
+                Bblk = tp.pread_cols(s, ncols)       # (Dq, ncols) F-order view
+                # 즉시 GEMM
+                t_c0 = time.perf_counter()
+                Sblk = q_emb @ Bblk                  # (Tq, ncols)
+                score = float(Sblk.max(axis=1).sum()) if ncols > 0 else -1e9
+                compute_s += time.perf_counter() - t_c0
+                io_s += t_c0 - t_read
+                reranked_pairs.append((did, score))
+
+            t_sort0 = time.perf_counter()
+            reranked_pairs.sort(key=lambda x: x[1], reverse=True)
+            computed_set = {did for (did, _) in reranked_pairs}
+            tail_pairs = [(did, sc) for (did, sc) in task.initial_candidates if did not in computed_set]
+            out = OrderedDict()
+            for did, sc in reranked_pairs:
+                out[did] = float(sc)
+            for did, sc in tail_pairs:
+                out[did] = float(sc)
+            sort_s = time.perf_counter() - t_sort0
+            total_s = io_s + compute_s + sort_s
+            # out = OrderedDict((did, float(sc)) for did, sc in reranked_pairs)
+            meta = dict()
+            return out, total_s, compute_s, io_s, meta, vstack_s
+
+    # ---- (B) 기존 row-pack/메모리 경로 (이하 원래 로직) ----
     t_io0 = time.perf_counter()
     doc_spans: List[Tuple[str, int, int]] = []
     blocks = []
     col_start = 0
     for did in compute_ids:
-        try:
-            pos_seq.append(int(retriever._doc_pos[did]))
-        except Exception:
-            pass
-
-        # ------------------------------
-        # Two-Stage ON: 스케치 row만 읽기 (pack 필요)
-        # ------------------------------
+        # Two-Stage ON: 스케치 row만
         if ENABLE_TWO_STAGE and (retriever.pack is not None):
-            # 1) 스케치와 원본 row-id(sidecar) 로드
             sketch, idx = retriever._get_doc_sketch_and_idx(did, L=STAGE1_SKETCH_TOKENS)
-            # 2) 문서의 절대 row-id로 변환 후 연속 span으로 압축
             di = retriever._doc_pos[did]
             ds, de = retriever.pack.doc_row_span(di)
             abs_rows = ds + idx.astype(np.int64)
             spans = PackReader.rows_to_spans(abs_rows)
-            # 3) 해당 span만 pread
             d_tok = retriever.pack.pread_row_spans(spans)
-
         else:
-            # 기존 절반 읽기(팩 있으면 Half-Doc), 아니면 전체 임베딩
+            # Half-Doc from pack
             if (retriever.pack is not None) and retriever.use_pack_half:
+                # logging.info(f"Half-Doc from pack Read")
                 d_tok = retriever._get_doc_rows_half_from_pack(did, retriever.half_policy)
             else:
+                # logging.info(f"Full Vector Read")
                 d_tok = retriever._get_doc_embeddings(did, allow_build=True)
 
         n_i = int(d_tok.shape[0])
@@ -903,10 +1011,8 @@ def _rerank_task_with_mega_gemm(retriever: ColbertFdeRetrieverNaive, task: "Rera
         col_start += n_i
 
     D_all = None
-    
     t_vstack0 = time.perf_counter()
     if blocks:
-        # [sum(n_i), d], C-contiguous
         D_all = np.ascontiguousarray(np.vstack(blocks).astype(np.float32))
     io_s = time.perf_counter() - t_io0
     vstack_s = time.perf_counter() - t_vstack0
@@ -922,13 +1028,8 @@ def _rerank_task_with_mega_gemm(retriever: ColbertFdeRetrieverNaive, task: "Rera
     compute_s = time.perf_counter() - t_c0
 
     reranked_pairs.sort(key=lambda x: x[1], reverse=True)
-    computed_set = {did for (did, _) in reranked_pairs}
-    tail_pairs = [(did, sc) for (did, sc) in task.initial_candidates if did not in computed_set]
-    out = OrderedDict()
-    for did, sc in reranked_pairs: out[did] = float(sc)
-    for did, sc in tail_pairs:     out[did] = float(sc)
+    out = OrderedDict((did, float(sc)) for did, sc in reranked_pairs)
     total_s = io_s + compute_s
-
     meta = dict()
     return out, total_s, compute_s, io_s, meta, vstack_s
 
@@ -1020,13 +1121,12 @@ def rerank_aggregator_loop(retriever: ColbertFdeRetrieverNaive,
         avg_vstack_time_list.append(vstack_s)
         if dup_ratio is not None:
             avg_dup_ratio_list.append(dup_ratio)
-        
         retriever._log_latency(task.qid, total_search_time, task.ann_time_s,
                                rerank_time, compute_rerank_time, io_rerank_time, wait_s, vstack_s,
                                dup_ratio=dup_ratio)
 
     def _process_task(task: RerankTask, dup_ratio_for_batch: Optional[float]):
-        # (Two-Stage) ANN 상위 num_rank_candidates로 절단 (문서 수 제한)
+        # Two-Stage: 상위 rerank_candidates만
         if ENABLE_TWO_STAGE and retriever.rerank_candidates > 0:
             topN = min(retriever.rerank_candidates, len(task.initial_candidates))
             task = replace(task, initial_candidates=task.initial_candidates[:topN])
@@ -1034,7 +1134,7 @@ def rerank_aggregator_loop(retriever: ColbertFdeRetrieverNaive,
         t_start = time.perf_counter()
         wait_s = t_start - task.enqueued_time_s
         t0 = time.perf_counter()
-        out_pairs, total_rerank_s, compute_s, io_s, meta, vstack_s = _rerank_task_with_mega_gemm(retriever, task, top_k)
+        out_pairs, total_rerank_s, compute_s, io_s, meta, vstack_s = _rerank_task_with_mega_gemm(retriever, task, top_k) # _rerank_task_with_mega_gemm
         rerank_time = time.perf_counter() - t0
         _commit_result(task, out_pairs, rerank_time, compute_s, io_s, wait_s, vstack_s,
                        dup_ratio=dup_ratio_for_batch, meta=meta)
@@ -1045,8 +1145,7 @@ def rerank_aggregator_loop(retriever: ColbertFdeRetrieverNaive,
             while True:
                 item = in_q.get()
                 if item == "__STOP__":
-                    in_q.put("__STOP__")
-                    break
+                    in_q.put("__STOP__"); break
                 _process_task(item, dup_ratio_for_batch=None)
         for _ in range(max(1, int(num_workers))):
             t = threading.Thread(target=worker_loop, daemon=True)
@@ -1094,7 +1193,6 @@ BF_CHUNK_SIZE = 256
 _DOC_BUILD_LOCK = threading.Lock()
 
 def _safe_get_doc_embeddings(retriever: ColbertFdeRetrieverNaive, did: str) -> np.ndarray:
-    # two-stage + pack이 준비되어 있으면 스케치 행만 읽기
     if ENABLE_TWO_STAGE and (retriever.pack is not None):
         _, idx = retriever._get_doc_sketch_and_idx(did, L=STAGE1_SKETCH_TOKENS)
         di = retriever._doc_pos[did]
@@ -1102,7 +1200,6 @@ def _safe_get_doc_embeddings(retriever: ColbertFdeRetrieverNaive, did: str) -> n
         abs_rows = ds + idx.astype(np.int64)
         spans = PackReader.rows_to_spans(abs_rows)
         return retriever.pack.pread_row_spans(spans)
-    # 아니면 기존 half-read 또는 full
     if (retriever.pack is not None) and retriever.use_pack_half:
         return retriever._get_doc_rows_half_from_pack(did, retriever.half_policy)
     int_path = retriever._internal_doc_emb_path(did)
@@ -1284,34 +1381,27 @@ if __name__ == "__main__":
             raise argparse.ArgumentTypeError("must be > 0")
         return v
 
-    parser = argparse.ArgumentParser(description="ANN + (optional) pack-half rerank + (optional) two-stage truncation (sketch row I/O)")
-    parser.add_argument("--num_simhash_projections", "--p", type=_positive_int, required=True,
-                        help="Number of simhash projections (P)")
-    parser.add_argument("--num_repetitions", "--r", type=_positive_int, required=True,
-                        help="Number of repetitions (R)")
-    parser.add_argument("--input", "-i", type=str, default=None,
-                        help="Optional explicit input pickle (defaults to fde_index_{P}_{R}.pkl)")
-    parser.add_argument("--output", "-o", type=str, default=None,
-                        help="Optional FAISS output path (defaults to ivf{nlist}_ip_{P}_{R}.faiss)")
-    parser.add_argument("--nlist", "-nl", type=_positive_int, default=1000,
-                        help="IVF list count (default: 1000)")
-    parser.add_argument("--num_rerank_cand", "-rc", type=int, required=True,
-                        help="number of rerank candidates")
-    parser.add_argument("--topk", "-tk", type=int, required=True,
-                        help="number of tok-k")
-    
+    parser = argparse.ArgumentParser(description="ANN + (optional) pack-half rerank + (optional) two-stage + (optional) TPack(B^T)")
+    parser.add_argument("--num_simhash_projections", "--p", type=_positive_int, required=True)
+    parser.add_argument("--num_repetitions", "--r", type=_positive_int, required=True)
+    parser.add_argument("--input", "-i", type=str, default=None)
+    parser.add_argument("--output", "-o", type=str, default=None)
+    parser.add_argument("--nlist", "-nl", type=_positive_int, default=1000)
+    parser.add_argument("--num_rerank_cand", "-rc", type=int, required=True)
+    parser.add_argument("--topk", "-tk", type=int, required=True)
+
     # pack/half 옵션
-    parser.add_argument("--use_pack_half", action="store_true",
-                        help="use pack layout to read only half of doc rows during rerank")
-    parser.add_argument("--half_policy", type=str, default="front",
-                        choices=["front","back","stride2"], help="Half-Doc policy for pack reading")
-    parser.add_argument("--build_pack_if_missing", action="store_true",
-                        help="build pack files if they don't exist")
-    parser.add_argument("--pack_block_size", type=int, default=512,
-                        help="pack block size for building tokens.bin")
+    parser.add_argument("--use_pack_half", action="store_true")
+    parser.add_argument("--half_policy", type=str, default="front", choices=["front","back","stride2"])
+    parser.add_argument("--build_pack_if_missing", action="store_true")
+    parser.add_argument("--pack_block_size", type=int, default=512)
+
     # two-stage 옵션
-    parser.add_argument("--enable_two_stage", action="store_true",
-                        help="take top-N from ANN (num_rerank_cand) then rerank using sketch-row subset I/O")
+    parser.add_argument("--enable_two_stage", action="store_true")
+
+    # TPack 옵션
+    parser.add_argument("--use_tpack", action="store_true", help="use pre-packed col-major B^T to remove vstack")
+    parser.add_argument("--build_tpack_if_missing", action="store_true", help="build TPack on the fly if missing")
 
     args, _ = parser.parse_known_args()
 
@@ -1325,8 +1415,8 @@ if __name__ == "__main__":
     faiss_default = f"ivf{argslist}_ip_{P}_{R}.faiss"
     meta_default = f"meta_{P}_{R}.json"
 
-    ENABLE_TWO_STAGE = False # 이렇게 해야 half policy를 먹일 수 있음
-    
+    ENABLE_TWO_STAGE = bool(args.enable_two_stage)
+
     corpus, queries, qrels = load_nanobeir_dataset(DATASET_REPO_ID)
 
     retriever = ColbertFdeRetrieverNaive(
@@ -1345,19 +1435,22 @@ if __name__ == "__main__":
         fde_reps=FDE_NUM_REPETITIONS,
         fde_simhash=FDE_NUM_SIMHASH,
         # pack/half
-        use_pack_half=args.use_pack_half,               # two-stage와 별개, 두-stage가 켜지면 pack도 시도
+        use_pack_half=args.use_pack_half,
         half_policy=args.half_policy,
         pack_block_size=args.pack_block_size,
         build_pack_if_missing=args.build_pack_if_missing,
+        # tpack
+        use_tpack=args.use_tpack,
+        build_tpack_if_missing=args.build_tpack_if_missing,
     )
 
     t_ready0 = time.perf_counter()
-    retriever.index(corpus)  # two-stage 또는 pack-half면 내부에서 pack 준비
+    retriever.index(corpus)  # pack/tpack 준비는 index() 내부에서
     t_ready = time.perf_counter() - t_ready0
-    logging.info(f"Retriever ready in {t_ready:.2f}s (two_stage={ENABLE_TWO_STAGE}, "
-                 f"pack_used={retriever.pack is not None}, policy={retriever.half_policy}, L={STAGE1_SKETCH_TOKENS})")
+    logging.info(f"Retriever ready in {t_ready:.2f}s (two_stage={ENABLE_TWO_STAGE}, pack_used={retriever.pack is not None}, tpack_used={retriever.tpack is not None}, policy={retriever.half_policy}, L={STAGE1_SKETCH_TOKENS})")
 
     retriever.precompute_queries(queries)
+    # print(f"[DCCLAB] {DATASET_REPO_ID}_bruteforce_top{TOP_K}.tsv")
 
     # (선택) 브루트포스 상한선 계산
     BF_OUTFILE = os.path.join(CACHE_ROOT, f"{DATASET_REPO_ID}_bruteforce_top{number_of_topk}.tsv")
@@ -1373,9 +1466,9 @@ if __name__ == "__main__":
                                                                  max(FAISS_CANDIDATES, RERANK_TOPN),
                                                                  ANN_BATCH_SIZE),
                                daemon=True)
-    rr_thr = threading.Thread(target=rerank_aggregator_loop, args=(retriever, rerank_in_q, results, number_of_topk, RERANK_BATCH_QUERIES),
+    rr_thr = threading.Thread(target=rerank_aggregator_loop, args=(retriever, rerank_in_q, results, RERANK_BATCH_QUERIES, number_of_topk),
                               daemon=True)
-    
+
     ann_thr.start()
     rr_thr.start()
 
@@ -1393,12 +1486,12 @@ if __name__ == "__main__":
 
     total_search_s = mean(avg_ann_time_list) + mean(avg_rerank_time_list) if avg_ann_time_list and avg_rerank_time_list else 0.0
 
-    # --- (NEW) 브루트포스 Top-K 기반 평가 ---
+    # 브루트포스 Top-K 기반 평가
     sys_topk = system_topk_from_results(results, number_of_topk)
     bf_recall = recall_at_k_wrt_bf(sys_topk, bf_truth, number_of_topk)
     bf_hit = hit_at_k_wrt_bf(sys_topk, bf_truth, number_of_topk)
     bf_ndcg, ndcg_list = ndcg_at_k_wrt_bf(sys_topk, bf_truth, number_of_topk)
-    
+
     _per_experiment_log_path = os.path.join(CACHE_ROOT, f"per_experiment_{DATASET_REPO_ID}")
     _per_ndcg_log_path = os.path.join(CACHE_ROOT, f"per_ndcg_{DATASET_REPO_ID}")
     
