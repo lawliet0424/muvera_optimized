@@ -24,7 +24,7 @@ from beir.retrieval.search.dense import DenseRetrievalExactSearch as DRES
 import argparse
 
 # FDE 구현 (업로드된 파일 사용)
-from fde_generator_optimized_stream_kmeans import (
+from fde_generator_optimized_stream_kmeans_gpu import (
     FixedDimensionalEncodingConfig,
     generate_query_fde,
     generate_document_fde_batch,
@@ -33,10 +33,10 @@ from fde_generator_optimized_stream_kmeans import (
 # ======================
 # --- Configuration ----
 # ======================
-DATASET_REPO_ID = "arguana"
+DATASET_REPO_ID = "scidocs"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
 TOP_K = 10
-FILENAME = "main_weight_kmeans"
+FILENAME = "main_weight_kmeans_gpu"
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -57,7 +57,7 @@ os.makedirs(COMMON_DOC_EMBEDS_DIR, exist_ok=True)
 os.makedirs(COMMON_QUERY_EMBEDS_DIR, exist_ok=True)
 
 # 쿼리 검색 디렉터리
-dataset = "arguana"
+dataset = DATASET_REPO_ID
 QUERY_SEARCH_DIR = os.path.join(CACHE_ROOT, "query_search")
 os.makedirs(QUERY_SEARCH_DIR, exist_ok=True)
 
