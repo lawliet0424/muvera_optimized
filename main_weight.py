@@ -48,7 +48,7 @@ else:
     DEVICE = "cpu"
 
 # 캐시 루트
-CACHE_ROOT = os.path.join("/media/hyunji/7672b947-0099-4e49-8e90-525a208d54b8", "muvera_optimized", "cache_muvera", DATASET_REPO_ID, FILENAME)
+CACHE_ROOT = os.path.join("/media/hyunji", "muvera_optimized", "cache_muvera", DATASET_REPO_ID, FILENAME)
 os.makedirs(CACHE_ROOT, exist_ok=True)
 
 # 쿼리 검색 디렉터리
@@ -57,7 +57,7 @@ QUERY_SEARCH_DIR = os.path.join(CACHE_ROOT, "query_search")
 os.makedirs(QUERY_SEARCH_DIR, exist_ok=True)
 
 # 공통 문서 임베딩 디렉터리 설정
-COMMON_EMBEDS_DIR = os.path.join("/media/hyunji/7672b947-0099-4e49-8e90-525a208d54b8", "muvera_optimized", "cache_muvera", DATASET_REPO_ID)
+COMMON_EMBEDS_DIR = os.path.join("/media/hyunji", "muvera_optimized", "cache_muvera", DATASET_REPO_ID)
 COMMON_DOC_EMBEDS_DIR = os.path.join(COMMON_EMBEDS_DIR, "doc_embeds")
 COMMON_QUERY_EMBEDS_DIR = os.path.join(COMMON_EMBEDS_DIR, "query_embeds")
 os.makedirs(COMMON_DOC_EMBEDS_DIR, exist_ok=True)
