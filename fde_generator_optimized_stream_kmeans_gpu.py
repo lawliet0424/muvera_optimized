@@ -7,8 +7,9 @@ from enum import Enum
 from typing import Optional, List, Tuple
 from collections import defaultdict
 from joblib import Parallel, delayed  # pip install joblib
-from sklearn.cluster import MiniBatchKMeans  # pip install scikit-learn
-from sklearn.cluster import KMeans
+
+#[1103] GPU 사용 시작
+from cuml.cluster import KMeans
 
 class EncodingType(Enum):
     DEFAULT_SUM = 0
@@ -219,13 +220,14 @@ def _sample_and_train_kmeans(
     sample_indices = rng.choice(len(all_projected_points), size=n_samples, replace=False)
     sampled_points = all_projected_points[sample_indices]
     
-    # CPU라서 1차 minibatch K-means 학습
-    mini_kmeans = MiniBatchKMeans(n_clusters=num_partitions, init="k-means++", random_state=seed, n_init=3, batch_size=16384, max_iter=100, verbose=0, reassignment_ratio=0.1)
-    mini_kmeans.fit(sampled_points)
-
-    # CPU라서 2차 정밀 K-means 학습
-    kmeans = KMeans(n_clusters=num_partitions, init=mini_kmeans.cluster_centers_, n_init=1, random_state=seed, max_iter=20, algorithm='elkan', tol=1e-3)
+    # GPU에서의 랜덤 30% 재할당 최적화된 K-means 학습
+    kmeans = KMeans(n_clusters=num_partitions, init="k-means++", random_state=seed, n_init=10, max_iter=300, tol=1e-4, oversampling_factor=2.0)
+    logging.info(f"[K-means Pre-training] Fitting K-means with {num_partitions} clusters and {n_samples} samples")
+    start_time = time.time()
     kmeans.fit(sampled_points)
+    end_time = time.time()
+    logging.info(f"[K-means Pre-training] K-means fitting time: {end_time - start_time:.2f} seconds")
+
     return kmeans.cluster_centers_
 
 # -----------------------------------------
