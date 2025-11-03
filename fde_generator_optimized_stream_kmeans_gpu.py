@@ -570,10 +570,12 @@ def generate_document_fde_batch(
                 all_projected_points.append(Pts_temp)
             
             all_projected_points = np.vstack(all_projected_points)
+            start_time = time.time()
             kmeans_centers_all[rep_num] = _sample_and_train_kmeans(
                 all_projected_points, num_partitions, current_seed, dynamic_sample_ratio
             )
-            
+            end_time = time.time()
+            logging.info(f"[FDE Batch] Rep {rep_num}: K-means fitting time: {end_time - start_time:.2f} seconds")
             logging.info(f"[FDE Batch] Rep {rep_num}: K-means centers learned with {num_partitions} partitions from {len(all_projected_points)} points")
 
         # Stream over documents (no vstack)
