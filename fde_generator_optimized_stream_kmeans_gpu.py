@@ -8,6 +8,8 @@ from typing import Optional, List, Tuple
 from collections import defaultdict
 from joblib import Parallel, delayed  # pip install joblib
 
+import faiss
+
 #[1103] GPU 사용 시작
 from cuml.cluster import KMeans
 
@@ -97,8 +99,15 @@ def _distance_to_simhash_partition(
 # ------------------------------
 def _kmeans_partition_index(projected_points: np.ndarray, centers: np.ndarray) -> np.ndarray:
     """K-means centers와의 거리로 partition index 계산"""
-    distances = np.linalg.norm(projected_points[:, np.newaxis] - centers[np.newaxis, :], axis=2)
-    return np.argmin(distances, axis=1)
+    #distances = np.linalg.norm(projected_points[:, np.newaxis] - centers[np.newaxis, :], axis=2)
+   # return np.argmin(distances, axis=1)
+    X = projected_points.astype('float32', copy=False)
+    C = centers.astype('float32', copy=False)
+    res = faiss.StandardGpuResources()
+    index = faiss.GpuIndexFlatL2(res, C.shape[1])  # L2
+    index.add(C)
+    _, labels = index.search(X, 1)                 # [N,1]
+    return labels.ravel()
 
 def _calculate_memory_based_sample_ratio(
     num_docs: int,
