@@ -99,8 +99,10 @@ def _distance_to_simhash_partition(
 # ------------------------------
 def _kmeans_partition_index(projected_points: np.ndarray, centers: np.ndarray) -> np.ndarray:
     """K-means centers와의 거리로 partition index 계산"""
-    #distances = np.linalg.norm(projected_points[:, np.newaxis] - centers[np.newaxis, :], axis=2)
-   # return np.argmin(distances, axis=1)
+    distances = np.linalg.norm(projected_points[:, np.newaxis] - centers[np.newaxis, :], axis=2)
+    return np.argmin(distances, axis=1)
+
+def _kmeans_partition_index_gpu(projected_points: np.ndarray, centers: np.ndarray) -> np.ndarray:
     X = projected_points.astype('float32', copy=False)
     C = centers.astype('float32', copy=False)
     res = faiss.StandardGpuResources()
@@ -346,7 +348,10 @@ def _generate_fde_internal(
 
         # [수정] K-means 기반 partition index 계산
         if query_or_doc and kmeans_centers is not None:  # Query인 경우: 미리 학습된 centers 사용
-            partition_indices = _kmeans_partition_index(projected_matrix, kmeans_centers[rep_num])
+            if config.num_repetitions > 4:
+                partition_indices = _kmeans_partition_index_gpu(projected_matrix, kmeans_centers[rep_num])
+            else:
+                partition_indices = _kmeans_partition_index(projected_matrix, kmeans_centers[rep_num])
         else:  # Document인 경우: 현재 데이터로 K-means 학습
             # 메모리 기반 또는 동적 샘플링 비율 계산
             if config.use_memory_based_sampling:
@@ -359,7 +364,11 @@ def _generate_fde_internal(
             learned_centers[rep_num] = _sample_and_train_kmeans(
                 projected_matrix, num_partitions, current_seed, dynamic_sample_ratio
             )
-            partition_indices = _kmeans_partition_index(projected_matrix, learned_centers[rep_num])
+
+            if config.num_repetitions > 4:
+                partition_indices = _kmeans_partition_index_gpu(projected_matrix, learned_centers[rep_num])
+            else:
+                partition_indices = _kmeans_partition_index(projected_matrix, learned_centers[rep_num])
 
         for i in range(num_points):
             start_idx = partition_indices[i] * projection_dim
@@ -604,7 +613,10 @@ def generate_document_fde_batch(
             else:
                 Pts = X @ ams_matrix
             
-            p_idx = _kmeans_partition_index(Pts, kmeans_centers_all[rep_num])
+            if config.num_repetitions > 4:
+                p_idx = _kmeans_partition_index_gpu(Pts, kmeans_centers_all[rep_num])
+            else:
+                p_idx = _kmeans_partition_index(Pts, kmeans_centers_all[rep_num])
 
             # Aggregate per partition for this doc
             rep_sum = np.zeros((num_partitions, projection_dim), dtype=np.float32)  # [P, Pdim]
