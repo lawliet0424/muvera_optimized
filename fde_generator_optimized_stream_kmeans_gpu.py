@@ -348,7 +348,7 @@ def _generate_fde_internal(
 
         # [수정] K-means 기반 partition index 계산
         if query_or_doc and kmeans_centers is not None:  # Query인 경우: 미리 학습된 centers 사용
-            if config.num_repetitions > 4:
+            if config.num_repetitions > 6:
                 partition_indices = _kmeans_partition_index_gpu(projected_matrix, kmeans_centers[rep_num])
             else:
                 partition_indices = _kmeans_partition_index(projected_matrix, kmeans_centers[rep_num])
@@ -613,7 +613,7 @@ def generate_document_fde_batch(
             else:
                 Pts = X @ ams_matrix
             
-            if config.num_repetitions > 4:
+            if config.num_repetitions > 6:
                 p_idx = _kmeans_partition_index_gpu(Pts, kmeans_centers_all[rep_num])
             else:
                 p_idx = _kmeans_partition_index(Pts, kmeans_centers_all[rep_num])
