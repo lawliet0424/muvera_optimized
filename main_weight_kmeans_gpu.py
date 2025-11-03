@@ -543,9 +543,12 @@ class ColbertFdeRetriever:
             logging.info(f"[K-means Pre-training] Rep {rep_num}: Collected {len(rep_projected_points)} points for K-means learning")
             
             # 이 repetition의 K-means centers 학습 (계산된 sample rate 사용)
+            start_time = time.time()
             self.kmeans_centers[rep_num] = _sample_and_train_kmeans(
                 rep_projected_points, num_partitions, current_seed, dynamic_sample_ratio, actual_tokens_per_doc
             )
+            end_time = time.time()
+            logging.info(f"[K-means Pre-training] Rep {rep_num}: K-means fitting time: {end_time - start_time:.2f} seconds")
             logging.info(f"[K-means Pre-training] Rep {rep_num}: Learned {num_partitions} partitions from {len(rep_projected_points)} points")
             
             # 메모리 해제
