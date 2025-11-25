@@ -6,8 +6,8 @@ Partition Masking and Utilization Statistics Calculator
 2) 마스킹 정보를 바탕으로 partition별 활용도 통계 계산
 
 Usage:
-  python3 partition_masking_stats.py <csv_file> --rep-num 0
-  python3 partition_masking_stats.py partition_counter.csv --rep-num 0 --output results.csv
+  python3 partition_statistic.py --dataset scidocs --filename main_weight_kmeans_gpu --method kmeans --csv_file partition_count.csv --rep 1 --partition_idx 4 --rerank 0 --output partition_statistic_result.csv --output_mask partition_masking.csv --output_rep_stats partition_utilization.csv
+  python3 partition_statistic.py -d scidocs -f main_weight_kmeans_gpu -m kmeans -c partition_count.csv -p 1 -pi 4 -rk 0 -out partition_statistic_result.csv -outm partition_masking.csv -outr partition_utilization.csv
 """
 
 import sys
@@ -22,13 +22,24 @@ def parse_arguments():
         description='Partition 마스킹 및 활용도 통계 계산',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    
-    parser.add_argument('csv_file', help='분석할 CSV 파일 경로')
-    parser.add_argument('--rep-num', '-r', type=int, 
+    parser.add_argument('--dataset', '-d', help='데이터셋 이름')
+    parser.add_argument('--filename', '-f', type=str, required=True,
+                        help='파일 이름')
+    parser.add_argument('--method', '-m', help='메서드 이름')
+    parser.add_argument('--rep', '-p', type=int, required=True,
+                        help='분석할 repetition 번호')
+    parser.add_argument('--partition_idx', '-pi', type=int, required=True,
+                        help='분석할 partition 인덱스 개수')
+    parser.add_argument('--rerank', '-rk', type=int, required=True,
+                        help='분석할 rerank 개수')
+    parser.add_argument('--csv_file', '-c', help='분석할 CSV 파일 경로')
+    parser.add_argument('--rep_num', '-rn', type=int, 
                         help='분석할 repetition 번호 (지정하지 않으면 전체 repetition 분석)')
-    parser.add_argument('--output', '-o', help='결과를 저장할 CSV 파일 경로 (선택)')
-    parser.add_argument('--output-mask', help='마스킹 결과를 저장할 CSV 파일 경로 (선택)')
-    parser.add_argument('--output-rep-stats', help='Repetition별 통계를 저장할 CSV 파일 경로 (선택)')
+    parser.add_argument('--output', '-out', help='결과를 저장할 CSV 파일 경로 (선택)')
+    parser.add_argument('--output_mask', '-outm', help='마스킹 결과를 저장할 CSV 파일 경로 (선택)')
+    parser.add_argument('--output_rep_stats', '-outr', help='Repetition별 통계를 저장할 CSV 파일 경로 (선택)')
+    parser.add_argument('--projection', '-pr', type=int, default=128,
+                        help='프로젝션 차원 수 (기본값: 128)')
     
     return parser.parse_args()
 
@@ -185,22 +196,30 @@ def calculate_partition_utilization(df_filtered, masking_df, partition_indices, 
     return utilization_df
 
 
-def print_masking_summary(masking_df):
+def print_masking_summary(masking_df, output_file=None):
     """마스킹 요약 정보 출력"""
-    print("\n" + "="*80)
-    print("📋 마스킹 요약")
-    print("="*80)
-    print(f"총 문서 수: {len(masking_df)}")
-    print(f"활성 파티션 개수 통계:")
-    print(f"  - 평균: {masking_df['active_partition_count'].mean():.2f}")
-    print(f"  - 중간값: {masking_df['active_partition_count'].median():.2f}")
-    print(f"  - 최소: {masking_df['active_partition_count'].min()}")
-    print(f"  - 최대: {masking_df['active_partition_count'].max()}")
-    print(f"  - 표준편차: {masking_df['active_partition_count'].std():.2f}")
-    print("="*80)
+    output_lines = []
+    output_lines.append("\n" + "="*80)
+    output_lines.append("📋 마스킹 요약")
+    output_lines.append("="*80)
+    output_lines.append(f"총 문서 수: {len(masking_df)}")
+    output_lines.append(f"활성 파티션 개수 통계:")
+    output_lines.append(f"  - 평균: {masking_df['active_partition_count'].mean():.2f}")
+    output_lines.append(f"  - 중간값: {masking_df['active_partition_count'].median():.2f}")
+    output_lines.append(f"  - 최소: {masking_df['active_partition_count'].min()}")
+    output_lines.append(f"  - 최대: {masking_df['active_partition_count'].max()}")
+    output_lines.append(f"  - 표준편차: {masking_df['active_partition_count'].std():.2f}")
+    output_lines.append("="*80)
+    
+    output_text = "\n".join(output_lines)
+    print(output_text)
+    
+    if output_file:
+        output_file.write(output_text + "\n")
+        output_file.flush()
 
 
-def print_utilization_table(utilization_df):
+def print_utilization_table(utilization_df, output_file=None):
     """활용도 결과 테이블 출력"""
     print("\n" + "="*80)
     print("📈 Partition별 활용도 통계")
@@ -210,15 +229,24 @@ def print_utilization_table(utilization_df):
     pd.options.display.float_format = '{:.2f}'.format
     print(utilization_df.to_string(index=False))
     
-    print("\n" + "-"*80)
-    print("📊 전체 요약:")
-    print(f"  - 평균 활용률: {utilization_df['utilization_rate(%)'].mean():.2f}%")
-    print(f"  - 가장 많이 활용된 파티션: {utilization_df.loc[utilization_df['utilization_rate(%)'].idxmax(), 'partition_idx']} "
+    # 전체 요약 부분 (파일 저장용)
+    summary_lines = []
+    summary_lines.append("\n" + "-"*80)
+    summary_lines.append("📊 전체 요약:")
+    summary_lines.append(f"  - 평균 활용률: {utilization_df['utilization_rate(%)'].mean():.2f}%")
+    summary_lines.append(f"  - 가장 많이 활용된 파티션: {utilization_df.loc[utilization_df['utilization_rate(%)'].idxmax(), 'partition_idx']} "
           f"({utilization_df['utilization_rate(%)'].max():.2f}%)")
-    print(f"  - 가장 적게 활용된 파티션: {utilization_df.loc[utilization_df['utilization_rate(%)'].idxmin(), 'partition_idx']} "
+    summary_lines.append(f"  - 가장 적게 활용된 파티션: {utilization_df.loc[utilization_df['utilization_rate(%)'].idxmin(), 'partition_idx']} "
           f"({utilization_df['utilization_rate(%)'].min():.2f}%)")
-    print(f"  - 전체 count 합계: {utilization_df['count_sum'].sum():.0f}")
-    print("="*80)
+    summary_lines.append(f"  - 전체 count 합계: {utilization_df['count_sum'].sum():.0f}")
+    summary_lines.append("="*80)
+    
+    summary_text = "\n".join(summary_lines)
+    print(summary_text)
+    
+    if output_file:
+        output_file.write(summary_text + "\n")
+        output_file.flush()
 
 
 def calculate_repetition_statistics(all_utilization_df):
@@ -283,9 +311,16 @@ def save_results(df, output_path, description):
 
 def main():
     args = parse_arguments()
+
+    if args.projection == 128:
+        common_file_path = os.path.join("/media/hyunji/muvera_optimized", "cache_muvera", args.dataset, args.filename, "query_search", f"rep{args.rep}_{args.method}{args.partition_idx}_rerank{args.rerank}")
+    else:
+        common_file_path = os.path.join("/media/hyunji/muvera_optimized", "cache_muvera", args.dataset, args.filename, "query_search", f"rep{args.rep}_{args.method}{args.partition_idx}_rerank{args.rerank}_proj{args.projection}")
+    # 출력 파일 경로 설정 (partition_count_result.txt 형태)
+    output_txt_path = os.path.join(common_file_path, f"partition_count_result.txt")
     
     # 1. CSV 로드
-    df = load_csv(args.csv_file)
+    df = load_csv(os.path.join(common_file_path, args.csv_file))
     
     # 2. 데이터 검증
     validate_dataframe(df)
@@ -308,30 +343,32 @@ def main():
     all_masking_dfs = []
     all_utilization_dfs = []
     
-    for rep_num in rep_nums_to_analyze:
-        print(f"\n{'='*80}")
-        print(f"🔍 Repetition {rep_num} 분석 시작")
-        print(f"{'='*80}")
-        
-        # Step 1: Partition 마스킹 생성
-        masking_df, df_filtered, partition_indices = create_partition_masking(df, rep_num)
-        
-        if masking_df is None:
-            print(f"⚠️  rep_num={rep_num} 건너뜀")
-            continue
-        
-        # 마스킹 요약 출력
-        print_masking_summary(masking_df)
-        
-        # Step 2: Partition 활용도 통계 계산
-        utilization_df = calculate_partition_utilization(df_filtered, masking_df, partition_indices, rep_num)
-        
-        # 결과 출력
-        print_utilization_table(utilization_df)
-        
-        # 결과 저장
-        all_masking_dfs.append(masking_df)
-        all_utilization_dfs.append(utilization_df)
+    # result.txt 파일 열기 (마스킹 요약과 전체 요약만 저장)
+    with open(output_txt_path, 'w', encoding='utf-8') as result_file:
+        for rep_num in rep_nums_to_analyze:
+            print(f"\n{'='*80}")
+            print(f"🔍 Repetition {rep_num} 분석 시작")
+            print(f"{'='*80}")
+            
+            # Step 1: Partition 마스킹 생성
+            masking_df, df_filtered, partition_indices = create_partition_masking(df, rep_num)
+            
+            if masking_df is None:
+                print(f"⚠️  rep_num={rep_num} 건너뜀")
+                continue
+            
+            # 마스킹 요약 출력 및 파일 저장
+            print_masking_summary(masking_df, result_file)
+            
+            # Step 2: Partition 활용도 통계 계산
+            utilization_df = calculate_partition_utilization(df_filtered, masking_df, partition_indices, rep_num)
+            
+            # 결과 출력 및 전체 요약 파일 저장
+            print_utilization_table(utilization_df, result_file)
+            
+            # 결과 저장
+            all_masking_dfs.append(masking_df)
+            all_utilization_dfs.append(utilization_df)
     
     # 6. 전체 결과 통합
     combined_masking_df = pd.concat(all_masking_dfs, ignore_index=True)
@@ -344,32 +381,38 @@ def main():
         
         # Repetition별 통계 저장
         if args.output_rep_stats:
-            save_results(rep_stats_df, args.output_rep_stats, "Repetition별 통계")
+            save_results(rep_stats_df, os.path.join(common_file_path, args.output), "Repetition별 통계")
         else:
-            base_name = os.path.splitext(args.csv_file)[0]
-            default_rep_stats_output = f"{base_name}_repetition_statistics.csv"
+            # base_name에서 파일명만 추출 (경로 제거)
+            default_rep_stats_output = os.path.join(common_file_path, args.output)
             save_results(rep_stats_df, default_rep_stats_output, "Repetition별 통계")
     
     # 8. 결과 파일 저장
     if args.output_mask:
-        save_results(combined_masking_df, args.output_mask, "마스킹 결과")
+        save_results(combined_masking_df, os.path.join(common_file_path, args.output_mask), "마스킹 결과")
     else:
-        base_name = os.path.splitext(args.csv_file)[0]
+        # base_name에서 파일명만 추출 (경로 제거)
         if len(rep_nums_to_analyze) == 1:
-            default_mask_output = f"{base_name}_masking_rep{rep_nums_to_analyze[0]}.csv"
+            default_mask_output = os.path.join(common_file_path, args.output_mask)
         else:
-            default_mask_output = f"{base_name}_masking_all.csv"
+            default_mask_output = os.path.join(common_file_path, args.output_mask)
         save_results(combined_masking_df, default_mask_output, "마스킹 결과")
     
+    # 9. 활용도 통계 저장 (utilization 파일 - result.txt와 독립적)
     if args.output:
-        save_results(combined_utilization_df, args.output, "활용도 통계")
+        utilization_output_path = os.path.join(common_file_path, args.output_rep_stats)
+        save_results(combined_utilization_df, utilization_output_path, "활용도 통계")
     else:
-        base_name = os.path.splitext(args.csv_file)[0]
+        # base_name에서 파일명만 추출 (경로 제거)
         if len(rep_nums_to_analyze) == 1:
-            default_util_output = f"{base_name}_utilization_rep{rep_nums_to_analyze[0]}.csv"
+            default_util_output = os.path.join(common_file_path, f"{args.output_rep_stats}_rep{rep_nums_to_analyze[0]}.csv")
         else:
-            default_util_output = f"{base_name}_utilization_all.csv"
+            default_util_output = os.path.join(common_file_path, f"{args.output_rep_stats}_all.csv")
         save_results(combined_utilization_df, default_util_output, "활용도 통계")
+    
+    # 10. result.txt 파일 저장 완료 메시지 (utilization 파일과 독립적)
+    print(f"\n✅ 출력 결과 저장 완료:")
+    print(f"   - 텍스트 요약: {output_txt_path}")
 
 
 if __name__ == "__main__":
