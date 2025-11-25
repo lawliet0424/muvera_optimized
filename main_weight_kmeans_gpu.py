@@ -10,6 +10,8 @@ import numpy as np
 import torch
 import joblib
 import time
+import psutil
+import gc
 
 import neural_cherche.models as neural_cherche_models
 import neural_cherche.rank as neural_cherche_rank
@@ -26,6 +28,7 @@ import argparse
 # FDE 구현 (업로드된 파일 사용)
 from fde_generator_optimized_stream_kmeans_gpu import (
     FixedDimensionalEncodingConfig,
+    ProjectionType,
     generate_query_fde,
     generate_document_fde_batch,
 )
@@ -46,11 +49,11 @@ else:
     DEVICE = "cpu"
 
 # 캐시 루트 (USB 경로가 /media/hyunji로 변경됨)
-CACHE_ROOT = os.path.join("/media/hyunji", "muvera_optimized", "cache_muvera", DATASET_REPO_ID, FILENAME)
+CACHE_ROOT = os.path.join("/media/dcceris", "muvera_optimized", "cache_muvera", DATASET_REPO_ID, FILENAME)
 os.makedirs(CACHE_ROOT, exist_ok=True)
 
 # 공통 문서 임베딩 디렉터리 설정
-COMMON_EMBEDS_DIR = os.path.join("/media/hyunji", "muvera_optimized", "cache_muvera", DATASET_REPO_ID)
+COMMON_EMBEDS_DIR = os.path.join("/media/dcceris", "muvera_optimized", "cache_muvera", DATASET_REPO_ID)
 COMMON_DOC_EMBEDS_DIR = os.path.join(COMMON_EMBEDS_DIR, "doc_embeds")
 COMMON_QUERY_EMBEDS_DIR = os.path.join(COMMON_EMBEDS_DIR, "query_embeds")
 os.makedirs(COMMON_DOC_EMBEDS_DIR, exist_ok=True)
@@ -74,7 +77,7 @@ def load_nanobeir_dataset(repo_id: str):
     """Loads BEIR dataset from local 'data_path' in test split."""
     # 데이터셋 준비 (BEIR trec-covid)
     url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip"
-    out_dir = os.path.join("/media/hyunji", "muvera_optimized", "datasets")
+    out_dir = os.path.join("/media/dcceris", "muvera_optimized", "datasets")
 
     if not os.path.exists(os.path.join(out_dir, dataset)):
         data_path = util.download_and_unzip(url, out_dir)
@@ -211,16 +214,22 @@ class ColbertFdeRetriever:
         external_doc_embeds_dir: Optional[str] = None,  # ★ 추가: 외부 임베딩 디렉터리
         num_repetitions: int = 2,
         num_simhash_projections: int = 5,
+        projection_dimension: int = 128,
     ):
         model = neural_cherche_models.ColBERT(model_name_or_path=model_name, device=DEVICE)
         self.ranker = neural_cherche_rank.ColBERT(key="id", on=["title", "text"], model=model)
+        self.projection_dimension = projection_dimension
 
         # 추가된 인자
         self.num_repetitions = num_repetitions
         self.num_simhash_projections = num_simhash_projections
 
+        # projection_dimension이 128이 아닌 경우 AMS_SKETCH projection 사용
+        use_projection = self.projection_dimension != 128
         self.doc_config = FixedDimensionalEncodingConfig(
-            dimension=128,
+            dimension=128,   # ColBERT 임베딩의 원본 차원 (고정)
+            projection_dimension=self.projection_dimension if use_projection else None,  # projection 후 차원
+            projection_type=ProjectionType.AMS_SKETCH if use_projection else ProjectionType.DEFAULT_IDENTITY,
             num_repetitions=self.num_repetitions,
             num_simhash_projections=self.num_simhash_projections,
             seed=42,
@@ -268,7 +277,7 @@ class ColbertFdeRetriever:
     # --------- 경로/키 유틸 ---------
     def _compute_cache_dir(self, dataset: str, model_name: str, cfg) -> str:
         model_key = model_name.replace("/", "_")
-        cfg_str = f"d{cfg.dimension}_r{cfg.num_repetitions}_p{cfg.num_simhash_projections}_seed{cfg.seed}_fill{int(cfg.fill_empty_partitions)}"
+        cfg_str = f"d{cfg.projection_dimension}_r{cfg.num_repetitions}_p{cfg.num_simhash_projections}_seed{cfg.seed}_fill{int(cfg.fill_empty_partitions)}"
         raw = f"{dataset}|{model_key}|{cfg_str}"
         key = hashlib.md5(raw.encode()).hexdigest()[:10]
         dir_name = f"{dataset.replace('/', '_')}__{model_key}__{cfg_str}__{key}"
@@ -501,8 +510,16 @@ class ColbertFdeRetriever:
         n_sample_docs = max(int(len(self.doc_ids) * dynamic_sample_ratio), 1)
         logging.info(f"[K-means Pre-training] Calculated sample ratio: {dynamic_sample_ratio:.3f} -> {n_sample_docs} docs per repetition")
         
+        # 실제 사용되는 projection 차원 계산
+        use_identity_proj = self.doc_config.projection_type == ProjectionType.DEFAULT_IDENTITY
+        projection_dim = self.doc_config.dimension if use_identity_proj else self.doc_config.projection_dimension
+        
         # 각 repetition별로 K-means centers 학습 (각각 다른 random sampling)
-        self.kmeans_centers = np.zeros((self.doc_config.num_repetitions, num_partitions, 128), dtype=np.float32)
+        # 원래 방식: projection을 먼저 적용한 후 K-means 학습
+        self.kmeans_centers = np.zeros((self.doc_config.num_repetitions, num_partitions, projection_dim), dtype=np.float32)
+        
+        # AMS projection matrix 생성 함수 import
+        from fde_generator_optimized_stream_kmeans_gpu import _ams_projection_matrix_from_seed
         
         for rep_num in range(self.doc_config.num_repetitions):
             # 각 repetition마다 다른 random seed로 샘플링
@@ -512,8 +529,9 @@ class ColbertFdeRetriever:
             
             logging.info(f"[K-means Pre-training] Rep {rep_num}: Sampling {n_sample_docs} docs with seed {current_seed}")
             
-            # 샘플링된 문서들의 임베딩만 선택적으로 로드
-            rep_projected_points = []
+            # 샘플링된 문서들의 원본 임베딩만 선택적으로 로드
+            rep_original_points = []
+            missing_sample_ids = []  # 누락된 문서 ID 추적
             
             for doc_idx in sample_doc_indices:
                 doc_id = self.doc_ids[doc_idx]
@@ -522,7 +540,7 @@ class ColbertFdeRetriever:
                 ext = self._external_doc_emb_path(doc_id)
                 if ext and os.path.exists(ext):
                     loaded_emb = np.load(ext).astype(np.float32)
-                    rep_projected_points.append(loaded_emb)
+                    rep_original_points.append(loaded_emb)
                     continue
                 
                 # 내부 캐시에서 로드
@@ -531,28 +549,62 @@ class ColbertFdeRetriever:
                     try:
                         loaded_emb = np.load(dst)
                         if loaded_emb.ndim == 2 and loaded_emb.shape[1] == 128:
-                            rep_projected_points.append(loaded_emb.astype(np.float32))
+                            rep_original_points.append(loaded_emb.astype(np.float32))
                             continue
                     except Exception as e:
                         print(f"[inner load error]: {e}, will regenerate")
                 
-                # 누락된 문서는 나중에 배치에서 처리
-                pass
+                # 누락된 문서는 나중에 인코딩
+                missing_sample_ids.append(doc_id)
             
-            rep_projected_points = np.vstack(rep_projected_points)
-            logging.info(f"[K-means Pre-training] Rep {rep_num}: Collected {len(rep_projected_points)} points for K-means learning")
+            # 누락된 문서 인코딩 (필요한 경우)
+            if missing_sample_ids:
+                logging.info(f"[K-means Pre-training] Rep {rep_num}: Encoding {len(missing_sample_ids)} missing documents...")
+                to_encode = [{"id": did, **self._corpus[did]} for did in missing_sample_ids]
+                encoded_map = self.ranker.encode_documents(documents=to_encode)
+                for did in missing_sample_ids:
+                    arr = to_numpy(encoded_map[did])
+                    rep_original_points.append(arr)
+                    del encoded_map[did]
+                del encoded_map
+                del to_encode
             
-            # 이 repetition의 K-means centers 학습 (계산된 sample rate 사용)
+            # rep_original_points가 여전히 비어있는지 확인
+            if len(rep_original_points) == 0:
+                raise RuntimeError(
+                    f"[K-means Pre-training] Rep {rep_num}: No valid embeddings found for {n_sample_docs} sampled documents. "
+                    f"Check if document embeddings exist in {self.external_doc_embeds_dir} or {self._doc_emb_dir}"
+                )
+            
+            # 원본 임베딩을 하나로 합치기
+            rep_original_points = np.vstack(rep_original_points)
+            logging.info(f"[K-means Pre-training] Rep {rep_num}: Collected {len(rep_original_points)} points (original dim={rep_original_points.shape[1]})")
+            
+            # 원래 방식: projection을 먼저 적용한 후 K-means 학습
+            if use_identity_proj:
+                rep_projected_points = rep_original_points
+            else:
+                # AMS projection 적용: 원본 임베딩(128차원) @ projection_matrix -> (projection_dim 차원)
+                ams_matrix = _ams_projection_matrix_from_seed(
+                    self.doc_config.dimension, projection_dim, current_seed
+                )
+                rep_projected_points = rep_original_points @ ams_matrix
+                logging.info(f"[K-means Pre-training] Rep {rep_num}: Applied AMS projection: {self.doc_config.dimension} -> {projection_dim}")
+            
+            # Projection된 데이터로 K-means centers 학습
             start_time = time.time()
             self.kmeans_centers[rep_num] = _sample_and_train_kmeans(
                 rep_projected_points, num_partitions, current_seed, dynamic_sample_ratio, actual_tokens_per_doc
             )
             end_time = time.time()
             logging.info(f"[K-means Pre-training] Rep {rep_num}: K-means fitting time: {end_time - start_time:.2f} seconds")
-            logging.info(f"[K-means Pre-training] Rep {rep_num}: Learned {num_partitions} partitions from {len(rep_projected_points)} points")
+            logging.info(f"[K-means Pre-training] Rep {rep_num}: Learned {num_partitions} partitions from {len(rep_projected_points)} points (projected dim={projection_dim})")
             
             # 메모리 해제
+            del rep_original_points
             del rep_projected_points
+            if not use_identity_proj:
+                del ams_matrix
             import gc
             gc.collect()
         
@@ -800,6 +852,7 @@ if __name__ == "__main__":
     parser.add_argument("--rep", type=int, default=2)
     parser.add_argument("--simhash", type=int, default=5)
     parser.add_argument("--rerank", type=int, default=100)
+    parser.add_argument("--projection", type=int, default=128)
     args = parser.parse_args()
 
     nltk.download('punkt', quiet=True)
@@ -827,6 +880,7 @@ if __name__ == "__main__":
             external_doc_embeds_dir=COMMON_DOC_EMBEDS_DIR,  # ★ 공통 문서 임베딩 디렉터리 
             num_repetitions=args.rep,
             num_simhash_projections=args.simhash,
+            projection_dimension=args.projection,
         )
     }
 
@@ -850,7 +904,7 @@ if __name__ == "__main__":
         results = {}
 
         # 지연시간 로그 파일 초기화
-        latency_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_kmeans{args.simhash}_rerank{args.rerank}")
+        latency_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_kmeans{args.simhash}_rerank{args.rerank}_proj{args.projection}")
         os.makedirs(latency_dir, exist_ok=True)
         with open(os.path.join(latency_dir, "latency.tsv"), "w", encoding="utf-8") as f:
             f.write("QID\tSearch\tRerank\n")

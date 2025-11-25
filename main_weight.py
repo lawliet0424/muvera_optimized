@@ -48,16 +48,16 @@ else:
     DEVICE = "cpu"
 
 # 캐시 루트
-CACHE_ROOT = os.path.join("/media/hyunji", "muvera_optimized", "cache_muvera", DATASET_REPO_ID, FILENAME)
+CACHE_ROOT = os.path.join("/media/dcceris", "muvera_optimized", "cache_muvera", DATASET_REPO_ID, FILENAME)
 os.makedirs(CACHE_ROOT, exist_ok=True)
 
 # 쿼리 검색 디렉터리
-dataset = "trec-covid"
+dataset = DATASET_REPO_ID
 QUERY_SEARCH_DIR = os.path.join(CACHE_ROOT, "query_search")
 os.makedirs(QUERY_SEARCH_DIR, exist_ok=True)
 
 # 공통 문서 임베딩 디렉터리 설정
-COMMON_EMBEDS_DIR = os.path.join("/media/hyunji", "muvera_optimized", "cache_muvera", DATASET_REPO_ID)
+COMMON_EMBEDS_DIR = os.path.join("/media/dcceris", "muvera_optimized", "cache_muvera", DATASET_REPO_ID)
 COMMON_DOC_EMBEDS_DIR = os.path.join(COMMON_EMBEDS_DIR, "doc_embeds")
 COMMON_QUERY_EMBEDS_DIR = os.path.join(COMMON_EMBEDS_DIR, "query_embeds")
 os.makedirs(COMMON_DOC_EMBEDS_DIR, exist_ok=True)
@@ -82,11 +82,12 @@ def log_memory_usage(stage: str):
     memory_gb = memory_mb / 1024  # GB 단위
     logging.info(f"[MEMORY] {stage}: {memory_mb:.1f} MB ({memory_gb:.2f} GB)")
     return memory_mb
+    
 def load_nanobeir_dataset(repo_id: str):
     """Loads BEIR dataset from local 'data_path' in test split."""
     # 데이터셋 준비 (BEIR trec-covid)
     url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip"
-    out_dir = os.path.join("/media/hyunji/7672b947-0099-4e49-8e90-525a208d54b8", "muvera_optimized", "datasets")
+    out_dir = os.path.join("/media/dcceris", "muvera_optimized", "datasets")
 
     if not os.path.exists(os.path.join(out_dir, dataset)):
         data_path = util.download_and_unzip(url, out_dir)
@@ -482,7 +483,7 @@ class ColbertFdeRetriever:
         #[1017] simhash별 indice별 원소 개수 csv 파일 저장 필요------------------------------------
         simhash_count_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_simhash{args.simhash}_rerank{args.rerank}")
         os.makedirs(simhash_count_dir, exist_ok=True)
-        simhash_count_path = os.path.join(simhash_count_dir, "simhash_count.csv")
+        simhash_count_path = os.path.join(simhash_count_dir, "partition_count.csv")
         with open(simhash_count_path, "w", encoding="utf-8") as f:
             f.write("doc_idx,rep_num,partition_idx,count\n")
         #------------------------------------------------------------------------
