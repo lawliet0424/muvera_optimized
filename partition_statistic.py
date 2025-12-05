@@ -313,9 +313,9 @@ def main():
     args = parse_arguments()
 
     if args.projection == 128:
-        common_file_path = os.path.join("/media/hyunji/muvera_optimized", "cache_muvera", args.dataset, args.filename, "query_search", f"rep{args.rep}_{args.method}{args.partition_idx}_rerank{args.rerank}")
+        common_file_path = os.path.join("/media/dcceris/muvera_optimized", "cache_muvera", args.dataset, args.filename, "query_search", f"rep{args.rep}_{args.method}{args.partition_idx}_rerank{args.rerank}")
     else:
-        common_file_path = os.path.join("/media/hyunji/muvera_optimized", "cache_muvera", args.dataset, args.filename, "query_search", f"rep{args.rep}_{args.method}{args.partition_idx}_rerank{args.rerank}_proj{args.projection}")
+        common_file_path = os.path.join("/media/dcceris/muvera_optimized", "cache_muvera", args.dataset, args.filename, "query_search", f"rep{args.rep}_{args.method}{args.partition_idx}_rerank{args.rerank}_proj{args.projection}")
     # 출력 파일 경로 설정 (partition_count_result.txt 형태)
     output_txt_path = os.path.join(common_file_path, f"partition_count_result.txt")
     

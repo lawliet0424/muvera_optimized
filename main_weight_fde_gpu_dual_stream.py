@@ -30,7 +30,7 @@ from beir.retrieval.search.dense import DenseRetrievalExactSearch as DRES
 import argparse
 
 # FDE 구현 (GPU 버전 사용)
-from fde_generator_gpu_optimized import (
+from fde_generator_gpu_optimized_dual_stream import (
     FixedDimensionalEncodingConfig,
     EncodingType,
     ProjectionType,
@@ -47,7 +47,7 @@ from fde_generator_gpu_optimized import (
 DATASET_REPO_ID = "scidocs"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
 TOP_K = 10
-FILENAME = "main_weight_fde_gpu"
+FILENAME = "main_weight_fde_gpu_dual_stream"
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -497,7 +497,7 @@ class ColbertFdeRetriever:
         )
 
         # ---------- 배치 단위 처리: 인코딩 → FDE 생성 → 저장 ----------
-        ATOMIC_BATCH_SIZE = 8000  # 배치 크기 (메모리 매핑으로 안전하게 처리)
+        ATOMIC_BATCH_SIZE = 3000  # 배치 크기 (메모리 매핑으로 안전하게 처리)
         
         #[1017] simhash별 indice별 원소 개수 csv 파일 저장 필요------------------------------------
         simhash_count_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{self.num_repetitions}_simhash{self.num_simhash_projections}_rerank{self.rerank_candidates}")

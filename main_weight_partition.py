@@ -26,8 +26,9 @@ from beir.retrieval.search.dense import DenseRetrievalExactSearch as DRES
 import argparse
 
 # FDE 구현 (업로드된 파일 사용)
-from fde_generator_optimized_stream_simhash_check import (
+from fde_generator_optimized_stream_weight_partition import (
     FixedDimensionalEncodingConfig,
+    ProjectionType,
     generate_query_fde,
     generate_document_fde_batch,
 )
@@ -35,10 +36,10 @@ from fde_generator_optimized_stream_simhash_check import (
 # ======================
 # --- Configuration ----
 # ======================
-DATASET_REPO_ID = "scidocs"
+DATASET_REPO_ID = "arguana"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
 TOP_K = 10
-FILENAME = "main_weight"
+FILENAME = "main_weight_partition"
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -157,9 +158,8 @@ def _dcg_at_k(ranked_docids: List[str], qrels_q: Dict[str, int], k: int) -> floa
     dcg = 0.0
     for i, did in enumerate(ranked_docids[:k], start=1):
         rel = int(qrels_q.get(str(did), 0))
-        if rel <= 0:
-            continue
-        gain = (2 ** rel) - 1
+        # rel=0인 경우도 포함 (gain=0이지만 위치는 유지)
+        gain = (2 ** rel) - 1 if rel > 0 else 0.0
         dcg += gain / math.log2(i + 1)
     return dcg
 
@@ -179,7 +179,7 @@ def per_query_ndcg_at_k(results: Dict[str, OrderedDict], qrels: Dict[str, Dict[s
         ideal_gains = sorted([int(v) for v in qrels_q.values() if int(v) > 0], reverse=True)
         idcg = 0.0
         for i, rel in enumerate(ideal_gains[:k], start=1):
-            gain = (2 ** rel) - 1
+            gain = (2 ** rel) - 1 if rel > 0 else 0.0
             idcg += gain / math.log2(i + 1)
         ndcg = (dcg / idcg) if idcg > 0 else 0.0
         ndcgs[qid] = ndcg
@@ -224,16 +224,22 @@ class ColbertFdeRetriever:
         external_doc_embeds_dir: Optional[str] = None,  # ★ 추가: 외부 임베딩 디렉터리
         num_repetitions: int = 2,
         num_simhash_projections: int = 5,
+        projection_dimension: int = 128,  # ★ 추가: projection dimension
     ):
         model = neural_cherche_models.ColBERT(model_name_or_path=model_name, device=DEVICE)
         self.ranker = neural_cherche_rank.ColBERT(key="id", on=["title", "text"], model=model)
+        self.projection_dimension = projection_dimension
 
         # 추가된 인자
         self.num_repetitions = num_repetitions
         self.num_simhash_projections = num_simhash_projections
 
+        # projection_dimension이 128이 아닌 경우 AMS_SKETCH projection 사용
+        use_projection = self.projection_dimension != 128
         self.doc_config = FixedDimensionalEncodingConfig(
-            dimension=128,
+            dimension=128,   # ColBERT 임베딩의 원본 차원 (고정)
+            projection_dimension=self.projection_dimension if use_projection else None,  # projection 후 차원
+            projection_type=ProjectionType.AMS_SKETCH if use_projection else ProjectionType.DEFAULT_IDENTITY,
             num_repetitions=self.num_repetitions,
             num_simhash_projections=self.num_simhash_projections,
             seed=42,
@@ -274,10 +280,106 @@ class ColbertFdeRetriever:
         # 지연시간 로그 파일 (헤더 없이 누적)
         self._latency_log_path = latency_log_path or os.path.join(self._cache_dir, "latency.tsv")
 
+    def run_bit_ablation(self, corpus, queries, qrels, top_k=10):
+        """
+        전체 FDE index(self.fde_index) 생성이 끝난 뒤 실행.
+        simhash bit을 하나씩 제거하여 전체 recall 변화 측정.
+        """
+        if self.fde_index is None:
+            raise RuntimeError("FDE index is not built yet.")
+
+        b = self.doc_config.num_simhash_projections
+        rep = self.doc_config.num_repetitions
+
+        logging.info(f"[Ablation] Running bit ablation: {b} simhash bits")
+
+        # (0) full score 먼저 계산
+        full_results = {}
+        for qid, qtext in queries.items():
+            full_results[str(qid)] = self.search(qtext, query_id=str(qid))
+
+        full_recall = evaluate_recall(full_results, qrels, k=top_k)
+        full_ndcg   = evaluate_ndcg_at_k(full_results, qrels, k=top_k)
+
+        ablation_output = {
+            "full_recall": full_recall,
+            "full_ndcg": full_ndcg,
+            "details": []
+        }
+
+        # 모든 문서 임베딩을 먼저 수집 (한 번만)
+        logging.info("[Ablation] Collecting all document embeddings...")
+        all_embeddings = []
+        for doc_id in self.doc_ids:
+            emb = self._get_doc_embeddings(doc_id)
+            all_embeddings.append(emb)
+
+        # (1) Bit 별 실험 (각 bit에 대해 0과 1 두 가지 실험 수행)
+        for k in range(b):
+            logging.info(f"[Ablation] Testing bit {k}/{b-1} (both 0 and 1)")
+
+            # 각 bit 값(0, 1)에 대해 실험 수행
+            for forced_value in [0, 1]:
+                logging.info(f"[Ablation] Testing bit {k} forced to {forced_value}")
+
+                # 배치로 한 번에 FDE 생성
+                ablated_fde_result = generate_document_fde_batch(
+                    all_embeddings,
+                    self.doc_config,
+                    ignore_bit=k,
+                    force_bit_value=forced_value,
+                    memmap_path=None
+                )
+                
+                # 튜플인 경우 첫 번째 요소만 사용 (partition_counter는 ablation에서 사용하지 않음)
+                if isinstance(ablated_fde_result, tuple):
+                    ablated_fde = ablated_fde_result[0]
+                else:
+                    ablated_fde = ablated_fde_result
+
+                # 검색 점수 계산
+                results_k = {}
+                old_index = self.fde_index
+                self.fde_index = ablated_fde  # 임시 교체
+
+                for qid, qtext in queries.items():
+                    results_k[str(qid)] = self.search(qtext, query_id=str(qid))
+
+                # 되돌리기
+                self.fde_index = old_index
+
+                recall_k = evaluate_recall(results_k, qrels, k=top_k)
+                ndcg_k   = evaluate_ndcg_at_k(results_k, qrels, k=top_k)
+
+                ablation_output["details"].append({
+                    "bit": k,
+                    "forced_value": forced_value,
+                    "recall": recall_k,
+                    "recall_drop": full_recall - recall_k,
+                    "ndcg": ndcg_k,
+                    "ndcg_drop": full_ndcg - ndcg_k
+                })
+
+                logging.info(
+                    f"[Ablation] bit={k}, forced={forced_value}: "
+                    f"Recall={recall_k:.4f} (Δ {full_recall - recall_k:.4f}), "
+                    f"nDCG={ndcg_k:.4f} (Δ {full_ndcg - ndcg_k:.4f})"
+                )
+
+        # (2) 저장
+        save_path = os.path.join(self._cache_dir, "bit_ablation_results.json")
+        with open(save_path, "w", encoding="utf-8") as f:
+            json.dump(ablation_output, f, indent=2, ensure_ascii=False)
+
+        logging.info(f"[Ablation] Saved results → {save_path}")
+        
+        return ablation_output
+
     # --------- 경로/키 유틸 ---------
     def _compute_cache_dir(self, dataset: str, model_name: str, cfg) -> str:
         model_key = model_name.replace("/", "_")
-        cfg_str = f"d{cfg.dimension}_r{cfg.num_repetitions}_p{cfg.num_simhash_projections}_seed{cfg.seed}_fill{int(cfg.fill_empty_partitions)}"
+        proj_dim = cfg.projection_dimension if cfg.projection_dimension else cfg.dimension
+        cfg_str = f"d{proj_dim}_r{cfg.num_repetitions}_p{cfg.num_simhash_projections}_seed{cfg.seed}_fill{int(cfg.fill_empty_partitions)}"
         raw = f"{dataset}|{model_key}|{cfg_str}"
         key = hashlib.md5(raw.encode()).hexdigest()[:10]
         dir_name = f"{dataset.replace('/', '_')}__{model_key}__{cfg_str}__{key}"
@@ -478,10 +580,12 @@ class ColbertFdeRetriever:
         )
 
         # ---------- 배치 단위 처리: 인코딩 → FDE 생성 → 저장 ----------
-        ATOMIC_BATCH_SIZE = 1000  # 배치 크기 (메모리 매핑으로 안전하게 처리)
+        ATOMIC_BATCH_SIZE = 3000  # 배치 크기 (메모리 매핑으로 안전하게 처리)
         
         #[1017] simhash별 indice별 원소 개수 csv 파일 저장 필요------------------------------------
-        simhash_count_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_simhash{args.simhash}_rerank{args.rerank}")
+        # partition_count 파일 경로 생성 (main script에서 사용할 경로와 동일한 구조)
+        proj_suffix = f"_proj{self.projection_dimension}" if self.projection_dimension != 128 else "_proj128"
+        simhash_count_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{self.num_repetitions}_simhash{self.num_simhash_projections}_rerank{self.rerank_candidates}{proj_suffix}")
         os.makedirs(simhash_count_dir, exist_ok=True)
         simhash_count_path = os.path.join(simhash_count_dir, "partition_count.csv")
         with open(simhash_count_path, "w", encoding="utf-8") as f:
@@ -494,7 +598,8 @@ class ColbertFdeRetriever:
         final_fde_dim = self.doc_config.num_repetitions * final_fde_dim_per_rep
         
         # FDE 인덱스 memmap 생성
-        fde_memmap_path = os.path.join(self._cache_dir, f"fde_index_memmap_{args.rep}_{args.simhash}.mmap")
+        proj_suffix = f"_{self.projection_dimension}" if self.projection_dimension != 128 else ""
+        fde_memmap_path = os.path.join(self._cache_dir, f"fde_index_memmap_{self.num_repetitions}_{self.num_simhash_projections}{proj_suffix}.mmap")
         fde_index = np.memmap(fde_memmap_path, mode="w+", dtype=np.float32, 
                              shape=(len(self.doc_ids), final_fde_dim))
         
@@ -565,12 +670,14 @@ class ColbertFdeRetriever:
             batch_fde_result = generate_document_fde_batch(
                 batch_embeddings,
                 self.doc_config,
+
                 memmap_path=batch_memmap_path,  # 배치별 memmap 사용
                 max_bytes_in_memory=512 * 1024**2,  # 512MB로 제한
                 log_every=ATOMIC_BATCH_SIZE,
                 flush_interval=ATOMIC_BATCH_SIZE,
             )
-            
+
+        
             if isinstance(batch_fde_result, tuple):
                 batch_fde, partition_counter = batch_fde_result
             else:
@@ -646,7 +753,7 @@ class ColbertFdeRetriever:
             query_embeddings_map = self.ranker.encode_queries(queries=[qtext])
             query_embeddings = to_numpy(next(iter(query_embeddings_map.values())))
             query_config = replace(self.doc_config, fill_empty_partitions=False)
-            query_fde_result = generate_query_fde(query_embeddings, query_config, True)
+            query_fde_result = generate_query_fde(query_embeddings, query_config)
             
             # query_fde_result가 튜플인 경우 첫 번째 요소만 사용
             if isinstance(query_fde_result, tuple):
@@ -673,7 +780,7 @@ class ColbertFdeRetriever:
             query_embeddings_map = self.ranker.encode_queries(queries=[query])
             query_embeddings = to_numpy(next(iter(query_embeddings_map.values())))
             query_config = replace(self.doc_config, fill_empty_partitions=False)
-            query_fde_result = generate_query_fde(query_embeddings, query_config, True)
+            query_fde_result = generate_query_fde(query_embeddings, query_config)
             
             # query_fde_result가 튜플인 경우 첫 번째 요소만 사용
             if isinstance(query_fde_result, tuple):
@@ -741,6 +848,7 @@ if __name__ == "__main__":
     parser.add_argument("--rep", type=int, default=2)
     parser.add_argument("--simhash", type=int, default=5)
     parser.add_argument("--rerank", type=int, default=100)
+    parser.add_argument("--projection", type=int, default=128, help="Projection dimension (default: 128, uses identity projection)")
     args = parser.parse_args()
 
     nltk.download('punkt', quiet=True)
@@ -765,10 +873,11 @@ if __name__ == "__main__":
             rerank_candidates=args.rerank,
             enable_rerank=True,
             save_doc_embeds=False,  # 공통 디렉터리에만 저장, 하위 디렉터리 중복 저장 방지
-            latency_log_path=os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_simhash{args.simhash}_rerank{args.rerank}", "latency.tsv"),  # QID\tSearch\tRerank
+            latency_log_path=os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_simhash{args.simhash}_rerank{args.rerank}_proj{args.projection}", "latency.tsv"),  # QID\tSearch\tRerank
             external_doc_embeds_dir=COMMON_DOC_EMBEDS_DIR,  # ★ 공통 문서 임베딩 디렉터리
             num_repetitions=args.rep,
             num_simhash_projections=args.simhash,
+            projection_dimension=args.projection,  # ★ projection dimension 설정
         )
     }
 
@@ -792,7 +901,7 @@ if __name__ == "__main__":
         results = {}
 
         # 지연시간 로그 파일 초기화
-        latency_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_simhash{args.simhash}_rerank{args.rerank}")
+        latency_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_simhash{args.simhash}_rerank{args.rerank}_proj{args.projection}")
         os.makedirs(latency_dir, exist_ok=True)
         with open(os.path.join(latency_dir, "latency.tsv"), "w", encoding="utf-8") as f:
             f.write("QID\tSearch\tRerank\n")
@@ -814,7 +923,7 @@ if __name__ == "__main__":
     report_lines.append("\n" + "=" * 85)
     report_lines.append(f"{'FINAL REPORT':^85}")
     report_lines.append(f"(Dataset: {DATASET_REPO_ID})")
-    report_lines.append(f"Parameters: rep={args.rep}, simhash={args.simhash}, rerank={args.rerank}")
+    report_lines.append(f"Parameters: rep={args.rep}, simhash={args.simhash}, rerank={args.rerank}, projection={args.projection}")
     report_lines.append(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     report_lines.append("=" * 85)
     report_lines.append(f"{'Retriever':<30} | {'Indexing Time (s)':<20} | {'Avg Query Time (ms)':<22} | {'Recall@{k}'.format(k=TOP_K):<10} | {'Hit@{k}'.format(k=TOP_K):<10} | {'nDCG@{k}'.format(k=TOP_K):<10}")
@@ -881,3 +990,411 @@ if __name__ == "__main__":
         f.write("\n".join(report_lines))
     
     logging.info(f"Results saved to: {results_file}")
+
+    # Run Bit Ablation
+    logging.info("--- PHASE 3: BIT ABLATION ---")
+    retriever = list(retrievers.values())[0]
+    ablation_results = retriever.run_bit_ablation(corpus, queries, qrels, top_k=TOP_K)
+    
+    # Bit Ablation 결과를 읽기 쉬운 형식으로 저장
+    ablation_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_simhash{args.simhash}_rerank{args.rerank}_proj{args.projection}")
+    os.makedirs(ablation_dir, exist_ok=True)
+    
+    # TSV 형식으로 저장
+    ablation_tsv_path = os.path.join(ablation_dir, "bit_ablation_results.tsv")
+    with open(ablation_tsv_path, "w", encoding="utf-8") as f:
+        f.write("Bit\tForced_Value\tRecall@{}\tnDCG@{}\tRecall_Drop\tnDCG_Drop\n".format(TOP_K, TOP_K))
+        f.write("Full\t-\t{:.6f}\t{:.6f}\t0.000000\t0.000000\n".format(
+            ablation_results["full_recall"], 
+            ablation_results["full_ndcg"]
+        ))
+        for detail in ablation_results["details"]:
+            f.write("{}\t{}\t{:.6f}\t{:.6f}\t{:.6f}\t{:.6f}\n".format(
+                detail["bit"],
+                detail["forced_value"],
+                detail["recall"],
+                detail["ndcg"],
+                detail["recall_drop"],
+                detail["ndcg_drop"]
+            ))
+    logging.info(f"Bit ablation TSV saved to: {ablation_tsv_path}")
+    
+    # 텍스트 리포트 형식으로 저장
+    ablation_report_path = os.path.join(ablation_dir, "bit_ablation_report.txt")
+    with open(ablation_report_path, "w", encoding="utf-8") as f:
+        f.write("=" * 100 + "\n")
+        f.write(f"{'BIT ABLATION RESULTS':^100}\n")
+        f.write("=" * 100 + "\n")
+        f.write(f"Dataset: {DATASET_REPO_ID}\n")
+        f.write(f"Parameters: rep={args.rep}, simhash={args.simhash}, rerank={args.rerank}, projection={args.projection}\n")
+        f.write(f"Top-K: {TOP_K}\n")
+        f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 100 + "\n\n")
+        
+        f.write(f"Full (All bits):\n")
+        f.write(f"  Recall@{TOP_K}: {ablation_results['full_recall']:.6f}\n")
+        f.write(f"  nDCG@{TOP_K}: {ablation_results['full_ndcg']:.6f}\n\n")
+        
+        f.write(f"{'Bit':<10} {'Forced':<10} {'Recall@{k}':<15} {'nDCG@{k}':<15} {'Recall Drop':<15} {'nDCG Drop':<15}\n".format(k=TOP_K))
+        f.write("-" * 100 + "\n")
+        for detail in ablation_results["details"]:
+            f.write(f"{detail['bit']:<10} {detail['forced_value']:<10} {detail['recall']:<15.6f} {detail['ndcg']:<15.6f} "
+                   f"{detail['recall_drop']:<15.6f} {detail['ndcg_drop']:<15.6f}\n")
+        
+        f.write("\n" + "=" * 100 + "\n")
+        f.write("Summary:\n")
+        f.write(f"  Overall Average Recall Drop: {np.mean([d['recall_drop'] for d in ablation_results['details']]):.6f}\n")
+        f.write(f"  Overall Average nDCG Drop: {np.mean([d['ndcg_drop'] for d in ablation_results['details']]):.6f}\n")
+        
+        # Forced value별 통계
+        for forced_val in [0, 1]:
+            forced_details = [d for d in ablation_results['details'] if d['forced_value'] == forced_val]
+            if forced_details:
+                f.write(f"\n  Forced Value = {forced_val}:\n")
+                f.write(f"    Average Recall Drop: {np.mean([d['recall_drop'] for d in forced_details]):.6f}\n")
+                f.write(f"    Average nDCG Drop: {np.mean([d['ndcg_drop'] for d in forced_details]):.6f}\n")
+                max_recall_drop = max(forced_details, key=lambda x: x['recall_drop'])
+                max_ndcg_drop = max(forced_details, key=lambda x: x['ndcg_drop'])
+                f.write(f"    Max Recall Drop: {max_recall_drop['recall_drop']:.6f} (bit {max_recall_drop['bit']})\n")
+                f.write(f"    Max nDCG Drop: {max_ndcg_drop['ndcg_drop']:.6f} (bit {max_ndcg_drop['bit']})\n")
+        
+        f.write("=" * 100 + "\n")
+    
+    logging.info(f"Bit ablation report saved to: {ablation_report_path}")
+
+    # Run Repetition Ablation
+    logging.info("--- PHASE 4: REPETITION ABLATION ---")
+    retriever = list(retrievers.values())[0]
+    
+    # FDE 차원 구조 계산
+    num_partitions_per_rep = 2 ** args.simhash
+    partition_size = retriever.doc_config.dimension  # 기본 dimension (projection_dimension이 있으면 그것 사용)
+    if hasattr(retriever.doc_config, 'projection_dimension') and retriever.doc_config.projection_dimension:
+        partition_size = retriever.doc_config.projection_dimension
+    repetition_size = partition_size * num_partitions_per_rep
+    
+    logging.info(f"✅ [INFO] repetition 개수: {args.rep}, 공간 분할 함수 개수: {args.simhash}")
+    logging.info(f"✅ [INFO] 각 repetition당 partition 개수: {num_partitions_per_rep}, 각 partition 크기: {partition_size}")
+    logging.info(f"✅ [INFO] 각 repetition당 공간 크기: {repetition_size}")
+    
+    # Repetition별 results 초기화
+    results_repetition = {}
+    
+    # 각 repetition을 개별적으로 분석: 0번만 -> 1번만 -> 2번만 -> ... -> (rep-1)번만
+    for rep_idx in range(args.rep):
+        # 각 repetition의 차원 범위 계산
+        dim_start = rep_idx * repetition_size
+        dim_end = (rep_idx + 1) * repetition_size
+        
+        logging.info(f"✅ [INFO] Repetition {rep_idx} (개별 분석):")
+        logging.info(f"   - 포함된 repetition: {rep_idx}번만 (1개)")
+        logging.info(f"   - 차원 범위: [{dim_start}, {dim_end})")
+        logging.info(f"   - 검색 수행 중...")
+        
+        # rep_idx번 repetition만 포함하는 차원들만 선택
+        dims_to_keep = list(range(dim_start, dim_end))
+        
+        # 문서 FDE에서 해당 repetition만 선택
+        truncated_fde_index = retriever.fde_index[:, dims_to_keep]
+        
+        # 검색 수행 (임시로 fde_index 교체)
+        old_index = retriever.fde_index
+        retriever.fde_index = truncated_fde_index
+        
+        # 모든 쿼리에 대해 검색 수행
+        rep_results = {}
+        for qid, qtext in queries.items():
+            # Query FDE 생성 (전체 차원으로 생성 후 슬라이싱)
+            key = retriever._query_key(qtext, str(qid))
+            cached_emb, cached_fde = retriever._load_query_cache(key)
+            
+            if cached_emb is None or cached_fde is None:
+                query_embeddings_map = retriever.ranker.encode_queries(queries=[qtext])
+                query_embeddings = to_numpy(next(iter(query_embeddings_map.values())))
+                query_config = replace(retriever.doc_config, fill_empty_partitions=False)
+                query_fde_result = generate_query_fde(query_embeddings, query_config)
+                
+                if isinstance(query_fde_result, tuple):
+                    query_fde = query_fde_result[0]
+                else:
+                    query_fde = query_fde_result
+            else:
+                query_fde = cached_fde
+            
+            # Query FDE도 동일한 차원만 선택
+            truncated_query_fde = query_fde[dims_to_keep]
+            
+            # 검색 점수 계산
+            fde_scores = truncated_fde_index @ truncated_query_fde
+            order_fde = np.argsort(-fde_scores)
+            
+            # 결과 저장
+            rep_results[str(qid)] = OrderedDict((retriever.doc_ids[i], float(fde_scores[i])) for i in order_fde)
+        
+        # 되돌리기
+        retriever.fde_index = old_index
+        
+        # 평가
+        recall_rep = evaluate_recall(rep_results, qrels, k=TOP_K)
+        ndcg_rep = evaluate_ndcg_at_k(rep_results, qrels, k=TOP_K)
+        
+        # 결과 저장
+        key = f"rep_{rep_idx}_only"
+        results_repetition[key] = {
+            "rep_idx": rep_idx,
+            "included_repetitions": 1,
+            "dim_range": [dim_start, dim_end],
+            "recall": recall_rep,
+            "ndcg": ndcg_rep
+        }
+        
+        logging.info(f"✅ [INFO] {DATASET_REPO_ID}, rep {rep_idx}만 완료")
+        logging.info(f"   - Recall@{TOP_K}: {recall_rep:.6f}, nDCG@{TOP_K}: {ndcg_rep:.6f}")
+    
+    # Repetition ablation 결과 저장
+    repetition_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_simhash{args.simhash}_rerank{args.rerank}_proj{args.projection}")
+    os.makedirs(repetition_dir, exist_ok=True)
+    
+    # JSON 형식으로 저장
+    repetition_json_path = os.path.join(repetition_dir, "repetition_ablation_results.json")
+    with open(repetition_json_path, "w", encoding="utf-8") as f:
+        json.dump(results_repetition, f, indent=2, ensure_ascii=False)
+    logging.info(f"Repetition ablation JSON saved to: {repetition_json_path}")
+    
+    # TSV 형식으로 저장
+    repetition_tsv_path = os.path.join(repetition_dir, "repetition_ablation_results.tsv")
+    with open(repetition_tsv_path, "w", encoding="utf-8") as f:
+        f.write("Repetition\tIncluded_Reps\tDim_Range_Start\tDim_Range_End\tRecall@{}\tnDCG@{}\n".format(TOP_K, TOP_K))
+        for key, result in sorted(results_repetition.items(), key=lambda x: x[1]['rep_idx']):
+            f.write(f"{result['rep_idx']}" + "\t" +
+                   f"{result['included_repetitions']}" + "\t" +
+                   f"{result['dim_range'][0]}" + "\t" +
+                   f"{result['dim_range'][1]}" + "\t" +
+                   f"{result['recall']:.6f}" + "\t" +
+                   f"{result['ndcg']:.6f}\n")
+    logging.info(f"Repetition ablation TSV saved to: {repetition_tsv_path}")
+    
+    # 텍스트 리포트 형식으로 저장
+    repetition_report_path = os.path.join(repetition_dir, "repetition_ablation_report.txt")
+    with open(repetition_report_path, "w", encoding="utf-8") as f:
+        f.write("=" * 100 + "\n")
+        f.write(f"{'REPETITION ABLATION RESULTS':^100}\n")
+        f.write("=" * 100 + "\n")
+        f.write(f"Dataset: {DATASET_REPO_ID}\n")
+        f.write(f"Parameters: rep={args.rep}, simhash={args.simhash}, rerank={args.rerank}, projection={args.projection}\n")
+        f.write(f"Top-K: {TOP_K}\n")
+        f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 100 + "\n\n")
+        
+        f.write(f"{'Repetition':<15} {'Included':<15} {'Dim Range':<20} {'Recall@{k}':<15} {'nDCG@{k}':<15}\n".format(k=TOP_K))
+        f.write("-" * 100 + "\n")
+        for key, result in sorted(results_repetition.items(), key=lambda x: x[1]['rep_idx']):
+            f.write(f"{result['rep_idx']:<15} {result['included_repetitions']:<15} "
+                   f"[{result['dim_range'][0]}, {result['dim_range'][1]}){'':<10} "
+                   f"{result['recall']:<15.6f} {result['ndcg']:<15.6f}\n")
+        
+        f.write("\n" + "=" * 100 + "\n")
+        f.write("Summary:\n")
+        recalls = [r['recall'] for r in results_repetition.values()]
+        ndcgs = [r['ndcg'] for r in results_repetition.values()]
+        best_recall_rep = max(results_repetition.items(), key=lambda x: x[1]['recall'])[1]['rep_idx']
+        best_ndcg_rep = max(results_repetition.items(), key=lambda x: x[1]['ndcg'])[1]['rep_idx']
+        f.write(f"  Best Recall@{TOP_K}: {max(recalls):.6f} (rep {best_recall_rep} only)\n")
+        f.write(f"  Best nDCG@{TOP_K}: {max(ndcgs):.6f} (rep {best_ndcg_rep} only)\n")
+        f.write(f"  Average Recall@{TOP_K}: {np.mean(recalls):.6f}\n")
+        f.write(f"  Average nDCG@{TOP_K}: {np.mean(ndcgs):.6f}\n")
+        f.write(f"  Std Recall@{TOP_K}: {np.std(recalls):.6f}\n")
+        f.write(f"  Std nDCG@{TOP_K}: {np.std(ndcgs):.6f}\n")
+        f.write("=" * 100 + "\n")
+    
+    logging.info(f"Repetition ablation report saved to: {repetition_report_path}")
+    
+    # Top N Repetition 조합 실험 (20%, 40%, 60%, 80%만)
+    logging.info("--- PHASE 5: TOP N REPETITION COMBINATION (20%, 40%, 60%, 80% of total) ---")
+    
+    # 전체 repetition 개수
+    total_reps = len(results_repetition)
+    
+    # 테스트할 percentile 목록
+    percentiles = [20, 40, 60, 80]
+    num_reps_list = [max(1, int(total_reps * pct / 100)) for pct in percentiles]
+    
+    logging.info(f"✅ [INFO] Total repetitions: {total_reps}")
+    logging.info(f"✅ [INFO] Testing top {percentiles}% repetitions: {num_reps_list}")
+    
+    # Recall 기준으로 정렬
+    sorted_by_recall = sorted(results_repetition.items(), key=lambda x: x[1]['recall'], reverse=True)
+    
+    # nDCG 기준으로 정렬
+    sorted_by_ndcg = sorted(results_repetition.items(), key=lambda x: x[1]['ndcg'], reverse=True)
+    
+    # 개수별 결과 저장
+    top_n_results = {}
+    
+    # 각 percentile에 대해 실험
+    for percentile, num_reps in zip(percentiles, num_reps_list):
+        
+        # Recall 기준 Top N개
+        top_n_recall_reps = [item[1]['rep_idx'] for item in sorted_by_recall[:num_reps]]
+        
+        # nDCG 기준 Top N개
+        top_n_ndcg_reps = [item[1]['rep_idx'] for item in sorted_by_ndcg[:num_reps]]
+        
+        logging.info(f"✅ [INFO] Testing Top {num_reps} repetitions (out of {total_reps} total, {percentile}%)")
+        
+        # Recall 기준 실험
+        top_n_recall_dims = []
+        for rep_idx in sorted(top_n_recall_reps):
+            dim_start = rep_idx * repetition_size
+            dim_end = (rep_idx + 1) * repetition_size
+            top_n_recall_dims.extend(range(dim_start, dim_end))
+        
+        top_n_recall_dims = sorted(top_n_recall_dims)
+        truncated_fde_index_recall = retriever.fde_index[:, top_n_recall_dims]
+        
+        old_index = retriever.fde_index
+        retriever.fde_index = truncated_fde_index_recall
+        
+        top_n_recall_results = {}
+        for qid, qtext in queries.items():
+            key = retriever._query_key(qtext, str(qid))
+            cached_emb, cached_fde = retriever._load_query_cache(key)
+            
+            if cached_emb is None or cached_fde is None:
+                query_embeddings_map = retriever.ranker.encode_queries(queries=[qtext])
+                query_embeddings = to_numpy(next(iter(query_embeddings_map.values())))
+                query_config = replace(retriever.doc_config, fill_empty_partitions=False)
+                query_fde_result = generate_query_fde(query_embeddings, query_config)
+                
+                if isinstance(query_fde_result, tuple):
+                    query_fde = query_fde_result[0]
+                else:
+                    query_fde = query_fde_result
+            else:
+                query_fde = cached_fde
+            
+            truncated_query_fde = query_fde[top_n_recall_dims]
+            fde_scores = truncated_fde_index_recall @ truncated_query_fde
+            order_fde = np.argsort(-fde_scores)
+            top_n_recall_results[str(qid)] = OrderedDict((retriever.doc_ids[i], float(fde_scores[i])) for i in order_fde)
+        
+        retriever.fde_index = old_index
+        
+        recall_top_n = evaluate_recall(top_n_recall_results, qrels, k=TOP_K)
+        ndcg_top_n_recall = evaluate_ndcg_at_k(top_n_recall_results, qrels, k=TOP_K)
+        
+        # nDCG 기준 실험
+        top_n_ndcg_dims = []
+        for rep_idx in sorted(top_n_ndcg_reps):
+            dim_start = rep_idx * repetition_size
+            dim_end = (rep_idx + 1) * repetition_size
+            top_n_ndcg_dims.extend(range(dim_start, dim_end))
+        
+        top_n_ndcg_dims = sorted(top_n_ndcg_dims)
+        truncated_fde_index_ndcg = retriever.fde_index[:, top_n_ndcg_dims]
+        
+        retriever.fde_index = truncated_fde_index_ndcg
+        
+        top_n_ndcg_results = {}
+        for qid, qtext in queries.items():
+            key = retriever._query_key(qtext, str(qid))
+            cached_emb, cached_fde = retriever._load_query_cache(key)
+            
+            if cached_emb is None or cached_fde is None:
+                query_embeddings_map = retriever.ranker.encode_queries(queries=[qtext])
+                query_embeddings = to_numpy(next(iter(query_embeddings_map.values())))
+                query_config = replace(retriever.doc_config, fill_empty_partitions=False)
+                query_fde_result = generate_query_fde(query_embeddings, query_config)
+                
+                if isinstance(query_fde_result, tuple):
+                    query_fde = query_fde_result[0]
+                else:
+                    query_fde = query_fde_result
+            else:
+                query_fde = cached_fde
+            
+            truncated_query_fde = query_fde[top_n_ndcg_dims]
+            fde_scores = truncated_fde_index_ndcg @ truncated_query_fde
+            order_fde = np.argsort(-fde_scores)
+            top_n_ndcg_results[str(qid)] = OrderedDict((retriever.doc_ids[i], float(fde_scores[i])) for i in order_fde)
+        
+        retriever.fde_index = old_index
+        
+        recall_top_n_ndcg = evaluate_recall(top_n_ndcg_results, qrels, k=TOP_K)
+        ndcg_top_n_ndcg = evaluate_ndcg_at_k(top_n_ndcg_results, qrels, k=TOP_K)
+        
+        # 결과 저장
+        top_n_results[f"top{percentile}pct"] = {
+            "num_repetitions": num_reps,
+            "percentile": percentile,
+            "recall_based": {
+                "selected_repetitions": sorted(top_n_recall_reps),
+                "dim_range": [min(top_n_recall_dims), max(top_n_recall_dims) + 1] if top_n_recall_dims else [0, 0],
+                "recall": recall_top_n,
+                "ndcg": ndcg_top_n_recall
+            },
+            "ndcg_based": {
+                "selected_repetitions": sorted(top_n_ndcg_reps),
+                "dim_range": [min(top_n_ndcg_dims), max(top_n_ndcg_dims) + 1] if top_n_ndcg_dims else [0, 0],
+                "recall": recall_top_n_ndcg,
+                "ndcg": ndcg_top_n_ndcg
+            }
+        }
+        
+        logging.info(f"   - Recall-based: Recall@{TOP_K}={recall_top_n:.6f}, nDCG@{TOP_K}={ndcg_top_n_recall:.6f}")
+        logging.info(f"   - nDCG-based: Recall@{TOP_K}={recall_top_n_ndcg:.6f}, nDCG@{TOP_K}={ndcg_top_n_ndcg:.6f}")
+    
+    # Top N별 결과 저장
+    top_n_json_path = os.path.join(repetition_dir, "top_n_combination_results.json")
+    with open(top_n_json_path, "w", encoding="utf-8") as f:
+        json.dump(top_n_results, f, indent=2, ensure_ascii=False)
+    logging.info(f"Top N combination JSON saved to: {top_n_json_path}")
+    
+    # TSV 형식으로도 저장
+    top_n_tsv_path = os.path.join(repetition_dir, "top_n_combination_results.tsv")
+    with open(top_n_tsv_path, "w", encoding="utf-8") as f:
+        f.write("Num_Reps\tPercentile\tMetric_Based\tRecall@{}\tnDCG@{}\n".format(TOP_K, TOP_K))
+        for key, result in sorted(top_n_results.items(), key=lambda x: x[1]['num_repetitions']):
+            num_reps = result['num_repetitions']
+            pct = result['percentile']
+            f.write(f"{num_reps}\t{pct:.2f}\tRecall\t{result['recall_based']['recall']:.6f}\t{result['recall_based']['ndcg']:.6f}\n")
+            f.write(f"{num_reps}\t{pct:.2f}\tnDCG\t{result['ndcg_based']['recall']:.6f}\t{result['ndcg_based']['ndcg']:.6f}\n")
+    logging.info(f"Top N combination TSV saved to: {top_n_tsv_path}")
+    
+    # 리포트 업데이트 (정렬된 repetition 목록과 Percentile 조합 결과 추가)
+    with open(repetition_report_path, "a", encoding="utf-8") as f:
+        f.write("\n" + "=" * 100 + "\n")
+        f.write(f"{'REPETITION RANKING':^100}\n")
+        f.write("=" * 100 + "\n\n")
+        
+        f.write("Recall 기준 순위:\n")
+        f.write(f"{'Rank':<10} {'Repetition':<15} {'Recall@{k}':<15} {'nDCG@{k}':<15}\n".format(k=TOP_K))
+        f.write("-" * 100 + "\n")
+        for rank, (key, result) in enumerate(sorted_by_recall, 1):
+            f.write(f"{rank:<10} {result['rep_idx']:<15} {result['recall']:<15.6f} {result['ndcg']:<15.6f}\n")
+        
+        f.write("\nnDCG 기준 순위:\n")
+        f.write(f"{'Rank':<10} {'Repetition':<15} {'Recall@{k}':<15} {'nDCG@{k}':<15}\n".format(k=TOP_K))
+        f.write("-" * 100 + "\n")
+        for rank, (key, result) in enumerate(sorted_by_ndcg, 1):
+            f.write(f"{rank:<10} {result['rep_idx']:<15} {result['recall']:<15.6f} {result['ndcg']:<15.6f}\n")
+        
+        f.write("\n" + "=" * 100 + "\n")
+        f.write(f"{'TOP N COMBINATION RESULTS (20%, 40%, 60%, 80% of total)':^100}\n")
+        f.write("=" * 100 + "\n\n")
+        
+        f.write(f"{'Num_Reps':<12} {'Percentile':<12} {'Metric':<12} {'Recall@{k}':<15} {'nDCG@{k}':<15}\n".format(k=TOP_K))
+        f.write("-" * 100 + "\n")
+        for key, result in sorted(top_n_results.items(), key=lambda x: x[1]['num_repetitions']):
+            num_reps = result['num_repetitions']
+            pct = result['percentile']
+            f.write(f"{num_reps:<12} {pct:.2f}%{'':<7} {'Recall':<12} {result['recall_based']['recall']:<15.6f} {result['recall_based']['ndcg']:<15.6f}\n")
+            f.write(f"{'':<12} {pct:.2f}%{'':<7} {'nDCG':<12} {result['ndcg_based']['recall']:<15.6f} {result['ndcg_based']['ndcg']:<15.6f}\n")
+        
+        f.write("=" * 100 + "\n")
+    
+    logging.info(f"✅ [INFO] 모든 결과 저장 완료:")
+    logging.info(f"   - Repetition별 결과: {repetition_json_path}")
+    logging.info(f"   - Top N 조합 결과: {top_n_json_path}")
+    logging.info(f"   - Top N 조합 TSV: {top_n_tsv_path}")
+
