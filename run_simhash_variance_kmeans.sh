@@ -4,8 +4,8 @@
 filename=$1
 rerank=0
 
-for simhash in 7 8 9; do
-    REP=1
+for simhash in 4; do
+    REP=10
     echo "rep=${REP} | rerank=${rerank} | simhash=${simhash}"
     python3.10 ${filename} --simhash "${simhash}" --rep "${REP}" --rerank "${rerank}"
 done

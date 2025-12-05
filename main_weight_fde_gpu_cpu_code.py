@@ -29,16 +29,14 @@ from beir.retrieval.search.dense import DenseRetrievalExactSearch as DRES
 
 import argparse
 
-# FDE 구현 (GPU 버전 사용)
-from fde_generator_gpu_optimized import (
+# FDE 구현 (업로드된 파일 사용)
+from fde_generator_optimized_stream_simhash_check_muvera import (
     FixedDimensionalEncodingConfig,
-    EncodingType,
     ProjectionType,
     generate_query_fde,
-    #generate_document_fde_batch,
-    _simhash_matrix_from_seed_gpu,
-    _ams_projection_matrix_from_seed_gpu,
-    generate_document_fde_batch_gpu_wrapper
+    generate_document_fde_batch,
+    _simhash_matrix_from_seed,
+    _ams_projection_matrix_from_seed,
 )
 
 # ======================
@@ -47,7 +45,7 @@ from fde_generator_gpu_optimized import (
 DATASET_REPO_ID = "scidocs"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
 TOP_K = 10
-FILENAME = "main_weight_fde_gpu"
+FILENAME = "main_weight_fde_gpu_cpu_code"
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -587,7 +585,7 @@ class ColbertFdeRetriever:
             #start_total = time.perf_counter()
             # 배치별 임시 memmap 파일 생성
             batch_memmap_path = os.path.join(self._cache_dir, f"batch_{batch_start//ATOMIC_BATCH_SIZE}.mmap")
-            batch_fde = generate_document_fde_batch_gpu_wrapper(
+            batch_fde = generate_document_fde_batch_with_timing(
                 batch_embeddings,
                 self.doc_config,
                 memmap_path=batch_memmap_path,  # 배치별 memmap 사용
@@ -600,7 +598,7 @@ class ColbertFdeRetriever:
 
             # 배치별 타이밍 리포트 출력
             logging.info(f"[Atomic Batch] Batch {batch_start//ATOMIC_BATCH_SIZE + 1} FDE generation completed")
-            #print_timing_report(len(batch_embeddings), self.doc_config.num_repetitions, cumulative=False)
+            print_timing_report(len(batch_embeddings), self.doc_config.num_repetitions, cumulative=False)
             
             partition_counter = None  # 타이밍 버전은 partition_counter를 반환하지 않음
             
@@ -978,11 +976,19 @@ def print_timing_report(num_docs, num_reps, cumulative=False):
     
     # 작업별 시간 정렬
     operations = [
-        ('prep',              'Data preparation'),
-        ('simhash_kernel',    'SimHash kernel'),
-        ('scatter_add_kernel','Scatter-add kernel'),
-        ('avg_kernel',        'Average kernel'),
-        ('cpu_transfer',      'GPU→CPU transfer'),
+        ('matrix_gen', '행렬 생성'),
+        ('data_load', '데이터 로딩'),
+        ('simhash', 'SimHash 행렬곱'),
+        ('bits', '비트 변환'),
+        ('partition', '파티션 인덱스'),
+        ('projection', 'Projection'),
+        ('alloc', '메모리 할당'),
+        ('count', 'Count 집계'),
+        ('sum', '⭐ Sum 집계 (Scatter-add)'),
+        ('avg', '평균 계산'),
+        ('empty', '빈 파티션 채우기'),
+        ('write', '결과 쓰기'),
+        ('flush', 'Flush'),
     ]
 
     
