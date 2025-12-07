@@ -30,7 +30,7 @@ from beir.retrieval.search.dense import DenseRetrievalExactSearch as DRES
 import argparse
 
 # FDE 구현 (GPU 버전 사용)
-from fde_generator_gpu_optimized import (
+from fde_generator_gpu_optimized_triple_stream_with_mini_batch import (
     FixedDimensionalEncodingConfig,
     EncodingType,
     ProjectionType,
@@ -38,7 +38,7 @@ from fde_generator_gpu_optimized import (
     #generate_document_fde_batch,
     _simhash_matrix_from_seed_gpu,
     _ams_projection_matrix_from_seed_gpu,
-    generate_document_fde_batch_gpu_wrapper
+    generate_document_fde_batch_gpu_3stream_pipeline
 )
 
 # ======================
@@ -47,7 +47,7 @@ from fde_generator_gpu_optimized import (
 DATASET_REPO_ID = "scidocs"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
 TOP_K = 10
-FILENAME = "main_weight_fde_gpu"
+FILENAME = "main_weight_fde_gpu_triple_stream_with_mini_batch"
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -586,15 +586,14 @@ class ColbertFdeRetriever:
             #TIMING.clear()
 
             #start_total = time.perf_counter()
-            # 배치별 임시 memmap 파일 생성
-            batch_memmap_path = os.path.join(self._cache_dir, f"batch_{batch_start//ATOMIC_BATCH_SIZE}.mmap")
-            batch_fde = generate_document_fde_batch_gpu_wrapper(
+            # 3-stream pipeline 함수는 fde_memmap에 직접 쓰므로, fde_index를 전달
+            stats = generate_document_fde_batch_gpu_3stream_pipeline(
                 batch_embeddings,
                 self.doc_config,
-                memmap_path=batch_memmap_path,  # 배치별 memmap 사용
-                max_bytes_in_memory=512 * 1024**2,  # 512MB로 제한
-                log_every=ATOMIC_BATCH_SIZE,
-                flush_interval=ATOMIC_BATCH_SIZE,
+                fde_index,  # 최종 통합 memmap 전달
+                batch_start,  # memmap에서 시작할 인덱스
+                mini_batch_size=500,  # mini-batch 크기
+                log_every=1000,
             )
             #end_total = time.perf_counter()
             #TIMING['total'] = end_total - start_total
@@ -605,18 +604,33 @@ class ColbertFdeRetriever:
             
             partition_counter = None  # 타이밍 버전은 partition_counter를 반환하지 않음
             
-            # Step 4: FDE 인덱스에 통합 저장 (메모리 매핑에 직접 저장)
-            fde_index[batch_start:batch_end] = batch_fde
-            logging.info(f"[FDE Integration] Integrated batch {batch_start//ATOMIC_BATCH_SIZE + 1} into final memmap")
+            # Step 4: FDE 인덱스에 통합 저장은 이미 pipeline 함수 내부에서 완료됨
+            # fde_index[batch_start:batch_end]는 pipeline 함수 내부에서 처리됨
+            logging.info(f"[FDE Integration] Integrated batch {batch_start//ATOMIC_BATCH_SIZE + 1} into final memmap (written directly by pipeline)")
             
-            # Step 5: 배치별 flush (즉시 디스크 저장)
+            # Step 5: 3-stream pipeline 함수에서 반환한 flush 시간을 누적
+            # (함수 내부에서 이미 flush를 수행했으므로, 여기서는 시간만 누적)
+            if stats and 'flush_time' in stats:
+                pipeline_flush_time = stats['flush_time']
+                logging.info(f"[Atomic Batch] Pipeline flush time: {pipeline_flush_time:.3f} seconds")
+                
+                # Pipeline 함수 내부의 flush 시간을 전역 TIMING에 누적
+                if 'flush' not in TIMING:
+                    TIMING['flush'] = 0.0
+                TIMING['flush'] += pipeline_flush_time
+                if 'flush' not in CUMULATIVE_TIMING:
+                    CUMULATIVE_TIMING['flush'] = 0.0
+                CUMULATIVE_TIMING['flush'] += pipeline_flush_time
+            
+            # Step 6: 배치별 추가 flush (안전을 위해, 하지만 거의 시간이 걸리지 않음)
             flush_start = time.perf_counter()
             fde_index.flush()
             flush_end = time.perf_counter()
             flush_time = flush_end - flush_start
-            logging.info(f"[Atomic Batch] Flush time: {flush_time:.3f} seconds")
+            if flush_time > 0.001:  # 1ms 이상일 때만 로깅
+                logging.info(f"[Atomic Batch] Additional flush time: {flush_time:.3f} seconds")
             
-            # Flush 시간을 전역 TIMING에 누적
+            # 추가 flush 시간도 누적 (하지만 보통 매우 작음)
             if 'flush' not in TIMING:
                 TIMING['flush'] = 0.0
             TIMING['flush'] += flush_time
@@ -634,21 +648,11 @@ class ColbertFdeRetriever:
                             with open(simhash_count_path, "a", encoding="utf-8") as f:
                                 f.write(f"{global_doc_idx},{rep_num},{partition_idx},{count}\n")
             
-            # Step 7: 배치 완료 후 메모리 해제
+            # Step 8: 배치 완료 후 메모리 해제
             del batch_embeddings
-            if not (batch_memmap_path and os.path.exists(batch_memmap_path)):
-                del batch_fde  # memmap이 아닌 경우만 삭제
             if partition_counter is not None:
                 del partition_counter
             gc.collect()
-            
-            # Step 8: 임시 배치 memmap 파일 정리
-            if batch_memmap_path and os.path.exists(batch_memmap_path):
-                try:
-                    os.remove(batch_memmap_path)
-                    logging.info(f"[Atomic Batch] Cleaned up batch memmap: {batch_memmap_path}")
-                except Exception as e:
-                    logging.warning(f"[Atomic Batch] Failed to clean up {batch_memmap_path}: {e}")
             
             log_memory_usage(f"After atomic batch {batch_start//ATOMIC_BATCH_SIZE + 1}")
         
