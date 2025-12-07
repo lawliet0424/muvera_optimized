@@ -450,6 +450,7 @@ class ColbertFdeRetriever:
 
     # --------- Public API ---------
     def index(self, corpus: dict):
+        global TIMING, CUMULATIVE_TIMING
         self._corpus = corpus
 
         # # (사용자 설정대로 캐시 로드 스킵 가능)
@@ -497,7 +498,7 @@ class ColbertFdeRetriever:
         )
 
         # ---------- 배치 단위 처리: 인코딩 → FDE 생성 → 저장 ----------
-        ATOMIC_BATCH_SIZE = 3000  # 배치 크기 (메모리 매핑으로 안전하게 처리)
+        ATOMIC_BATCH_SIZE = 12000  # 배치 크기 (메모리 매핑으로 안전하게 처리)
         
         #[1017] simhash별 indice별 원소 개수 csv 파일 저장 필요------------------------------------
         simhash_count_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{self.num_repetitions}_simhash{self.num_simhash_projections}_rerank{self.rerank_candidates}")
@@ -609,7 +610,19 @@ class ColbertFdeRetriever:
             logging.info(f"[FDE Integration] Integrated batch {batch_start//ATOMIC_BATCH_SIZE + 1} into final memmap")
             
             # Step 5: 배치별 flush (즉시 디스크 저장)
+            flush_start = time.perf_counter()
             fde_index.flush()
+            flush_end = time.perf_counter()
+            flush_time = flush_end - flush_start
+            logging.info(f"[Atomic Batch] Flush time: {flush_time:.3f} seconds")
+            
+            # Flush 시간을 전역 TIMING에 누적
+            if 'flush' not in TIMING:
+                TIMING['flush'] = 0.0
+            TIMING['flush'] += flush_time
+            if 'flush' not in CUMULATIVE_TIMING:
+                CUMULATIVE_TIMING['flush'] = 0.0
+            CUMULATIVE_TIMING['flush'] += flush_time
             
             # Step 6: Simhash 통계 저장 (partition_counter가 있는 경우만)
             if partition_counter is not None:
@@ -640,8 +653,19 @@ class ColbertFdeRetriever:
             log_memory_usage(f"After atomic batch {batch_start//ATOMIC_BATCH_SIZE + 1}")
         
         # Step 8: 최종 통합 memmap 완성 및 저장
+        final_flush_start = time.perf_counter()
         fde_index.flush()
+        final_flush_time = time.perf_counter() - final_flush_start
         logging.info(f"[FDE Integration] Final integrated memmap completed: {fde_memmap_path}")
+        logging.info(f"[FDE Integration] Final flush time: {final_flush_time:.3f} seconds")
+        
+        # 최종 flush 시간도 전역 TIMING에 누적
+        if 'flush' not in TIMING:
+            TIMING['flush'] = 0.0
+        TIMING['flush'] += final_flush_time
+        if 'flush' not in CUMULATIVE_TIMING:
+            CUMULATIVE_TIMING['flush'] = 0.0
+        CUMULATIVE_TIMING['flush'] += final_flush_time
         logging.info(f"[FDE Integration] Final shape: {fde_index.shape}")
         
         # 최종 통합 memmap을 인스턴스에 할당
@@ -983,11 +1007,12 @@ def print_timing_report(num_docs, num_reps, cumulative=False):
         ('scatter_add_kernel','Scatter-add kernel'),
         ('avg_kernel',        'Average kernel'),
         ('cpu_transfer',      'GPU→CPU transfer'),
+        ('flush',             'Flush'),
     ]
 
     
     items_sorted = sorted([(key, name) for key, name in operations], 
-                         key=lambda x: TIMING.get(x[0], 0), reverse=True)
+                         key=lambda x: timing_dict.get(x[0], 0), reverse=True)
     
     for key, name in items_sorted:
         t = timing_dict.get(key, 0)
@@ -1084,9 +1109,14 @@ if __name__ == "__main__":
     retriever.index(corpus)
     total_indexing_time = time.perf_counter() - start_time
 
+    # Get cumulative flush time
+    total_flush_time = CUMULATIVE_TIMING.get('flush', 0.0) if CUMULATIVE_TIMING else 0.0
+    
     logging.info("=" * 100)
     logging.info(f"✅ FDE Index Building Completed!")
     logging.info(f"Total indexing time: {total_indexing_time:.2f} seconds")
+    if total_flush_time > 0.0:
+        logging.info(f"Total flush time (cumulative): {total_flush_time:.2f} seconds ({total_flush_time/total_indexing_time*100:.1f}%)")
     logging.info(f"Average time per document: {total_indexing_time / len(corpus) * 1000:.3f} ms")
     logging.info("=" * 100)
     

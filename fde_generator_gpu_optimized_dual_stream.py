@@ -363,6 +363,26 @@ def _generate_fde_internal(
 # DUAL-STREAM GPU FDE GENERATION (NEW!)
 # ==============================================================================
 
+# Global variables for cumulative timing across all batches
+_GPU_CUMULATIVE_TIMING = {
+    'prep_time': 0.0,
+    'simhash_time': 0.0,
+    'scatter_time': 0.0,
+    'average_time': 0.0,
+    'transfer_time': 0.0,
+}
+
+def reset_gpu_cumulative_timing():
+    """Reset cumulative timing for GPU operations"""
+    global _GPU_CUMULATIVE_TIMING
+    _GPU_CUMULATIVE_TIMING = {
+        'prep_time': 0.0,
+        'simhash_time': 0.0,
+        'scatter_time': 0.0,
+        'average_time': 0.0,
+        'transfer_time': 0.0,
+    }
+
 def generate_document_fde_batch_gpu_streaming(
     doc_embeddings_list: List[np.ndarray],
     config: FixedDimensionalEncodingConfig,
@@ -593,6 +613,76 @@ def generate_document_fde_batch_gpu_streaming(
     # ==========================================
     total_time = time.perf_counter() - start_time
     
+    # Calculate total measured time for this batch
+    total_measured_time = prep_time + total_simhash_time + total_scatter_time + total_average_time + total_transfer_time
+    
+    # Accumulate this batch's times to global cumulative timing
+    global _GPU_CUMULATIVE_TIMING
+    _GPU_CUMULATIVE_TIMING['prep_time'] += prep_time
+    _GPU_CUMULATIVE_TIMING['simhash_time'] += total_simhash_time
+    _GPU_CUMULATIVE_TIMING['scatter_time'] += total_scatter_time
+    _GPU_CUMULATIVE_TIMING['average_time'] += total_average_time
+    _GPU_CUMULATIVE_TIMING['transfer_time'] += total_transfer_time
+    
+    # Get cumulative times (across all batches)
+    cumul_prep = _GPU_CUMULATIVE_TIMING['prep_time']
+    cumul_simhash = _GPU_CUMULATIVE_TIMING['simhash_time']
+    cumul_scatter = _GPU_CUMULATIVE_TIMING['scatter_time']
+    cumul_average = _GPU_CUMULATIVE_TIMING['average_time']
+    cumul_transfer = _GPU_CUMULATIVE_TIMING['transfer_time']
+    
+    # Try to get flush time from global CUMULATIVE_TIMING if available (from index method)
+    # Use sys.modules to avoid circular import
+    flush_time = 0.0
+    try:
+        import sys
+        # Try multiple possible module names
+        module_names = [
+            'main_weight_fde_gpu_dual_stream',
+            '__main__',
+        ]
+        
+        main_module = None
+        for mod_name in module_names:
+            if mod_name in sys.modules:
+                main_module = sys.modules[mod_name]
+                # Check if this module has CUMULATIVE_TIMING (it's the right module)
+                if hasattr(main_module, 'CUMULATIVE_TIMING'):
+                    break
+                main_module = None
+        
+        if main_module is None:
+            # Fallback: search all loaded modules
+            for mod_name, mod in sys.modules.items():
+                if hasattr(mod, 'CUMULATIVE_TIMING') and hasattr(mod, 'TIMING'):
+                    main_module = mod
+                    logging.info(f"[DEBUG] Found module with CUMULATIVE_TIMING: {mod_name}")
+                    break
+        
+        if main_module is not None:
+            # Check CUMULATIVE_TIMING first (accumulated across all batches)
+            if hasattr(main_module, 'CUMULATIVE_TIMING'):
+                flush_time = main_module.CUMULATIVE_TIMING.get('flush', 0.0)
+                logging.info(f"[DEBUG] Retrieved flush time from CUMULATIVE_TIMING: {flush_time:.3f}s")
+            # Fallback to TIMING if CUMULATIVE_TIMING doesn't have it
+            if flush_time == 0.0 and hasattr(main_module, 'TIMING'):
+                flush_time = main_module.TIMING.get('flush', 0.0)
+                if flush_time > 0.0:
+                    logging.info(f"[DEBUG] Retrieved flush time from TIMING: {flush_time:.3f}s")
+        else:
+            logging.warning("[DEBUG] Could not find module with CUMULATIVE_TIMING in sys.modules")
+            # List available modules for debugging
+            available_modules = [name for name in sys.modules.keys() if 'main_weight' in name or 'fde' in name.lower()]
+            logging.warning(f"[DEBUG] Available modules with 'main_weight' or 'fde': {available_modules}")
+    except (AttributeError, KeyError, Exception) as e:
+        logging.warning(f"[DEBUG] Could not get flush time: {e}")
+        import traceback
+        logging.debug(traceback.format_exc())
+        pass
+    
+    # Calculate total cumulative time (across all batches)
+    total_measured_with_flush = cumul_prep + cumul_simhash + cumul_scatter + cumul_average + cumul_transfer + flush_time
+    
     logging.info("=" * 80)
     logging.info("🚀 GPU FDE Performance Summary (Single Batch)")
     logging.info("=" * 80)
@@ -601,7 +691,19 @@ def generate_document_fde_batch_gpu_streaming(
     logging.info(f"Scatter-add kernel:  {total_scatter_time:8.3f}s  ({total_scatter_time/total_time*100:5.1f}%)")
     logging.info(f"Average kernel:      {total_average_time:8.3f}s  ({total_average_time/total_time*100:5.1f}%)")
     logging.info(f"CPU transfer:        {total_transfer_time:8.3f}s  ({total_transfer_time/total_time*100:5.1f}%)")
+    logging.info(f"Flush:               {flush_time:8.3f}s  ({flush_time/total_time*100:5.1f}%)" if flush_time > 0.0 else f"Flush:               {flush_time:8.3f}s  (  0.0%)")
     logging.info(f"Total time:          {total_time:8.3f}s")
+    logging.info("=" * 80)
+    logging.info("📊 Cumulative Time Breakdown (All Operations - Across All Batches):")
+    logging.info("-" * 80)
+    logging.info(f"   Data preparation (cumulative):    {cumul_prep:8.3f}s")
+    logging.info(f"   SimHash kernel (cumulative):      {cumul_simhash:8.3f}s")
+    logging.info(f"   Scatter-add kernel (cumulative): {cumul_scatter:8.3f}s")
+    logging.info(f"   Average kernel (cumulative):     {cumul_average:8.3f}s")
+    logging.info(f"   CPU transfer (cumulative):       {cumul_transfer:8.3f}s")
+    logging.info(f"   Flush (cumulative):              {flush_time:8.3f}s")
+    logging.info("-" * 80)
+    logging.info(f"   Total cumulative time:            {total_measured_with_flush:8.3f}s")
     logging.info("=" * 80)
     
     # Cleanup

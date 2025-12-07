@@ -363,6 +363,34 @@ def _generate_fde_internal(
 # DUAL-STREAM GPU FDE GENERATION (NEW!)
 # ==============================================================================
 
+# Global variables for cumulative timing across all batches
+_GPU_CUMULATIVE_TIMING = {
+    'prep_time': 0.0,
+    'simhash_time': 0.0,
+    'scatter_time': 0.0,
+    'average_time': 0.0,
+    'pure_transfer_time': 0.0,
+    'reshape_write_time': 0.0,
+    'batch_memmap_flush_time': 0.0,  # Batch temporary memmap flush (out_fdes.flush())
+    'transfer_time': 0.0,  # Total: pure_transfer + reshape_write + batch_memmap_flush (for overlap calculation)
+    'overlap_benefit': 0.0
+}
+
+def reset_gpu_cumulative_timing():
+    """Reset cumulative timing for GPU operations"""
+    global _GPU_CUMULATIVE_TIMING
+    _GPU_CUMULATIVE_TIMING = {
+        'prep_time': 0.0,
+        'simhash_time': 0.0,
+        'scatter_time': 0.0,
+        'average_time': 0.0,
+        'pure_transfer_time': 0.0,
+        'reshape_write_time': 0.0,
+        'batch_memmap_flush_time': 0.0,
+        'transfer_time': 0.0,
+        'overlap_benefit': 0.0
+    }
+
 def generate_document_fde_batch_gpu_streaming(
     doc_embeddings_list: List[np.ndarray],
     config: FixedDimensionalEncodingConfig,
@@ -461,11 +489,15 @@ def generate_document_fde_batch_gpu_streaming(
     num_mini_batches = (num_docs + mini_batch_size - 1) // mini_batch_size
     logging.info(f"[FDE GPU Streaming] Split into {num_mini_batches} mini-batches")
     
+    # Local timing for this batch (mini-batches within this function call)
     total_compute_time = 0.0
     total_transfer_time = 0.0
+    total_pure_transfer_time = 0.0
+    total_reshape_write_time = 0.0
+    total_batch_memmap_flush_time = 0.0
     overlap_benefit = 0.0
     
-    # Detailed kernel timing
+    # Detailed kernel timing for this batch
     total_simhash_time = 0.0
     total_scatter_time = 0.0
     total_average_time = 0.0
@@ -601,21 +633,41 @@ def generate_document_fde_batch_gpu_streaming(
         # Transfer PREVIOUS batch results to CPU (if exists) on transfer stream
         if prev_results is not None:
             with stream_transfer:
+                # Pure GPU→CPU transfer time
                 prev_partition_sums_cpu = cp.asnumpy(prev_results)
-                
-                # Write to output
-                for doc_idx in range(prev_partition_sums_cpu.shape[0]):
-                    global_doc_idx = prev_batch_start + doc_idx
-                    for rep_idx in range(config.num_repetitions):
-                        rep_offset = rep_idx * final_fde_dim_per_rep
-                        fde_chunk = prev_partition_sums_cpu[doc_idx, rep_idx].reshape(-1)
-                        out_fdes[global_doc_idx, rep_offset:rep_offset + final_fde_dim_per_rep] = fde_chunk
-                
-                if memmap_used:
-                    out_fdes.flush()
-        
-        stream_transfer.synchronize()
-        transfer_time = time.perf_counter() - transfer_start
+            
+            stream_transfer.synchronize()
+            pure_transfer_time = time.perf_counter() - transfer_start
+            
+            # Reshape and write time (CPU operations)
+            reshape_write_start = time.perf_counter()
+            for doc_idx in range(prev_partition_sums_cpu.shape[0]):
+                global_doc_idx = prev_batch_start + doc_idx
+                for rep_idx in range(config.num_repetitions):
+                    rep_offset = rep_idx * final_fde_dim_per_rep
+                    fde_chunk = prev_partition_sums_cpu[doc_idx, rep_idx].reshape(-1)
+                    out_fdes[global_doc_idx, rep_offset:rep_offset + final_fde_dim_per_rep] = fde_chunk
+            
+            reshape_write_time = time.perf_counter() - reshape_write_start
+            
+            # Batch memmap flush time (temporary batch memmap file)
+            batch_flush_start = time.perf_counter()
+            if memmap_used:
+                out_fdes.flush()
+            batch_flush_time = time.perf_counter() - batch_flush_start
+            
+            # Total transfer time (for overlap calculation)
+            transfer_time = pure_transfer_time + reshape_write_time + batch_flush_time
+            
+            # Accumulate separate timings
+            total_pure_transfer_time += pure_transfer_time
+            total_reshape_write_time += reshape_write_time
+            total_batch_memmap_flush_time += batch_flush_time
+        else:
+            pure_transfer_time = 0.0
+            reshape_write_time = 0.0
+            flush_time_batch = 0.0
+            transfer_time = 0.0
         
         # Calculate overlap benefit
         if prev_results is not None:
@@ -635,25 +687,124 @@ def generate_document_fde_batch_gpu_streaming(
     # Process LAST batch (no overlap for final)
     # ========================================
     if prev_results is not None:
+        # Pure GPU→CPU transfer time
         final_transfer_start = time.perf_counter()
         prev_partition_sums_cpu = cp.asnumpy(prev_results)
+        final_pure_transfer_time = time.perf_counter() - final_transfer_start
         
+        # Reshape and write time
+        final_reshape_write_start = time.perf_counter()
         for doc_idx in range(prev_partition_sums_cpu.shape[0]):
             global_doc_idx = prev_batch_start + doc_idx
             for rep_idx in range(config.num_repetitions):
                 rep_offset = rep_idx * final_fde_dim_per_rep
                 fde_chunk = prev_partition_sums_cpu[doc_idx, rep_idx].reshape(-1)
                 out_fdes[global_doc_idx, rep_offset:rep_offset + final_fde_dim_per_rep] = fde_chunk
+        final_reshape_write_time = time.perf_counter() - final_reshape_write_start
         
+        # Final batch memmap flush time (temporary batch memmap file)
+        final_batch_flush_start = time.perf_counter()
         if memmap_used:
             out_fdes.flush()
+        final_batch_flush_time = time.perf_counter() - final_batch_flush_start
         
-        total_transfer_time += time.perf_counter() - final_transfer_start
+        # Total transfer time
+        final_transfer_time = final_pure_transfer_time + final_reshape_write_time + final_batch_flush_time
+        total_transfer_time += final_transfer_time
+        total_pure_transfer_time += final_pure_transfer_time
+        total_reshape_write_time += final_reshape_write_time
+        total_batch_memmap_flush_time += final_batch_flush_time
     
     # ==========================================
     # Performance Summary (Detailed Breakdown)
     # ==========================================
     total_time = time.perf_counter() - start_time
+    
+    # Calculate total measured time for this batch
+    total_measured_time = prep_time + total_simhash_time + total_scatter_time + total_average_time + total_transfer_time
+    
+    # Accumulate this batch's times to global cumulative timing
+    global _GPU_CUMULATIVE_TIMING
+    _GPU_CUMULATIVE_TIMING['prep_time'] += prep_time
+    _GPU_CUMULATIVE_TIMING['simhash_time'] += total_simhash_time
+    _GPU_CUMULATIVE_TIMING['scatter_time'] += total_scatter_time
+    _GPU_CUMULATIVE_TIMING['average_time'] += total_average_time
+    _GPU_CUMULATIVE_TIMING['pure_transfer_time'] += total_pure_transfer_time
+    _GPU_CUMULATIVE_TIMING['reshape_write_time'] += total_reshape_write_time
+    _GPU_CUMULATIVE_TIMING['batch_memmap_flush_time'] += total_batch_memmap_flush_time
+    _GPU_CUMULATIVE_TIMING['transfer_time'] += total_transfer_time
+    _GPU_CUMULATIVE_TIMING['overlap_benefit'] += overlap_benefit
+    
+    # Get cumulative times (across all batches)
+    cumul_prep = _GPU_CUMULATIVE_TIMING['prep_time']
+    cumul_simhash = _GPU_CUMULATIVE_TIMING['simhash_time']
+    cumul_scatter = _GPU_CUMULATIVE_TIMING['scatter_time']
+    cumul_average = _GPU_CUMULATIVE_TIMING['average_time']
+    cumul_pure_transfer = _GPU_CUMULATIVE_TIMING['pure_transfer_time']
+    cumul_reshape_write = _GPU_CUMULATIVE_TIMING['reshape_write_time']
+    cumul_batch_memmap_flush = _GPU_CUMULATIVE_TIMING['batch_memmap_flush_time']
+    cumul_transfer = _GPU_CUMULATIVE_TIMING['transfer_time']
+    cumul_overlap = _GPU_CUMULATIVE_TIMING['overlap_benefit']
+    
+    # Try to get flush time from global CUMULATIVE_TIMING if available (from index method)
+    # Use sys.modules to avoid circular import
+    flush_time = 0.0
+    try:
+        import sys
+        # Try multiple possible module names
+        module_names = [
+            'main_weight_fde_gpu_dual_stream_with_mini_batch',
+            '__main__',
+        ]
+        
+        main_module = None
+        for mod_name in module_names:
+            if mod_name in sys.modules:
+                main_module = sys.modules[mod_name]
+                # Check if this module has CUMULATIVE_TIMING (it's the right module)
+                if hasattr(main_module, 'CUMULATIVE_TIMING'):
+                    break
+                main_module = None
+        
+        if main_module is None:
+            # Fallback: search all loaded modules
+            for mod_name, mod in sys.modules.items():
+                if hasattr(mod, 'CUMULATIVE_TIMING') and hasattr(mod, 'TIMING'):
+                    main_module = mod
+                    logging.info(f"[DEBUG] Found module with CUMULATIVE_TIMING: {mod_name}")
+                    break
+        
+        if main_module is not None:
+            # Check CUMULATIVE_TIMING first (accumulated across all batches)
+            # This is the final integrated memmap flush time (from main_weight_fde_gpu_dual_stream_with_mini_batch.py)
+            # This is different from batch_memmap_flush_time which is for temporary batch memmap files
+            if hasattr(main_module, 'CUMULATIVE_TIMING'):
+                final_memmap_flush_time = main_module.CUMULATIVE_TIMING.get('flush', 0.0)
+                logging.info(f"[DEBUG] Retrieved final integrated memmap flush time from CUMULATIVE_TIMING: {final_memmap_flush_time:.3f}s")
+            # Fallback to TIMING if CUMULATIVE_TIMING doesn't have it
+            if 'final_memmap_flush_time' not in locals() or final_memmap_flush_time == 0.0:
+                if hasattr(main_module, 'TIMING'):
+                    final_memmap_flush_time = main_module.TIMING.get('flush', 0.0)
+                    if final_memmap_flush_time > 0.0:
+                        logging.info(f"[DEBUG] Retrieved final integrated memmap flush time from TIMING: {final_memmap_flush_time:.3f}s")
+                else:
+                    final_memmap_flush_time = 0.0
+        else:
+            final_memmap_flush_time = 0.0
+            logging.warning("[DEBUG] Could not find module with CUMULATIVE_TIMING in sys.modules")
+            # List available modules for debugging
+            available_modules = [name for name in sys.modules.keys() if 'main_weight' in name or 'fde' in name.lower()]
+            logging.warning(f"[DEBUG] Available modules with 'main_weight' or 'fde': {available_modules}")
+    except (AttributeError, KeyError, Exception) as e:
+        logging.warning(f"[DEBUG] Could not get flush time: {e}")
+        import traceback
+        logging.debug(traceback.format_exc())
+        pass
+    
+    # Calculate total cumulative time (across all batches)
+    # Note: final_memmap_flush_time is from main_weight_fde_gpu_dual_stream_with_mini_batch.py (final integrated memmap)
+    #       cumul_batch_memmap_flush is from this file (temporary batch memmap files)
+    total_measured_with_flush = cumul_prep + cumul_simhash + cumul_scatter + cumul_average + cumul_transfer + final_memmap_flush_time
     
     logging.info("=" * 80)
     logging.info("🚀 DUAL-STREAM GPU FDE Performance Summary")
@@ -662,11 +813,30 @@ def generate_document_fde_batch_gpu_streaming(
     logging.info(f"SimHash kernel:      {total_simhash_time:8.3f}s  ({total_simhash_time/total_time*100:5.1f}%)")
     logging.info(f"Scatter-add kernel:  {total_scatter_time:8.3f}s  ({total_scatter_time/total_time*100:5.1f}%)")
     logging.info(f"Average kernel:      {total_average_time:8.3f}s  ({total_average_time/total_time*100:5.1f}%)")
-    logging.info(f"CPU transfer:        {total_transfer_time:8.3f}s  ({total_transfer_time/total_time*100:5.1f}%)")
+    logging.info(f"GPU→CPU transfer:    {total_pure_transfer_time:8.3f}s  ({total_pure_transfer_time/total_time*100:5.1f}%)")
+    logging.info(f"Reshape + Write:     {total_reshape_write_time:8.3f}s  ({total_reshape_write_time/total_time*100:5.1f}%)")
+    logging.info(f"Batch memmap flush:  {total_batch_memmap_flush_time:8.3f}s  ({total_batch_memmap_flush_time/total_time*100:5.1f}%)")
+    logging.info(f"CPU transfer (total): {total_transfer_time:8.3f}s  ({total_transfer_time/total_time*100:5.1f}%)")
+    logging.info(f"Final memmap flush:  {final_memmap_flush_time:8.3f}s  ({final_memmap_flush_time/total_time*100:5.1f}%)" if final_memmap_flush_time > 0.0 else f"Final memmap flush:  {final_memmap_flush_time:8.3f}s  (  0.0%)")
     logging.info(f"Total time:          {total_time:8.3f}s")
     logging.info("=" * 80)
     logging.info(f"💡 Overlap benefit:  {overlap_benefit:8.3f}s saved by dual-stream parallelism")
-    logging.info(f"💡 Speedup vs sequential: {(prep_time + total_simhash_time + total_scatter_time + total_average_time + total_transfer_time) / total_time:.2f}x")
+    logging.info(f"💡 Speedup vs sequential: {total_measured_time / total_time:.2f}x")
+    logging.info("=" * 80)
+    logging.info("📊 Cumulative Time Breakdown (All Operations - Across All Batches):")
+    logging.info("-" * 80)
+    logging.info(f"   Data preparation (cumulative):    {cumul_prep:8.3f}s")
+    logging.info(f"   SimHash kernel (cumulative):      {cumul_simhash:8.3f}s")
+    logging.info(f"   Scatter-add kernel (cumulative): {cumul_scatter:8.3f}s")
+    logging.info(f"   Average kernel (cumulative):     {cumul_average:8.3f}s")
+    logging.info(f"   GPU→CPU transfer (cumulative):  {cumul_pure_transfer:8.3f}s")
+    logging.info(f"   Reshape + Write (cumulative):   {cumul_reshape_write:8.3f}s")
+    logging.info(f"   Batch memmap flush (cumulative): {cumul_batch_memmap_flush:8.3f}s")
+    logging.info(f"   CPU transfer (cumulative, total): {cumul_transfer:8.3f}s")
+    logging.info(f"   Final memmap flush (cumulative):   {final_memmap_flush_time:8.3f}s")
+    logging.info("-" * 80)
+    logging.info(f"   Total cumulative time:            {total_measured_with_flush:8.3f}s")
+    logging.info(f"   Overlap benefit (cumulative):     {cumul_overlap:8.3f}s")
     logging.info("=" * 80)
     
     # Cleanup
@@ -707,7 +877,7 @@ def generate_document_fde_batch_gpu_wrapper(
             bytes_per_doc = avg_len * config.dimension * config.num_repetitions * 8
             
             optimal_batch_size = int((free_mem * 0.3) / bytes_per_doc)
-            optimal_batch_size = max(100, min(optimal_batch_size, 4000))  # Clamp to 100-1000
+            optimal_batch_size = max(100, min(optimal_batch_size, 1000))  # Clamp to 100-1000
             
             logging.info(f"[GPU Wrapper] Auto-tuned mini-batch size: {optimal_batch_size}")
             
