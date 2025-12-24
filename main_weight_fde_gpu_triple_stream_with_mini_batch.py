@@ -498,7 +498,7 @@ class ColbertFdeRetriever:
         )
 
         # ---------- 배치 단위 처리: 인코딩 → FDE 생성 → 저장 ----------
-        ATOMIC_BATCH_SIZE = 12000  # 배치 크기 (메모리 매핑으로 안전하게 처리)
+        ATOMIC_BATCH_SIZE = 3000  # 배치 크기 (메모리 매핑으로 안전하게 처리)
         
         #[1017] simhash별 indice별 원소 개수 csv 파일 저장 필요------------------------------------
         simhash_count_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{self.num_repetitions}_simhash{self.num_simhash_projections}_rerank{self.rerank_candidates}")

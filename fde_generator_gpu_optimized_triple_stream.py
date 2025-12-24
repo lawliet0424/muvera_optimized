@@ -19,12 +19,178 @@ from queue import Queue
 from dataclasses import dataclass, replace
 from enum import Enum
 
-# Import CUDA kernels from your dual-stream version
-from fde_generator_gpu_optimized_dual_stream_with_mini_batch import (
-    SIMHASH_KERNEL,
-    SCATTER_ADD_KERNEL,
-    AVERAGE_KERNEL,
-)
+# ==============================================================================
+# CUDA KERNELS (Same as before)
+# ==============================================================================
+
+# Kernel 1: SimHash projection and partition assignment
+SIMHASH_KERNEL = cp.RawKernel(r'''
+extern "C" __global__
+void simhash_projection_multi_rep(
+    const float* __restrict__ embeddings,
+    const int* __restrict__ doc_lengths,
+    const float* __restrict__ simhash_matrices,
+    const float* __restrict__ ams_matrices,
+    float* __restrict__ sketches_out,
+    float* __restrict__ projected_out,
+    int* __restrict__ partition_indices,
+    const int num_docs,
+    const int max_len,
+    const int dim,
+    const int num_bits,
+    const int proj_dim,
+    const int num_reps,
+    const int use_identity
+) {
+    int global_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_tokens = num_docs * num_reps * max_len;
+    
+    if (global_id >= total_tokens) return;
+    
+    int token_idx = global_id % max_len;
+    int temp = global_id / max_len;
+    int rep_idx = temp % num_reps;
+    int doc_idx = temp / num_reps;
+    
+    if (token_idx >= doc_lengths[doc_idx]) return;
+    
+    const float* emb = &embeddings[(doc_idx * max_len + token_idx) * dim];
+    const float* simhash_mat = &simhash_matrices[rep_idx * dim * num_bits];
+    
+    float sketches[32];
+    for (int b = 0; b < num_bits; b++) {
+        float val = 0.0f;
+        for (int d = 0; d < dim; d++) {
+            val += emb[d] * simhash_mat[d * num_bits + b];
+        }
+        sketches[b] = val;
+    }
+    
+    int sketch_offset = ((doc_idx * num_reps + rep_idx) * max_len + token_idx) * num_bits;
+    for (int b = 0; b < num_bits; b++) {
+        sketches_out[sketch_offset + b] = sketches[b];
+    }
+    
+    unsigned int p_idx = 0;
+    for (int b = 0; b < num_bits; b++) {
+        unsigned int bit = (sketches[b] > 0.0f) ? 1 : 0;
+        p_idx = (p_idx << 1) + (bit ^ (p_idx & 1));
+    }
+    partition_indices[(doc_idx * num_reps + rep_idx) * max_len + token_idx] = p_idx;
+    
+    int proj_offset = ((doc_idx * num_reps + rep_idx) * max_len + token_idx) * proj_dim;
+    
+    if (use_identity) {
+        for (int d = 0; d < proj_dim; d++) {
+            projected_out[proj_offset + d] = emb[d];
+        }
+    } else {
+        const float* ams_mat = &ams_matrices[rep_idx * dim * proj_dim];
+        for (int p = 0; p < proj_dim; p++) {
+            float val = 0.0f;
+            for (int d = 0; d < dim; d++) {
+                val += emb[d] * ams_mat[d * proj_dim + p];
+            }
+            projected_out[proj_offset + p] = val;
+        }
+    }
+}
+''', 'simhash_projection_multi_rep')
+
+
+# Kernel 2: Scatter-add with shared memory
+SCATTER_ADD_KERNEL = cp.RawKernel(r'''
+extern "C" __global__
+void scatter_add_partitions(
+    const float* __restrict__ projected,
+    const int* __restrict__ partition_indices,
+    const int* __restrict__ doc_lengths,
+    float* __restrict__ partition_sums,
+    int* __restrict__ partition_counts,
+    const int num_docs,
+    const int num_reps,
+    const int max_len,
+    const int proj_dim,
+    const int num_partitions
+) {
+    extern __shared__ float shared_mem[];
+    float* shared_sums = shared_mem;
+    int* shared_counts = (int*)&shared_sums[num_partitions * proj_dim];
+    
+    int doc_idx = blockIdx.x;
+    int rep_idx = blockIdx.y;
+    
+    if (doc_idx >= num_docs || rep_idx >= num_reps) return;
+    
+    int doc_len = doc_lengths[doc_idx];
+    
+    for (int i = threadIdx.x; i < num_partitions * proj_dim; i += blockDim.x) {
+        shared_sums[i] = 0.0f;
+    }
+    for (int i = threadIdx.x; i < num_partitions; i += blockDim.x) {
+        shared_counts[i] = 0;
+    }
+    __syncthreads();
+    
+    for (int token_idx = threadIdx.x; token_idx < doc_len; token_idx += blockDim.x) {
+        int p_idx = partition_indices[(doc_idx * num_reps + rep_idx) * max_len + token_idx];
+        int proj_offset = ((doc_idx * num_reps + rep_idx) * max_len + token_idx) * proj_dim;
+        
+        atomicAdd(&shared_counts[p_idx], 1);
+        
+        for (int d = 0; d < proj_dim; d++) {
+            atomicAdd(&shared_sums[p_idx * proj_dim + d], projected[proj_offset + d]);
+        }
+    }
+    __syncthreads();
+    
+    int out_offset = (doc_idx * num_reps + rep_idx) * num_partitions;
+    for (int p = threadIdx.x; p < num_partitions; p += blockDim.x) {
+        partition_counts[out_offset + p] = shared_counts[p];
+        
+        int sum_offset = out_offset * proj_dim + p * proj_dim;
+        for (int d = 0; d < proj_dim; d++) {
+            partition_sums[sum_offset + d] = shared_sums[p * proj_dim + d];
+        }
+    }
+}
+''', 'scatter_add_partitions')
+
+
+# Kernel 3: Average computation
+AVERAGE_KERNEL = cp.RawKernel(r'''
+extern "C" __global__
+void compute_averages(
+    float* __restrict__ partition_sums,
+    const int* __restrict__ partition_counts,
+    const int num_docs,
+    const int num_reps,
+    const int num_partitions,
+    const int proj_dim
+) {
+    int global_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_partitions = num_docs * num_reps * num_partitions;
+    
+    if (global_id >= total_partitions) return;
+    
+    int p_idx = global_id % num_partitions;
+    int temp = global_id / num_partitions;
+    int rep_idx = temp % num_reps;
+    int doc_idx = temp / num_reps;
+    
+    int count_offset = (doc_idx * num_reps + rep_idx) * num_partitions + p_idx;
+    int count = partition_counts[count_offset];
+    
+    if (count > 0) {
+        int sum_offset = count_offset * proj_dim;
+        float inv_count = 1.0f / (float)count;
+        
+        for (int d = 0; d < proj_dim; d++) {
+            partition_sums[sum_offset + d] *= inv_count;
+        }
+    }
+}
+''', 'compute_averages')
 
 class EncodingType(Enum):
     DEFAULT_SUM = 0
@@ -200,6 +366,9 @@ def _generate_fde_internal(
 _GPU_CUMULATIVE_TIMING = {
     'prep_time': 0.0,
     'upload_time': 0.0,
+    'simhash_time': 0.0,
+    'scatter_time': 0.0,
+    'average_time': 0.0,
     'compute_time': 0.0,
     'download_time': 0.0,
     'reshape_time': 0.0,
@@ -212,6 +381,9 @@ def reset_gpu_cumulative_timing():
     _GPU_CUMULATIVE_TIMING = {
         'prep_time': 0.0,
         'upload_time': 0.0,
+        'simhash_time': 0.0,
+        'scatter_time': 0.0,
+        'average_time': 0.0,
         'compute_time': 0.0,
         'download_time': 0.0,
         'reshape_time': 0.0,
@@ -303,6 +475,9 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     
     # Timing accumulators
     upload_time = 0.0
+    simhash_time = 0.0
+    scatter_time = 0.0
+    average_time = 0.0
     compute_time = 0.0
     download_time = 0.0
     reshape_time = 0.0
@@ -339,6 +514,8 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     
     with stream_compute:
         # Kernel 1: SimHash
+        simhash_start = time.perf_counter()
+        
         total_tokens = num_docs * config.num_repetitions * max_len
         threads_per_block = 256
         num_blocks = (total_tokens + threads_per_block - 1) // threads_per_block
@@ -352,8 +529,12 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
              projection_dim, config.num_repetitions,
              1 if use_identity_proj else 0)
         )
+        stream_compute.synchronize()
+        simhash_time = time.perf_counter() - simhash_start
         
         # Kernel 2: Scatter-add
+        scatter_start = time.perf_counter()
+        
         shared_mem_size = (num_partitions * projection_dim * 4) + (num_partitions * 4)
         grid_dim = (num_docs, config.num_repetitions)
         
@@ -363,8 +544,12 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
              num_docs, config.num_repetitions, max_len, projection_dim, num_partitions),
             shared_mem=shared_mem_size
         )
+        stream_compute.synchronize()
+        scatter_time = time.perf_counter() - scatter_start
         
         # Kernel 3: Average
+        average_start = time.perf_counter()
+        
         total_partitions = num_docs * config.num_repetitions * num_partitions
         num_blocks = (total_partitions + threads_per_block - 1) // threads_per_block
         
@@ -373,9 +558,10 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
             (partition_sums_gpu, partition_counts_gpu, num_docs, config.num_repetitions,
              num_partitions, projection_dim)
         )
+        stream_compute.synchronize()
+        average_time = time.perf_counter() - average_start
     
-    stream_compute.synchronize()
-    compute_time = time.perf_counter() - compute_start
+    compute_time = simhash_time + scatter_time + average_time
     
     # ========================================
     # STEP 4: Download to CPU (Stream 3)
@@ -423,6 +609,9 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     global _GPU_CUMULATIVE_TIMING
     _GPU_CUMULATIVE_TIMING['prep_time'] += prep_time
     _GPU_CUMULATIVE_TIMING['upload_time'] += upload_time
+    _GPU_CUMULATIVE_TIMING['simhash_time'] += simhash_time
+    _GPU_CUMULATIVE_TIMING['scatter_time'] += scatter_time
+    _GPU_CUMULATIVE_TIMING['average_time'] += average_time
     _GPU_CUMULATIVE_TIMING['compute_time'] += compute_time
     _GPU_CUMULATIVE_TIMING['download_time'] += download_time
     _GPU_CUMULATIVE_TIMING['reshape_time'] += reshape_time
@@ -471,6 +660,9 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     logging.info("=" * 80)
     logging.info(f"Data preparation:    {prep_time:8.3f}s  ({prep_time/total_time*100:5.1f}%)")
     logging.info(f"Upload time:         {upload_time:8.3f}s  ({upload_time/total_time*100:5.1f}%)")
+    logging.info(f"SimHash kernel:      {simhash_time:8.3f}s  ({simhash_time/total_time*100:5.1f}%)")
+    logging.info(f"Scatter-add kernel:  {scatter_time:8.3f}s  ({scatter_time/total_time*100:5.1f}%)")
+    logging.info(f"Average kernel:      {average_time:8.3f}s  ({average_time/total_time*100:5.1f}%)")
     logging.info(f"Compute time:        {compute_time:8.3f}s  ({compute_time/total_time*100:5.1f}%)")
     logging.info(f"Download time:       {download_time:8.3f}s  ({download_time/total_time*100:5.1f}%)")
     logging.info(f"Reshape time:        {reshape_time:8.3f}s  ({reshape_time/total_time*100:5.1f}%)")
@@ -482,6 +674,9 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     logging.info("-" * 80)
     logging.info(f"   Data preparation (cumulative):    {cumul['prep_time']:8.3f}s")
     logging.info(f"   Upload (cumulative):             {cumul['upload_time']:8.3f}s")
+    logging.info(f"   SimHash kernel (cumulative):      {cumul['simhash_time']:8.3f}s")
+    logging.info(f"   Scatter-add kernel (cumulative): {cumul['scatter_time']:8.3f}s")
+    logging.info(f"   Average kernel (cumulative):     {cumul['average_time']:8.3f}s")
     logging.info(f"   Compute (cumulative):           {cumul['compute_time']:8.3f}s")
     logging.info(f"   Download (cumulative):          {cumul['download_time']:8.3f}s")
     logging.info(f"   Reshape (cumulative):          {cumul['reshape_time']:8.3f}s")
@@ -504,6 +699,9 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     return {
         'prep_time': prep_time,
         'upload_time': upload_time,
+        'simhash_time': simhash_time,
+        'scatter_time': scatter_time,
+        'average_time': average_time,
         'compute_time': compute_time,
         'download_time': download_time,
         'reshape_time': reshape_time,

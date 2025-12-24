@@ -20,20 +20,20 @@ tt_REP2=8
 tt_REP3=12
 
 
-echo "rep=${REP} | rerank=${rerank} | simhash=${SIMHASH_1} | projection=${PROJECTION_1}"
-python3.10 ${filename} --simhash "${SIMHASH_1}" --projection "${PROJECTION_1}" --rep "${REP}" --rerank "${rerank}"
+#echo "rep=${REP} | rerank=${rerank} | simhash=${SIMHASH_1} | projection=${PROJECTION_1}"
+#python3.10 ${filename} --simhash "${SIMHASH_1}" --projection "${PROJECTION_1}" --rep "${REP}" --rerank "${rerank}"
 
 
-#echo "rep=${T_REP} | rerank=${rerank} | simhash=${T_SIMHASH} | projection=${T_PROJECTION}"
-#python3.10 ${filename} --simhash "${T_SIMHASH}" --projection "${T_PROJECTION}" --rep "${T_REP}" --rerank "${rerank}"
+echo "rep=${T_REP} | rerank=${rerank} | simhash=${T_SIMHASH} | projection=${T_PROJECTION}"
+python3.10 ${filename} --simhash "${T_SIMHASH}" --projection "${T_PROJECTION}" --rep "${T_REP}" --rerank "${rerank}"
 
-#echo "rep=${REP} | rerank=${rerank} | simhash=${SIMHASH_2} | projection=${PROJECTION_1}"
-#python3.10 ${filename} --simhash "${SIMHASH_2}" --projection "${PROJECTION_1}" --rep "${REP}" --rerank "${rerank}"
+echo "rep=${REP} | rerank=${rerank} | simhash=${SIMHASH_2} | projection=${PROJECTION_1}"
+python3.10 ${filename} --simhash "${SIMHASH_2}" --projection "${PROJECTION_1}" --rep "${REP}" --rerank "${rerank}"
 
-#echo "rep=${REP} | rerank=${rerank} | simhash=${SIMHASH_3} | projection=${PROJECTION_1}"
-#python3.10 ${filename} --simhash "${SIMHASH_3}" --projection "${PROJECTION_1}" --rep "${REP}" --rerank "${rerank}"
+echo "rep=${REP} | rerank=${rerank} | simhash=${SIMHASH_3} | projection=${PROJECTION_1}"
+python3.10 ${filename} --simhash "${SIMHASH_3}" --projection "${PROJECTION_1}" --rep "${REP}" --rerank "${rerank}"
 
-#echo "rep=${REP} | rerank=${rerank} | simhash=${SIMHASH_3} | projection=${PROJECTION_2}"
-#python3.10 ${filename} --simhash "${SIMHASH_3}" --projection "${PROJECTION_2}" --rep "${REP}" --rerank "${rerank}"
+echo "rep=${REP} | rerank=${rerank} | simhash=${SIMHASH_3} | projection=${PROJECTION_2}"
+python3.10 ${filename} --simhash "${SIMHASH_3}" --projection "${PROJECTION_2}" --rep "${REP}" --rerank "${rerank}"
 
 
