@@ -30,7 +30,7 @@ from beir.retrieval.search.dense import DenseRetrievalExactSearch as DRES
 import argparse
 
 # FDE 구현 (GPU 버전 사용)
-from fde_generator_gpu_optimized_triple_stream_with_mini_batch import (
+from fde_generator_gpu_optimized_triple_stage_optimized import (
     FixedDimensionalEncodingConfig,
     EncodingType,
     ProjectionType,
@@ -38,7 +38,7 @@ from fde_generator_gpu_optimized_triple_stream_with_mini_batch import (
     #generate_document_fde_batch,
     _simhash_matrix_from_seed_gpu,
     _ams_projection_matrix_from_seed_gpu,
-    generate_document_fde_batch_gpu_3stream_pipeline
+    generate_document_fde_batch_gpu_3stage
 )
 
 # ======================
@@ -47,7 +47,7 @@ from fde_generator_gpu_optimized_triple_stream_with_mini_batch import (
 DATASET_REPO_ID = "scidocs"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
 TOP_K = 10
-FILENAME = "main_weight_fde_gpu_triple_stream_with_mini_batch"
+FILENAME = "main_weight_fde_gpu_triple_stage_optimized"
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -498,7 +498,7 @@ class ColbertFdeRetriever:
         )
 
         # ---------- 배치 단위 처리: 인코딩 → FDE 생성 → 저장 ----------
-        ATOMIC_BATCH_SIZE = 3000  # 배치 크기 (메모리 매핑으로 안전하게 처리)
+        ATOMIC_BATCH_SIZE = 8000  # 배치 크기 (메모리 매핑으로 안전하게 처리)
         
         #[1017] simhash별 indice별 원소 개수 csv 파일 저장 필요------------------------------------
         simhash_count_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{self.num_repetitions}_simhash{self.num_simhash_projections}_rerank{self.rerank_candidates}")
@@ -587,12 +587,12 @@ class ColbertFdeRetriever:
 
             #start_total = time.perf_counter()
             # 3-stream pipeline 함수는 fde_memmap에 직접 쓰므로, fde_index를 전달
-            stats = generate_document_fde_batch_gpu_3stream_pipeline(
+            stats = generate_document_fde_batch_gpu_3stage(
                 batch_embeddings,
                 self.doc_config,
                 fde_index,  # 최종 통합 memmap 전달
                 batch_start,  # memmap에서 시작할 인덱스
-                mini_batch_size=500,  # mini-batch 크기
+                # mini_batch_size는 무시됨 (전체 배치를 한 번에 처리)
                 log_every=1000,
             )
             #end_total = time.perf_counter()

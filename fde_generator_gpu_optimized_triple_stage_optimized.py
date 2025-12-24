@@ -1,13 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-GPU-Optimized FDE Generator with 3-STREAM PIPELINE
-Pipeline stages:
-  Stream 1: CPU → GPU (upload embeddings)
-  Stream 2: GPU processing (compute FDE)  
-  Stream 3: GPU → CPU → Disk (download + flush)
-
-All 3 stages run in parallel for maximum throughput!
-"""
 import logging
 import time
 import os
@@ -20,82 +11,44 @@ from dataclasses import dataclass, replace
 from enum import Enum
 
 # ==============================================================================
-# CUDA KERNELS (Same as before)
+# CUDA KERNELS 
 # ==============================================================================
 
-# Kernel 1: SimHash projection and partition assignment
-SIMHASH_KERNEL = cp.RawKernel(r'''
+# Kernel 1: SimHash partition assignment
+SIMHASH_PARTITION_KERNEL = cp.RawKernel(r'''
 extern "C" __global__
-void simhash_projection_multi_rep(
-    const float* __restrict__ embeddings,
+void simhash_partition_multi_rep(
+    const float* __restrict__ sketches_out,
     const int* __restrict__ doc_lengths,
-    const float* __restrict__ simhash_matrices,
-    const float* __restrict__ ams_matrices,
-    float* __restrict__ sketches_out,
-    float* __restrict__ projected_out,
     int* __restrict__ partition_indices,
     const int num_docs,
     const int max_len,
-    const int dim,
     const int num_bits,
-    const int proj_dim,
-    const int num_reps,
-    const int use_identity
+    const int num_reps
 ) {
     int global_id = blockIdx.x * blockDim.x + threadIdx.x;
     int total_tokens = num_docs * num_reps * max_len;
-    
     if (global_id >= total_tokens) return;
-    
+
     int token_idx = global_id % max_len;
     int temp = global_id / max_len;
     int rep_idx = temp % num_reps;
     int doc_idx = temp / num_reps;
-    
+
     if (token_idx >= doc_lengths[doc_idx]) return;
-    
-    const float* emb = &embeddings[(doc_idx * max_len + token_idx) * dim];
-    const float* simhash_mat = &simhash_matrices[rep_idx * dim * num_bits];
-    
-    float sketches[32];
-    for (int b = 0; b < num_bits; b++) {
-        float val = 0.0f;
-        for (int d = 0; d < dim; d++) {
-            val += emb[d] * simhash_mat[d * num_bits + b];
-        }
-        sketches[b] = val;
-    }
-    
+
     int sketch_offset = ((doc_idx * num_reps + rep_idx) * max_len + token_idx) * num_bits;
-    for (int b = 0; b < num_bits; b++) {
-        sketches_out[sketch_offset + b] = sketches[b];
-    }
-    
+    const float* sketches = &sketches_out[sketch_offset];
+
     unsigned int p_idx = 0;
     for (int b = 0; b < num_bits; b++) {
         unsigned int bit = (sketches[b] > 0.0f) ? 1 : 0;
         p_idx = (p_idx << 1) + (bit ^ (p_idx & 1));
     }
+
     partition_indices[(doc_idx * num_reps + rep_idx) * max_len + token_idx] = p_idx;
-    
-    int proj_offset = ((doc_idx * num_reps + rep_idx) * max_len + token_idx) * proj_dim;
-    
-    if (use_identity) {
-        for (int d = 0; d < proj_dim; d++) {
-            projected_out[proj_offset + d] = emb[d];
-        }
-    } else {
-        const float* ams_mat = &ams_matrices[rep_idx * dim * proj_dim];
-        for (int p = 0; p < proj_dim; p++) {
-            float val = 0.0f;
-            for (int d = 0; d < dim; d++) {
-                val += emb[d] * ams_mat[d * proj_dim + p];
-            }
-            projected_out[proj_offset + p] = val;
-        }
-    }
 }
-''', 'simhash_projection_multi_rep')
+''', 'simhash_partition_multi_rep')
 
 
 # Kernel 2: Scatter-add with shared memory
@@ -226,7 +179,7 @@ def _gray_code_to_binary(num: int) -> int:
 def _simhash_matrix_from_seed_gpu(
     dimension: int, num_projections: int, seed: int
 ) -> cp.ndarray:
-    """Generate SimHash matrix on GPU"""
+    #Generate SimHash matrix on GPU
     rng = cp.random.default_rng(seed)
 
     # 평균 0, 표준편차 1인 가우시안
@@ -240,7 +193,7 @@ def _simhash_matrix_from_seed_gpu(
 def _ams_projection_matrix_from_seed_gpu(
     dimension: int, projection_dim: int, seed: int
 ) -> cp.ndarray:
-    """Generate AMS projection matrix on GPU"""
+    #Generate AMS projection matrix on GPU
     rng = cp.random.default_rng(seed)
     out = cp.zeros((dimension, projection_dim), dtype=cp.float32)
     indices = rng.integers(0, projection_dim, size=dimension)
@@ -255,7 +208,7 @@ def _ams_projection_matrix_from_seed_gpu(
 
 
 def _pad_doc_embeddings(doc_embeddings_list: List[np.ndarray]) -> tuple:
-    """Pad document embeddings to uniform length"""
+    #Pad document embeddings to uniform length
     doc_lengths = np.array([doc.shape[0] for doc in doc_embeddings_list], dtype=np.int32)
     max_len = int(doc_lengths.max())
     num_docs = len(doc_embeddings_list)
@@ -271,7 +224,7 @@ def _pad_doc_embeddings(doc_embeddings_list: List[np.ndarray]) -> tuple:
 def generate_query_fde(
     point_cloud: np.ndarray, config: FixedDimensionalEncodingConfig
 ) -> np.ndarray:
-    """Generates a Fixed Dimensional Encoding for a query point cloud (using SUM)."""
+    #Generates a Fixed Dimensional Encoding for a query point cloud (using SUM).
     if config.fill_empty_partitions:
         raise ValueError(
             "Query FDE generation does not support 'fill_empty_partitions'."
@@ -367,6 +320,7 @@ _GPU_CUMULATIVE_TIMING = {
     'prep_time': 0.0,
     'upload_time': 0.0,
     'simhash_time': 0.0,
+    'partition_time': 0.0,
     'scatter_time': 0.0,
     'average_time': 0.0,
     'compute_time': 0.0,
@@ -382,6 +336,7 @@ def reset_gpu_cumulative_timing():
         'prep_time': 0.0,
         'upload_time': 0.0,
         'simhash_time': 0.0,
+        'partition_time': 0.0,
         'scatter_time': 0.0,
         'average_time': 0.0,
         'compute_time': 0.0,
@@ -390,50 +345,16 @@ def reset_gpu_cumulative_timing():
         'flush_time': 0.0,
     }
 
-def generate_document_fde_batch_gpu_3stream_pipeline(
+def generate_document_fde_batch_gpu_3stage(
     doc_embeddings_list: List[np.ndarray],
     config: FixedDimensionalEncodingConfig,
     fde_memmap,  # Pre-created memmap from main code
     batch_start_idx: int,  # Where to write in memmap
     *,
-    mini_batch_size: int = 500,
+    mini_batch_size: int = 500,  # Ignored - kept for backward compatibility
     log_every: int = 1000
 ) -> dict:
-    """
-    🚀 3-STREAM PIPELINE for FDE generation
-    
-    Pipeline stages (all parallel):
-    ┌──────────────────────────────────────────────────────────┐
-    │ Stream 1 (Upload):   CPU → GPU                           │
-    │   - Upload embeddings for batch N                        │
-    │   - While batch N-1 is computing                         │
-    ├──────────────────────────────────────────────────────────┤
-    │ Stream 2 (Compute):  GPU kernels                         │
-    │   - SimHash, Scatter-add, Average for batch N            │
-    │   - While batch N+1 uploads & batch N-1 downloads        │
-    ├──────────────────────────────────────────────────────────┤
-    │ Stream 3 (Download): GPU → CPU → Disk                    │
-    │   - Download results for batch N-1                       │
-    │   - Write to memmap and flush                            │
-    │   - While batch N computes & batch N+1 uploads           │
-    └──────────────────────────────────────────────────────────┘
-    
-    Timeline example:
-    Batch 1: [Upload]
-    Batch 2: [Upload] [Compute B1]
-    Batch 3: [Upload] [Compute B2] [Download+Flush B1]  ⚡ All parallel!
-    Batch 4: [Upload] [Compute B3] [Download+Flush B2]  ⚡ All parallel!
-    
-    Args:
-        doc_embeddings_list: All document embeddings
-        config: FDE configuration
-        fde_memmap: Pre-allocated memmap for output
-        batch_start_idx: Starting index in memmap
-        mini_batch_size: Documents per mini-batch
-        
-    Returns:
-        Timing statistics dictionary
-    """
+
     start_time = time.perf_counter()
     num_docs = len(doc_embeddings_list)
     
@@ -442,7 +363,7 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
         return {}
     
     logging.info(f"[FDE 3-Stream] Processing {num_docs} documents with 3-stream pipeline")
-    logging.info(f"[FDE 3-Stream] Mini-batch size: {mini_batch_size}")
+    logging.info(f"[FDE 3-Stream] Processing all documents in a single batch (no mini-batching)")
     
     # Configuration
     use_identity_proj = config.projection_type == ProjectionType.DEFAULT_IDENTITY
@@ -452,7 +373,7 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     final_fde_dim = config.num_repetitions * final_fde_dim_per_rep
     
     # ==========================================
-    # Prepare random matrices (shared across all batches)
+    # Random matrices preparation (shared across all batches)
     # ==========================================
     prep_start = time.perf_counter()
     
@@ -476,6 +397,7 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     ams_matrices_gpu = cp.stack(ams_matrices_list, axis=0) if not use_identity_proj else None
     
     prep_time = time.perf_counter() - prep_start
+    logging.info(f"[FDE 3-Stream] Random matrices prepared in {prep_time:.3f}s")
     
     # ==========================================
     # Create 3 CUDA streams
@@ -485,249 +407,170 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     stream_download = cp.cuda.Stream(non_blocking=True)  # Stream 3: Download
     
     # ==========================================
-    # Split into mini-batches
+    # Process all documents in a single batch
     # ==========================================
-    num_mini_batches = (num_docs + mini_batch_size - 1) // mini_batch_size
-    logging.info(f"[FDE 3-Stream] Split into {num_mini_batches} mini-batches")
+    logging.info(f"[FDE 3-Stream] Processing all {num_docs} documents in one batch")
     
     # Timing accumulators
-    total_upload_time = 0.0
-    total_simhash_time = 0.0
-    total_scatter_time = 0.0
-    total_average_time = 0.0
-    total_compute_time = 0.0
-    total_download_time = 0.0
-    total_reshape_time = 0.0
-    total_flush_time = 0.0
+    upload_time = 0.0
+    simhash_time = 0.0
+    partition_time = 0.0
+    scatter_time = 0.0
+    average_time = 0.0
+    compute_time = 0.0
+    download_time = 0.0
+    reshape_time = 0.0
+    flush_time = 0.0
     
-    # Pipeline state: Track results for each stage
-    # We need to keep 3 batches in flight at once
-    pipeline_state = {
-        'uploaded': None,      # Batch that just finished uploading
-        'computed': None,      # Batch that just finished computing
-        'downloaded': None,    # Batch that just finished downloading
-    }
+    # ========================================
+    # STEP 1: Prepare all document data
+    # ========================================
+    padded_embeddings, doc_lengths, max_len = _pad_doc_embeddings(doc_embeddings_list)
     
-    # Pre-allocate GPU buffers for double-buffering
-    # We need 2 sets: one being computed, one being uploaded
-    max_batch_docs = mini_batch_size
-    max_len_estimate = max([doc.shape[0] for doc in doc_embeddings_list])
+    # ========================================
+    # STEP 2: Upload to GPU (Stream 1)
+    # ========================================
+    upload_start = time.perf_counter()
     
-    # Buffer set A
-    embeddings_gpu_A = None
-    doc_lengths_gpu_A = None
-    sketches_gpu_A = None
-    projected_gpu_A = None
-    partition_indices_gpu_A = None
-    partition_sums_gpu_A = None
-    partition_counts_gpu_A = None
-    
-    # Buffer set B
-    embeddings_gpu_B = None
-    doc_lengths_gpu_B = None
-    sketches_gpu_B = None
-    projected_gpu_B = None
-    partition_indices_gpu_B = None
-    partition_sums_gpu_B = None
-    partition_counts_gpu_B = None
-    
-    # ==========================================
-    # 3-STAGE PIPELINE EXECUTION
-    # ==========================================
-    
-    for mini_batch_idx in range(num_mini_batches + 2):  # +2 to drain pipeline
-        logging.info(f"[Pipeline] Stage {mini_batch_idx + 1}/{num_mini_batches + 2}")
+    with stream_upload:
+        embeddings_gpu = cp.asarray(padded_embeddings)
+        doc_lengths_gpu = cp.asarray(doc_lengths)
         
-        # Determine which buffer set to use (ping-pong)
-        use_buffer_A = (mini_batch_idx % 2 == 0)
+        # Allocate output buffers
+        sketches_gpu = cp.zeros((num_docs, config.num_repetitions, max_len, config.num_simhash_projections), dtype=cp.float32)
+        projected_gpu = cp.zeros((num_docs, config.num_repetitions, max_len, projection_dim), dtype=cp.float32)
+        partition_indices_gpu = cp.zeros((num_docs, config.num_repetitions, max_len), dtype=cp.int32)
+        partition_sums_gpu = cp.zeros((num_docs, config.num_repetitions, num_partitions, projection_dim), dtype=cp.float32)
+        partition_counts_gpu = cp.zeros((num_docs, config.num_repetitions, num_partitions), dtype=cp.int32)
+    
+    stream_upload.synchronize()
+    upload_time = time.perf_counter() - upload_start
+    
+    # ========================================
+    # STEP 3: Compute on GPU (Stream 2)
+    # ========================================
+    compute_start = time.perf_counter()
+    
+    with stream_compute:
+        # ===========================
+        # 3-1. CuPy GEMM -> projection 수행
+        # ===========================
+        simhash_start = time.perf_counter()
         
-        # ========================================
-        # STAGE 1: UPLOAD (Stream 1)
-        # ========================================
-        if mini_batch_idx < num_mini_batches:
-            upload_start = time.perf_counter()
-            
-            batch_start = mini_batch_idx * mini_batch_size
-            batch_end = min(batch_start + mini_batch_size, num_docs)
-            batch_size = batch_end - batch_start
-            
-            mini_batch_embeddings = doc_embeddings_list[batch_start:batch_end]
-            padded, doc_lengths, max_len = _pad_doc_embeddings(mini_batch_embeddings)
-            
-            with stream_upload:
-                if use_buffer_A:
-                    embeddings_gpu_A = cp.asarray(padded)
-                    doc_lengths_gpu_A = cp.asarray(doc_lengths)
-                    
-                    # Allocate output buffers
-                    sketches_gpu_A = cp.zeros((batch_size, config.num_repetitions, max_len, config.num_simhash_projections), dtype=cp.float32)
-                    projected_gpu_A = cp.zeros((batch_size, config.num_repetitions, max_len, projection_dim), dtype=cp.float32)
-                    partition_indices_gpu_A = cp.zeros((batch_size, config.num_repetitions, max_len), dtype=cp.int32)
-                    partition_sums_gpu_A = cp.zeros((batch_size, config.num_repetitions, num_partitions, projection_dim), dtype=cp.float32)
-                    partition_counts_gpu_A = cp.zeros((batch_size, config.num_repetitions, num_partitions), dtype=cp.int32)
-                else:
-                    embeddings_gpu_B = cp.asarray(padded)
-                    doc_lengths_gpu_B = cp.asarray(doc_lengths)
-                    
-                    sketches_gpu_B = cp.zeros((batch_size, config.num_repetitions, max_len, config.num_simhash_projections), dtype=cp.float32)
-                    projected_gpu_B = cp.zeros((batch_size, config.num_repetitions, max_len, projection_dim), dtype=cp.float32)
-                    partition_indices_gpu_B = cp.zeros((batch_size, config.num_repetitions, max_len), dtype=cp.int32)
-                    partition_sums_gpu_B = cp.zeros((batch_size, config.num_repetitions, num_partitions, projection_dim), dtype=cp.float32)
-                    partition_counts_gpu_B = cp.zeros((batch_size, config.num_repetitions, num_partitions), dtype=cp.int32)
-            
-            stream_upload.synchronize()
-            upload_time = time.perf_counter() - upload_start
-            total_upload_time += upload_time
-            
-            pipeline_state['uploaded'] = {
-                'batch_idx': mini_batch_idx,
-                'batch_start': batch_start,
-                'batch_end': batch_end,
-                'batch_size': batch_size,
-                'max_len': max_len,
-                'use_buffer_A': use_buffer_A,
-            }
-            
-            logging.info(f"[Stage 1 Upload] Batch {mini_batch_idx} uploaded in {upload_time:.3f}s")
+        # 1-Dimensional Embedding으로 펼치기: T = num_docs * max_len
+        total_tokens = num_docs * max_len
+        dim = config.dimension
+        num_bits = config.num_simhash_projections
+        reps = config.num_repetitions
         
-        # ========================================
-        # STAGE 2: COMPUTE (Stream 2)
-        # ========================================
-        if pipeline_state['uploaded'] is not None:
-            compute_start = time.perf_counter()
+        embeddings_2d = embeddings_gpu.reshape(total_tokens, dim)  # (T, D)
+        
+        for rep_idx in range(reps):
+            # SimHash: (T, D) @ (D, num_bits) -> (T, num_bits)
+            simhash_mat_rep = simhash_matrices_gpu[rep_idx]             # (D, num_bits)
+            sketches_rep = embeddings_2d @ simhash_mat_rep              # (T, num_bits)
             
-            batch_info = pipeline_state['uploaded']
-            batch_size = batch_info['batch_size']
-            max_len = batch_info['max_len']
-            use_buf_A = batch_info['use_buffer_A']
+            # (num_docs, max_len, num_bits)로 reshape 후, rep 축에 넣기
+            sketches_rep_4d = sketches_rep.reshape(num_docs, max_len, num_bits)
+            sketches_gpu[:, rep_idx, :, :] = sketches_rep_4d
             
-            # Select buffers
-            if use_buf_A:
-                emb_gpu = embeddings_gpu_A
-                len_gpu = doc_lengths_gpu_A
-                sketch_gpu = sketches_gpu_A
-                proj_gpu = projected_gpu_A
-                part_idx_gpu = partition_indices_gpu_A
-                part_sum_gpu = partition_sums_gpu_A
-                part_cnt_gpu = partition_counts_gpu_A
+            # Projection: identity or AMS
+            if use_identity_proj:
+                # projection이 필요없는 경우 그대로 복사
+                projected_gpu[:, rep_idx, :, :] = embeddings_gpu
             else:
-                emb_gpu = embeddings_gpu_B
-                len_gpu = doc_lengths_gpu_B
-                sketch_gpu = sketches_gpu_B
-                proj_gpu = projected_gpu_B
-                part_idx_gpu = partition_indices_gpu_B
-                part_sum_gpu = partition_sums_gpu_B
-                part_cnt_gpu = partition_counts_gpu_B
-            
-            with stream_compute:
-                # Kernel 1: SimHash
-                simhash_start = time.perf_counter()
-                
-                total_tokens = batch_size * config.num_repetitions * max_len
-                threads_per_block = 256
-                num_blocks = (total_tokens + threads_per_block - 1) // threads_per_block
-                
-                SIMHASH_KERNEL(
-                    (num_blocks,), (threads_per_block,),
-                    (emb_gpu, len_gpu, simhash_matrices_gpu,
-                     ams_matrices_gpu if ams_matrices_gpu is not None else cp.zeros(1, dtype=cp.float32),
-                     sketch_gpu, proj_gpu, part_idx_gpu,
-                     batch_size, max_len, config.dimension, config.num_simhash_projections,
-                     projection_dim, config.num_repetitions,
-                     1 if use_identity_proj else 0)
-                )
-                stream_compute.synchronize()
-                simhash_time = time.perf_counter() - simhash_start
-                total_simhash_time += simhash_time
-                
-                # Kernel 2: Scatter-add
-                scatter_start = time.perf_counter()
-                
-                shared_mem_size = (num_partitions * projection_dim * 4) + (num_partitions * 4)
-                grid_dim = (batch_size, config.num_repetitions)
-                
-                SCATTER_ADD_KERNEL(
-                    grid_dim, (threads_per_block,),
-                    (proj_gpu, part_idx_gpu, len_gpu, part_sum_gpu, part_cnt_gpu,
-                     batch_size, config.num_repetitions, max_len, projection_dim, num_partitions),
-                    shared_mem=shared_mem_size
-                )
-                stream_compute.synchronize()
-                scatter_time = time.perf_counter() - scatter_start
-                total_scatter_time += scatter_time
-                
-                # Kernel 3: Average
-                average_start = time.perf_counter()
-                
-                total_partitions = batch_size * config.num_repetitions * num_partitions
-                num_blocks = (total_partitions + threads_per_block - 1) // threads_per_block
-                
-                AVERAGE_KERNEL(
-                    (num_blocks,), (threads_per_block,),
-                    (part_sum_gpu, part_cnt_gpu, batch_size, config.num_repetitions,
-                     num_partitions, projection_dim)
-                )
-                stream_compute.synchronize()
-                average_time = time.perf_counter() - average_start
-                total_average_time += average_time
-            
-            compute_time = simhash_time + scatter_time + average_time
-            total_compute_time += compute_time
-            
-            pipeline_state['computed'] = batch_info
-            pipeline_state['uploaded'] = None
-            
-            logging.info(f"[Stage 2 Compute] Batch {batch_info['batch_idx']} computed in {compute_time:.3f}s")
+                ams_mat_rep = ams_matrices_gpu[rep_idx]                 # (D, proj_dim)
+                proj_rep = embeddings_2d @ ams_mat_rep                  # (T, proj_dim)
+                proj_rep_4d = proj_rep.reshape(num_docs, max_len, projection_dim)
+                projected_gpu[:, rep_idx, :, :] = proj_rep_4d
         
-        # ========================================
-        # STAGE 3: DOWNLOAD + RESHAPE + FLUSH (Stream 3)
-        # ========================================
-        if pipeline_state['computed'] is not None:
-            download_start = time.perf_counter()
-            
-            batch_info = pipeline_state['computed']
-            use_buf_A = batch_info['use_buffer_A']
-            batch_size = batch_info['batch_size']
-            
-            # Select output buffer (partition_sums, not fde_output)
-            part_sum_gpu = partition_sums_gpu_A if use_buf_A else partition_sums_gpu_B
-            
-            # Download to CPU
-            with stream_download:
-                partition_sums_cpu = cp.asnumpy(part_sum_gpu)
-            
-            stream_download.synchronize()
-            download_time = time.perf_counter() - download_start
-            total_download_time += download_time
-            
-            # Reshape on CPU (same as your original code)
-            reshape_start = time.perf_counter()
-            
-            fde_cpu = np.zeros((batch_size, final_fde_dim), dtype=np.float32)
-            for doc_idx in range(batch_size):
-                for rep_idx in range(config.num_repetitions):
-                    rep_offset = rep_idx * final_fde_dim_per_rep
-                    fde_chunk = partition_sums_cpu[doc_idx, rep_idx].reshape(-1)
-                    fde_cpu[doc_idx, rep_offset:rep_offset + final_fde_dim_per_rep] = fde_chunk
-            
-            reshape_time = time.perf_counter() - reshape_start
-            total_reshape_time += reshape_time
-            
-            # Write to memmap and flush
-            flush_start = time.perf_counter()
-            
-            global_start = batch_start_idx + batch_info['batch_start']
-            global_end = batch_start_idx + batch_info['batch_end']
-            
-            fde_memmap[global_start:global_end] = fde_cpu
-            fde_memmap.flush()  # Flush to disk
-            
-            flush_time = time.perf_counter() - flush_start
-            total_flush_time += flush_time
-            
-            pipeline_state['computed'] = None
-            
-            logging.info(f"[Stage 3 Download] Batch {batch_info['batch_idx']}: download={download_time:.3f}s, reshape={reshape_time:.3f}s, flush={flush_time:.3f}s")
+        stream_compute.synchronize()
+        simhash_time = time.perf_counter() - simhash_start
+
+        # ===========================
+        # 3-2. partition 계산 커널 호출
+        # ===========================
+        partition_start = time.perf_counter()
+        
+        total_tokens_all_reps = num_docs * reps * max_len
+        threads_per_block = 256
+        num_blocks = (total_tokens_all_reps + threads_per_block - 1) // threads_per_block
+        
+        SIMHASH_PARTITION_KERNEL(
+            (num_blocks,), (threads_per_block,),
+            (sketches_gpu, doc_lengths_gpu, partition_indices_gpu,
+             num_docs, max_len, num_bits, reps)
+        )
+        stream_compute.synchronize()
+        partition_time = time.perf_counter() - partition_start
+        
+        # Kernel 2: Scatter-add
+        scatter_start = time.perf_counter()
+        
+        shared_mem_size = (num_partitions * projection_dim * 4) + (num_partitions * 4)
+        grid_dim = (num_docs, config.num_repetitions)
+        
+        SCATTER_ADD_KERNEL(
+            grid_dim, (threads_per_block,),
+            (projected_gpu, partition_indices_gpu, doc_lengths_gpu, partition_sums_gpu, partition_counts_gpu,
+             num_docs, config.num_repetitions, max_len, projection_dim, num_partitions),
+            shared_mem=shared_mem_size
+        )
+        stream_compute.synchronize()
+        scatter_time = time.perf_counter() - scatter_start
+        
+        # Kernel 3: Average
+        average_start = time.perf_counter()
+        
+        total_partitions = num_docs * config.num_repetitions * num_partitions
+        num_blocks = (total_partitions + threads_per_block - 1) // threads_per_block
+        
+        AVERAGE_KERNEL(
+            (num_blocks,), (threads_per_block,),
+            (partition_sums_gpu, partition_counts_gpu, num_docs, config.num_repetitions,
+             num_partitions, projection_dim)
+        )
+        stream_compute.synchronize()
+        average_time = time.perf_counter() - average_start
+    
+    compute_time = simhash_time + scatter_time + average_time
+    
+    # ========================================
+    # STEP 4: Download to CPU (Stream 3)
+    # ========================================
+    download_start = time.perf_counter()
+    
+    with stream_download:
+        partition_sums_cpu = cp.asnumpy(partition_sums_gpu)
+    
+    stream_download.synchronize()
+    download_time = time.perf_counter() - download_start
+    
+    # ========================================
+    # STEP 5: Reshape on CPU
+    # ========================================
+    reshape_start = time.perf_counter()
+    
+    fde_cpu = np.zeros((num_docs, final_fde_dim), dtype=np.float32)
+    for doc_idx in range(num_docs):
+        for rep_idx in range(config.num_repetitions):
+            rep_offset = rep_idx * final_fde_dim_per_rep
+            fde_chunk = partition_sums_cpu[doc_idx, rep_idx].reshape(-1)
+            fde_cpu[doc_idx, rep_offset:rep_offset + final_fde_dim_per_rep] = fde_chunk
+    
+    reshape_time = time.perf_counter() - reshape_start
+    
+    # ========================================
+    # STEP 6: Write to memmap and flush
+    # ========================================
+    flush_start = time.perf_counter()
+    
+    fde_memmap[batch_start_idx:batch_start_idx + num_docs] = fde_cpu
+    fde_memmap.flush()  # Flush to disk
+    
+    flush_time = time.perf_counter() - flush_start
+    
+    logging.info(f"[FDE 3-Stream] Completed: upload={upload_time:.3f}s, compute={compute_time:.3f}s, download={download_time:.3f}s, reshape={reshape_time:.3f}s, flush={flush_time:.3f}s")
     
     # ==========================================
     # Performance Summary
@@ -737,24 +580,25 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     # Accumulate this batch's times to global cumulative timing
     global _GPU_CUMULATIVE_TIMING
     _GPU_CUMULATIVE_TIMING['prep_time'] += prep_time
-    _GPU_CUMULATIVE_TIMING['upload_time'] += total_upload_time
-    _GPU_CUMULATIVE_TIMING['simhash_time'] += total_simhash_time
-    _GPU_CUMULATIVE_TIMING['scatter_time'] += total_scatter_time
-    _GPU_CUMULATIVE_TIMING['average_time'] += total_average_time
-    _GPU_CUMULATIVE_TIMING['compute_time'] += total_compute_time
-    _GPU_CUMULATIVE_TIMING['download_time'] += total_download_time
-    _GPU_CUMULATIVE_TIMING['reshape_time'] += total_reshape_time
-    _GPU_CUMULATIVE_TIMING['flush_time'] += total_flush_time
+    _GPU_CUMULATIVE_TIMING['upload_time'] += upload_time
+    _GPU_CUMULATIVE_TIMING['simhash_time'] += simhash_time
+    _GPU_CUMULATIVE_TIMING['partition_time'] += partition_time
+    _GPU_CUMULATIVE_TIMING['scatter_time'] += scatter_time
+    _GPU_CUMULATIVE_TIMING['average_time'] += average_time
+    _GPU_CUMULATIVE_TIMING['compute_time'] += compute_time
+    _GPU_CUMULATIVE_TIMING['download_time'] += download_time
+    _GPU_CUMULATIVE_TIMING['reshape_time'] += reshape_time
+    _GPU_CUMULATIVE_TIMING['flush_time'] += flush_time
     
     # Get cumulative times (across all batches) - use dictionary directly to avoid duplication
     cumul = _GPU_CUMULATIVE_TIMING
     
-    # Try to get final memmap flush time from main_weight module
+    # Final memmap flush time from main_weight module
     final_memmap_flush_time = 0.0
     try:
         import sys
         module_names = [
-            'main_weight_fde_gpu_triple_stream_with_mini_batch',
+            'main_weight_fde_gpu_triple_stream',
             '__main__',
         ]
         
@@ -781,32 +625,31 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
         pass
     
     # Calculate total measured time
-    total_measured_time = prep_time + total_upload_time + total_compute_time + total_download_time + total_reshape_time + total_flush_time
+    total_measured_time = prep_time + upload_time + compute_time + download_time + reshape_time + flush_time
     total_measured_with_final_flush = cumul['prep_time'] + cumul['upload_time'] + cumul['compute_time'] + cumul['download_time'] + cumul['reshape_time'] + cumul['flush_time'] + final_memmap_flush_time
     
     logging.info("=" * 80)
-    logging.info("🚀 3-STREAM PIPELINE Performance Summary")
+    logging.info("🚀 GPU FDE Performance Summary (Single Batch)")
     logging.info("=" * 80)
     logging.info(f"Data preparation:    {prep_time:8.3f}s  ({prep_time/total_time*100:5.1f}%)")
-    logging.info(f"Total upload time:   {total_upload_time:8.3f}s  ({total_upload_time/total_time*100:5.1f}%)")
-    logging.info(f"Total simhash time:  {total_simhash_time:8.3f}s  ({total_simhash_time/total_time*100:5.1f}%)")
-    logging.info(f"Total scatter time:  {total_scatter_time:8.3f}s  ({total_scatter_time/total_time*100:5.1f}%)")
-    logging.info(f"Total average time:  {total_average_time:8.3f}s  ({total_average_time/total_time*100:5.1f}%)")
-    logging.info(f"Total compute time:  {total_compute_time:8.3f}s  ({total_compute_time/total_time*100:5.1f}%)")
-    logging.info(f"Total download time: {total_download_time:8.3f}s  ({total_download_time/total_time*100:5.1f}%)")
-    logging.info(f"Total reshape time:  {total_reshape_time:8.3f}s  ({total_reshape_time/total_time*100:5.1f}%)")
-    logging.info(f"Total flush time:    {total_flush_time:8.3f}s  ({total_flush_time/total_time*100:5.1f}%)")
+    logging.info(f"Upload time:         {upload_time:8.3f}s  ({upload_time/total_time*100:5.1f}%)")
+    logging.info(f"SimHash(Projection) kernel:      {simhash_time:8.3f}s  ({simhash_time/total_time*100:5.1f}%)")
+    logging.info(f"Partition kernel:    {partition_time:8.3f}s  ({partition_time/total_time*100:5.1f}%)")
+    logging.info(f"Scatter-add kernel:  {scatter_time:8.3f}s  ({scatter_time/total_time*100:5.1f}%)")
+    logging.info(f"Average kernel:      {average_time:8.3f}s  ({average_time/total_time*100:5.1f}%)")
+    logging.info(f"Compute time:        {compute_time:8.3f}s  ({compute_time/total_time*100:5.1f}%)")
+    logging.info(f"Download time:       {download_time:8.3f}s  ({download_time/total_time*100:5.1f}%)")
+    logging.info(f"Reshape time:        {reshape_time:8.3f}s  ({reshape_time/total_time*100:5.1f}%)")
+    logging.info(f"Flush time:          {flush_time:8.3f}s  ({flush_time/total_time*100:5.1f}%)")
     logging.info(f"Final memmap flush: {final_memmap_flush_time:8.3f}s  ({final_memmap_flush_time/total_time*100:5.1f}%)" if final_memmap_flush_time > 0.0 else f"Final memmap flush: {final_memmap_flush_time:8.3f}s  (  0.0%)")
     logging.info(f"Total time:          {total_time:8.3f}s")
-    logging.info("=" * 80)
-    logging.info(f"💡 Sequential time would be: {total_measured_time:.3f}s")
-    logging.info(f"💡 Pipeline speedup: {total_measured_time / total_time:.2f}x")
     logging.info("=" * 80)
     logging.info("📊 Cumulative Time Breakdown (All Operations - Across All Batches):")
     logging.info("-" * 80)
     logging.info(f"   Data preparation (cumulative):    {cumul['prep_time']:8.3f}s")
     logging.info(f"   Upload (cumulative):             {cumul['upload_time']:8.3f}s")
-    logging.info(f"   SimHash kernel (cumulative):      {cumul['simhash_time']:8.3f}s")
+    logging.info(f"   SimHash(Projection) kernel (cumulative):      {cumul['simhash_time']:8.3f}s")
+    logging.info(f"   Partition kernel (cumulative):    {cumul['partition_time']:8.3f}s")
     logging.info(f"   Scatter-add kernel (cumulative): {cumul['scatter_time']:8.3f}s")
     logging.info(f"   Average kernel (cumulative):     {cumul['average_time']:8.3f}s")
     logging.info(f"   Compute (cumulative):           {cumul['compute_time']:8.3f}s")
@@ -824,16 +667,22 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
         del ams_matrices_gpu
     cp.get_default_memory_pool().free_all_blocks()
     
+    # Cleanup intermediate buffers
+    del embeddings_gpu, doc_lengths_gpu, sketches_gpu, projected_gpu, partition_indices_gpu
+    del partition_counts_gpu, partition_sums_gpu
+    
+    
     return {
         'prep_time': prep_time,
-        'upload_time': total_upload_time,
-        'simhash_time': total_simhash_time,
-        'scatter_time': total_scatter_time,
-        'average_time': total_average_time,
-        'compute_time': total_compute_time,
-        'download_time': total_download_time,
-        'reshape_time': total_reshape_time,
-        'flush_time': total_flush_time,
+        'upload_time': upload_time,
+        'simhash_time': simhash_time,
+        'partition_time': partition_time,
+        'scatter_time': scatter_time,
+        'average_time': average_time,
+        'compute_time': compute_time,
+        'download_time': download_time,
+        'reshape_time': reshape_time,
+        'flush_time': flush_time,
         'total_time': total_time,
     }
 

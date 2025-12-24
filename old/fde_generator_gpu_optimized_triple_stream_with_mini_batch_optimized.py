@@ -57,11 +57,11 @@ void simhash_projection_multi_rep(
     const float* emb = &embeddings[(doc_idx * max_len + token_idx) * dim];
     const float* simhash_mat = &simhash_matrices[rep_idx * dim * num_bits];
     
-    float sketches[32];
+    float sketches[32]; // SimHash sketches
     for (int b = 0; b < num_bits; b++) {
         float val = 0.0f;
         for (int d = 0; d < dim; d++) {
-            val += emb[d] * simhash_mat[d * num_bits + b];
+            val += emb[d] * simhash_mat[b * dim + d]; // For memory-coalesced access <- exchange column-major to row-major
         }
         sketches[b] = val;
     }
@@ -504,6 +504,9 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     # We need to keep 3 batches in flight at once
     pipeline_state = {
         'uploaded': None,      # Batch that just finished uploading
+        'simhash_time': 0.0,
+        'scatter_time': 0.0,
+        'average_time': 0.0,
         'computed': None,      # Batch that just finished computing
         'downloaded': None,    # Batch that just finished downloading
     }
@@ -621,11 +624,12 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
             
             with stream_compute:
                 # Kernel 1: SimHash
-                simhash_start = time.perf_counter()
-                
                 total_tokens = batch_size * config.num_repetitions * max_len
                 threads_per_block = 256
                 num_blocks = (total_tokens + threads_per_block - 1) // threads_per_block
+                
+                # Kernel 1: SimHash
+                simhash_start = time.perf_counter()
                 
                 SIMHASH_KERNEL(
                     (num_blocks,), (threads_per_block,),
@@ -806,9 +810,9 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     logging.info("-" * 80)
     logging.info(f"   Data preparation (cumulative):    {cumul['prep_time']:8.3f}s")
     logging.info(f"   Upload (cumulative):             {cumul['upload_time']:8.3f}s")
-    logging.info(f"   SimHash kernel (cumulative):      {cumul['simhash_time']:8.3f}s")
-    logging.info(f"   Scatter-add kernel (cumulative): {cumul['scatter_time']:8.3f}s")
-    logging.info(f"   Average kernel (cumulative):     {cumul['average_time']:8.3f}s")
+    logging.info(f"   Simhash (cumulative):           {cumul['simhash_time']:8.3f}s")
+    logging.info(f"   Scatter (cumulative):           {cumul['scatter_time']:8.3f}s")
+    logging.info(f"   Average (cumulative):           {cumul['average_time']:8.3f}s")
     logging.info(f"   Compute (cumulative):           {cumul['compute_time']:8.3f}s")
     logging.info(f"   Download (cumulative):          {cumul['download_time']:8.3f}s")
     logging.info(f"   Reshape (cumulative):          {cumul['reshape_time']:8.3f}s")
@@ -832,7 +836,7 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
         'average_time': total_average_time,
         'compute_time': total_compute_time,
         'download_time': total_download_time,
-        'reshape_time': total_reshape_time,
+        'reshape_time': total_reshape_time,  # Added missing reshape_time
         'flush_time': total_flush_time,
         'total_time': total_time,
     }

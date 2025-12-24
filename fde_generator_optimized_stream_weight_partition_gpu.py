@@ -1,13 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-GPU-Optimized FDE Generator with 3-STREAM PIPELINE
-Pipeline stages:
-  Stream 1: CPU → GPU (upload embeddings)
-  Stream 2: GPU processing (compute FDE)  
-  Stream 3: GPU → CPU → Disk (download + flush)
-
-All 3 stages run in parallel for maximum throughput!
-"""
 import logging
 import time
 import os
@@ -20,82 +11,52 @@ from dataclasses import dataclass, replace
 from enum import Enum
 
 # ==============================================================================
-# CUDA KERNELS (Same as before)
+# CUDA KERNELS 
 # ==============================================================================
 
-# Kernel 1: SimHash projection and partition assignment
-SIMHASH_KERNEL = cp.RawKernel(r'''
+# Kernel 1: SimHash partition assignment
+SIMHASH_PARTITION_KERNEL = cp.RawKernel(r'''
 extern "C" __global__
-void simhash_projection_multi_rep(
-    const float* __restrict__ embeddings,
+void simhash_partition_multi_rep(
+    const float* __restrict__ sketches_out,
     const int* __restrict__ doc_lengths,
-    const float* __restrict__ simhash_matrices,
-    const float* __restrict__ ams_matrices,
-    float* __restrict__ sketches_out,
-    float* __restrict__ projected_out,
     int* __restrict__ partition_indices,
     const int num_docs,
     const int max_len,
-    const int dim,
     const int num_bits,
-    const int proj_dim,
     const int num_reps,
-    const int use_identity
+    const int ignore_bit,
+    const int force_bit_value
 ) {
     int global_id = blockIdx.x * blockDim.x + threadIdx.x;
     int total_tokens = num_docs * num_reps * max_len;
-    
     if (global_id >= total_tokens) return;
-    
+
     int token_idx = global_id % max_len;
     int temp = global_id / max_len;
     int rep_idx = temp % num_reps;
     int doc_idx = temp / num_reps;
-    
+
     if (token_idx >= doc_lengths[doc_idx]) return;
-    
-    const float* emb = &embeddings[(doc_idx * max_len + token_idx) * dim];
-    const float* simhash_mat = &simhash_matrices[rep_idx * dim * num_bits];
-    
-    float sketches[32];
-    for (int b = 0; b < num_bits; b++) {
-        float val = 0.0f;
-        for (int d = 0; d < dim; d++) {
-            val += emb[d] * simhash_mat[d * num_bits + b];
-        }
-        sketches[b] = val;
-    }
-    
+
     int sketch_offset = ((doc_idx * num_reps + rep_idx) * max_len + token_idx) * num_bits;
-    for (int b = 0; b < num_bits; b++) {
-        sketches_out[sketch_offset + b] = sketches[b];
-    }
-    
+    const float* sketches = &sketches_out[sketch_offset];
+
     unsigned int p_idx = 0;
     for (int b = 0; b < num_bits; b++) {
-        unsigned int bit = (sketches[b] > 0.0f) ? 1 : 0;
+        unsigned int bit;
+        if (ignore_bit >= 0 && b == ignore_bit) {
+            // Bit ablation: force the bit value (force_bit_value가 지정되면 그 값, 아니면 기본값 0)
+            bit = (force_bit_value >= 0) ? (unsigned int)force_bit_value : 0;
+        } else {
+            bit = (sketches[b] > 0.0f) ? 1 : 0;
+        }
         p_idx = (p_idx << 1) + (bit ^ (p_idx & 1));
     }
+
     partition_indices[(doc_idx * num_reps + rep_idx) * max_len + token_idx] = p_idx;
-    
-    int proj_offset = ((doc_idx * num_reps + rep_idx) * max_len + token_idx) * proj_dim;
-    
-    if (use_identity) {
-        for (int d = 0; d < proj_dim; d++) {
-            projected_out[proj_offset + d] = emb[d];
-        }
-    } else {
-        const float* ams_mat = &ams_matrices[rep_idx * dim * proj_dim];
-        for (int p = 0; p < proj_dim; p++) {
-            float val = 0.0f;
-            for (int d = 0; d < dim; d++) {
-                val += emb[d] * ams_mat[d * proj_dim + p];
-            }
-            projected_out[proj_offset + p] = val;
-        }
-    }
 }
-''', 'simhash_projection_multi_rep')
+''', 'simhash_partition_multi_rep')
 
 
 # Kernel 2: Scatter-add with shared memory
@@ -192,6 +153,80 @@ void compute_averages(
 }
 ''', 'compute_averages')
 
+# Kernel 4: Fill empty partitions
+FILL_EMPTY_PARTITIONS_KERNEL = cp.RawKernel(r'''
+extern "C" __global__
+void fill_empty_partitions(
+    float* __restrict__ partition_sums,
+    const int* __restrict__ partition_counts,
+    const float* __restrict__ sketches,
+    const float* __restrict__ projected,
+    const int* __restrict__ doc_lengths,
+    const unsigned char* __restrict__ partition_bits_table,
+    const int num_docs,
+    const int num_reps,
+    const int num_partitions,
+    const int max_len,
+    const int num_bits,
+    const int proj_dim
+) {
+    int global_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_partitions = num_docs * num_reps * num_partitions;
+    
+    if (global_id >= total_partitions) return;
+    
+    int p_idx = global_id % num_partitions;
+    int temp = global_id / num_partitions;
+    int rep_idx = temp % num_reps;
+    int doc_idx = temp / num_reps;
+    
+    int count_offset = (doc_idx * num_reps + rep_idx) * num_partitions + p_idx;
+    int count = partition_counts[count_offset];
+    
+    // Only process empty partitions
+    if (count > 0) return;
+    
+    int doc_len = doc_lengths[doc_idx];
+    if (doc_len == 0) return;
+    
+    // Get target bits for this partition from table
+    const unsigned char* target_bits = &partition_bits_table[p_idx * num_bits];
+    
+    // Find nearest point by computing Hamming distance
+    int min_dist = num_bits + 1;
+    int nearest_token_idx = -1;
+    
+    for (int token_idx = 0; token_idx < doc_len; token_idx++) {
+        int sketch_offset = ((doc_idx * num_reps + rep_idx) * max_len + token_idx) * num_bits;
+        const float* sketch = &sketches[sketch_offset];
+        
+        // Compute Hamming distance
+        int dist = 0;
+        for (int b = 0; b < num_bits; b++) {
+            unsigned char sketch_bit = (sketch[b] > 0.0f) ? 1 : 0;
+            if (sketch_bit != target_bits[b]) {
+                dist++;
+            }
+        }
+        
+        if (dist < min_dist) {
+            min_dist = dist;
+            nearest_token_idx = token_idx;
+        }
+    }
+    
+    // Fill empty partition with nearest point's projected values
+    if (nearest_token_idx >= 0) {
+        int proj_offset = ((doc_idx * num_reps + rep_idx) * max_len + nearest_token_idx) * proj_dim;
+        int sum_offset = count_offset * proj_dim;
+        
+        for (int d = 0; d < proj_dim; d++) {
+            partition_sums[sum_offset + d] = projected[proj_offset + d];
+        }
+    }
+}
+''', 'fill_empty_partitions')
+
 class EncodingType(Enum):
     DEFAULT_SUM = 0
     AVERAGE = 1
@@ -223,10 +258,65 @@ def _gray_code_to_binary(num: int) -> int:
         mask >>= 1
     return num
 
+def _simhash_partition_index_gray(sketch_vector) -> int:
+    """Compute Gray code partition index from sketch vector (supports both numpy and cupy arrays)."""
+    partition_index = 0
+    # Convert to numpy if cupy array
+    if hasattr(sketch_vector, 'get'):  # cupy array
+        sketch_vector = cp.asnumpy(sketch_vector)
+    for val in sketch_vector:
+        partition_index = _append_to_gray_code(partition_index, val > 0)
+    return partition_index
+
+def _partition_bits_table(num_bits: int) -> np.ndarray:
+    """
+    Returns an array of shape [num_partitions, num_bits] with binary bits (0/1)
+    corresponding to *binary* code for each partition index where the index was
+    originally generated as Gray code (Gray->Binary performed here).
+    """
+    P = 1 << num_bits
+    gray = np.arange(P, dtype=np.uint32)
+    binary = gray.copy()
+    g = gray.copy()
+    # vectorized gray->binary via iterative XOR with right shift
+    while True:
+        g >>= 1
+        if not g.any():
+            break
+        binary ^= g
+    shifts = np.arange(num_bits - 1, -1, -1, dtype=np.uint32)
+    bits = ((binary[:, None] >> shifts[None, :]) & 1).astype(np.uint8)  # [P, b]
+    return bits
+
+def _distance_to_simhash_partition(sketch_vector, partition_index: int) -> int:
+    """Compute Hamming distance to partition (supports both numpy and cupy arrays)."""
+    num_projections = sketch_vector.size
+    binary_representation = _gray_code_to_binary(partition_index)
+    # Convert to numpy if cupy array
+    if hasattr(sketch_vector, 'get'):  # cupy array
+        sketch_vector = cp.asnumpy(sketch_vector)
+    sketch_bits = (sketch_vector > 0).astype(int)
+    binary_array = (binary_representation >> np.arange(num_projections - 1, -1, -1)) & 1
+    return int(np.sum(sketch_bits != binary_array))
+
+def _apply_count_sketch_to_vector(
+    input_vector: np.ndarray, final_dimension: int, seed: int
+) -> np.ndarray:
+    """Apply count sketch projection (supports both numpy and cupy arrays)."""
+    # Convert to numpy if cupy array
+    if hasattr(input_vector, 'get'):  # cupy array
+        input_vector = cp.asnumpy(input_vector)
+    rng = np.random.default_rng(seed)
+    out = np.zeros(final_dimension, dtype=np.float32)
+    indices = rng.integers(0, final_dimension, size=input_vector.shape[0])
+    signs = rng.choice([-1.0, 1.0], size=input_vector.shape[0])
+    np.add.at(out, indices, signs * input_vector)
+    return out
+
 def _simhash_matrix_from_seed_gpu(
     dimension: int, num_projections: int, seed: int
 ) -> cp.ndarray:
-    """Generate SimHash matrix on GPU"""
+    #Generate SimHash matrix on GPU
     rng = cp.random.default_rng(seed)
 
     # 평균 0, 표준편차 1인 가우시안
@@ -240,7 +330,7 @@ def _simhash_matrix_from_seed_gpu(
 def _ams_projection_matrix_from_seed_gpu(
     dimension: int, projection_dim: int, seed: int
 ) -> cp.ndarray:
-    """Generate AMS projection matrix on GPU"""
+    #Generate AMS projection matrix on GPU
     rng = cp.random.default_rng(seed)
     out = cp.zeros((dimension, projection_dim), dtype=cp.float32)
     indices = rng.integers(0, projection_dim, size=dimension)
@@ -255,7 +345,7 @@ def _ams_projection_matrix_from_seed_gpu(
 
 
 def _pad_doc_embeddings(doc_embeddings_list: List[np.ndarray]) -> tuple:
-    """Pad document embeddings to uniform length"""
+    #Pad document embeddings to uniform length
     doc_lengths = np.array([doc.shape[0] for doc in doc_embeddings_list], dtype=np.int32)
     max_len = int(doc_lengths.max())
     num_docs = len(doc_embeddings_list)
@@ -271,7 +361,7 @@ def _pad_doc_embeddings(doc_embeddings_list: List[np.ndarray]) -> tuple:
 def generate_query_fde(
     point_cloud: np.ndarray, config: FixedDimensionalEncodingConfig
 ) -> np.ndarray:
-    """Generates a Fixed Dimensional Encoding for a query point cloud (using SUM)."""
+    #Generates a Fixed Dimensional Encoding for a query point cloud (using SUM).
     if config.fill_empty_partitions:
         raise ValueError(
             "Query FDE generation does not support 'fill_empty_partitions'."
@@ -305,53 +395,148 @@ def _generate_fde_internal(
         )
 
     final_fde_dim = config.num_repetitions * num_partitions * projection_dim
-    out_fde = np.zeros(final_fde_dim, dtype=np.float32)
+    out_fde_gpu = cp.zeros(final_fde_dim, dtype=cp.float32)
 
+    # Convert input to GPU
+    point_cloud_gpu = cp.asarray(point_cloud.astype(np.float32))
+    
+    # Query는 단일 쿼리이므로 num_docs=1, max_len=num_points
+    num_docs = 1
+    max_len = num_points
+    doc_lengths_gpu = cp.array([num_points], dtype=cp.int32)
+
+    # Prepare all random matrices for all repetitions at once
+    simhash_matrices_list = []
+    ams_matrices_list = []
+    
     for rep_num in range(config.num_repetitions):
         current_seed = config.seed + rep_num
-
-        sketches = point_cloud @ _simhash_matrix_from_seed(
+        simhash_mat_gpu = _simhash_matrix_from_seed_gpu(
             original_dim, config.num_simhash_projections, current_seed
         )
-
-        if use_identity_proj:
-            projected_matrix = point_cloud
-        elif config.projection_type == ProjectionType.AMS_SKETCH:
-            ams_matrix = _ams_projection_matrix_from_seed(
+        simhash_matrices_list.append(simhash_mat_gpu)
+        
+        if not use_identity_proj:
+            ams_matrix_gpu = _ams_projection_matrix_from_seed_gpu(
                 original_dim, projection_dim, current_seed
             )
-            projected_matrix = point_cloud @ ams_matrix
+            ams_matrices_list.append(ams_matrix_gpu)
+    
+    # Stack matrices: [num_reps, dim, num_bits] or [num_reps, dim, proj_dim]
+    simhash_matrices_gpu = cp.stack(simhash_matrices_list, axis=0)  # [num_reps, dim, num_bits]
+    if not use_identity_proj:
+        ams_matrices_gpu = cp.stack(ams_matrices_list, axis=0)  # [num_reps, dim, proj_dim]
+    else:
+        ams_matrices_gpu = None
 
-        rep_fde_sum = np.zeros(num_partitions * projection_dim, dtype=np.float32)
-        partition_counts = np.zeros(num_partitions, dtype=np.int32)
-        partition_indices = np.array(
-            [_simhash_partition_index_gray(sketches[i]) for i in range(num_points)]
+    # Prepare data structures for kernel calls (batch format: [num_docs=1, num_reps, max_len, ...])
+    sketches_batch_gpu = cp.zeros((num_docs, config.num_repetitions, max_len, config.num_simhash_projections), dtype=cp.float32)
+    projected_batch_gpu = cp.zeros((num_docs, config.num_repetitions, max_len, projection_dim), dtype=cp.float32)
+    partition_indices_batch_gpu = cp.zeros((num_docs, config.num_repetitions, max_len), dtype=cp.int32)
+    partition_sums_batch_gpu = cp.zeros((num_docs, config.num_repetitions, num_partitions, projection_dim), dtype=cp.float32)
+    partition_counts_batch_gpu = cp.zeros((num_docs, config.num_repetitions, num_partitions), dtype=cp.int32)
+
+    # Compute SimHash and Projection for all repetitions (same pattern as document batch processing)
+    # 1-Dimensional Embedding으로 펼치기: T = num_points
+    total_tokens = num_points
+    dim = original_dim
+    num_bits = config.num_simhash_projections
+    reps = config.num_repetitions
+    
+    point_cloud_2d = point_cloud_gpu.reshape(total_tokens, dim)  # (T, D)
+    
+    for rep_idx in range(reps):
+        # SimHash: (T, D) @ (D, num_bits) -> (T, num_bits)
+        simhash_mat_rep = simhash_matrices_gpu[rep_idx]  # (D, num_bits)
+        sketches_rep = point_cloud_2d @ simhash_mat_rep  # (T, num_bits)
+        
+        # (1, num_points, num_bits)로 reshape 후, rep 축에 넣기
+        sketches_rep_4d = sketches_rep.reshape(num_docs, max_len, num_bits)
+        sketches_batch_gpu[:, rep_idx, :, :] = sketches_rep_4d
+        
+        # Projection: identity or AMS
+        if use_identity_proj:
+            # projection이 필요없는 경우 그대로 복사
+            projected_batch_gpu[:, rep_idx, :, :] = point_cloud_gpu.reshape(num_docs, max_len, dim)
+        else:
+            ams_mat_rep = ams_matrices_gpu[rep_idx]  # (D, proj_dim)
+            proj_rep = point_cloud_2d @ ams_mat_rep  # (T, proj_dim)
+            proj_rep_4d = proj_rep.reshape(num_docs, max_len, projection_dim)
+            projected_batch_gpu[:, rep_idx, :, :] = proj_rep_4d
+
+    # Call SIMHASH_PARTITION_KERNEL for all repetitions at once
+    total_tokens_all_reps = num_docs * config.num_repetitions * max_len
+    threads_per_block = 256
+    num_blocks = (total_tokens_all_reps + threads_per_block - 1) // threads_per_block
+    
+    SIMHASH_PARTITION_KERNEL(
+        (num_blocks,), (threads_per_block,),
+        (sketches_batch_gpu, doc_lengths_gpu, partition_indices_batch_gpu,
+         num_docs, max_len, config.num_simhash_projections, config.num_repetitions,
+         -1, -1)  # ignore_bit=-1, force_bit_value=-1 (no bit ablation for queries)
+    )
+    cp.cuda.Device().synchronize()
+
+    # Call SCATTER_ADD_KERNEL for all repetitions
+    shared_mem_size = (num_partitions * projection_dim * 4) + (num_partitions * 4)  # floats + ints
+    grid_dim = (num_docs, config.num_repetitions)
+    
+    SCATTER_ADD_KERNEL(
+        grid_dim, (threads_per_block,),
+        (projected_batch_gpu, partition_indices_batch_gpu, doc_lengths_gpu,
+         partition_sums_batch_gpu, partition_counts_batch_gpu,
+         num_docs, config.num_repetitions, max_len, projection_dim, num_partitions),
+        shared_mem=shared_mem_size
+    )
+    cp.cuda.Device().synchronize()
+
+    # Call AVERAGE_KERNEL if needed
+    '''
+    if config.encoding_type == EncodingType.AVERAGE:
+        total_partitions = num_docs * config.num_repetitions * num_partitions
+        num_blocks = (total_partitions + threads_per_block - 1) // threads_per_block
+        
+        AVERAGE_KERNEL(
+            (num_blocks,), (threads_per_block,),
+            (partition_sums_batch_gpu, partition_counts_batch_gpu, num_docs, config.num_repetitions,
+             num_partitions, projection_dim)
         )
+        cp.cuda.Device().synchronize()
 
-        for i in range(num_points):
-            start_idx = partition_indices[i] * projection_dim
-            rep_fde_sum[start_idx : start_idx + projection_dim] += projected_matrix[i]
-            partition_counts[partition_indices[i]] += 1
-
-        if config.encoding_type == EncodingType.AVERAGE:
-            for i in range(num_partitions):
-                start_idx = i * projection_dim
-                if partition_counts[i] > 0:
-                    rep_fde_sum[start_idx : start_idx + projection_dim] /= (
-                        partition_counts[i]
-                    )
-                elif config.fill_empty_partitions and num_points > 0:
-                    distances = [
-                        _distance_to_simhash_partition(sketches[j], i)
-                        for j in range(num_points)
-                    ]
-                    nearest_point_idx = np.argmin(distances)
-                    rep_fde_sum[start_idx : start_idx + projection_dim] = (
-                        projected_matrix[nearest_point_idx]
-                    )
-
+    # Handle fill_empty_partitions if needed (CPU fallback for now, can be optimized later)
+    
+    if config.fill_empty_partitions and config.encoding_type == EncodingType.AVERAGE:
+        # Check for empty partitions and fill them
+        for rep_num in range(config.num_repetitions):
+            for p_idx in range(num_partitions):
+                count = int(partition_counts_batch_gpu[0, rep_num, p_idx])
+                if count == 0 and num_points > 0:
+                    # Find nearest point (fallback to CPU for now)
+                    sketches_cpu = cp.asnumpy(sketches_batch_gpu[0, rep_num, :, :])
+                    nearest_point_idx = None
+                    min_dist = float('inf')
+                    for j in range(num_points):
+                        dist = _distance_to_simhash_partition(sketches_cpu[j], p_idx)
+                        if dist < min_dist:
+                            min_dist = dist
+                            nearest_point_idx = j
+                    if nearest_point_idx is not None:
+                        # partition_sums_batch_gpu shape: [num_docs, num_reps, num_partitions, proj_dim]
+                        partition_sums_batch_gpu[0, rep_num, p_idx, :] = (
+                            projected_batch_gpu[0, rep_num, nearest_point_idx, :]
+                        )
+    '''
+    
+    # Reshape results to final FDE format
+    for rep_num in range(config.num_repetitions):
         rep_start_index = rep_num * num_partitions * projection_dim
-        out_fde[rep_start_index : rep_start_index + rep_fde_sum.size] = rep_fde_sum
+        # partition_sums_batch_gpu shape: [num_docs, num_reps, num_partitions, proj_dim]
+        # Flatten: [num_partitions, projection_dim] -> [num_partitions * projection_dim]
+        rep_fde_flat = partition_sums_batch_gpu[0, rep_num].reshape(-1)
+        out_fde_gpu[rep_start_index : rep_start_index + rep_fde_flat.size] = rep_fde_flat
+
+    # Convert final result to CPU
+    out_fde = cp.asnumpy(out_fde_gpu)
 
     if config.final_projection_dimension and config.final_projection_dimension > 0:
         return _apply_count_sketch_to_vector(
@@ -367,8 +552,10 @@ _GPU_CUMULATIVE_TIMING = {
     'prep_time': 0.0,
     'upload_time': 0.0,
     'simhash_time': 0.0,
+    'partition_time': 0.0,
     'scatter_time': 0.0,
     'average_time': 0.0,
+    'fill_time': 0.0,
     'compute_time': 0.0,
     'download_time': 0.0,
     'reshape_time': 0.0,
@@ -382,41 +569,28 @@ def reset_gpu_cumulative_timing():
         'prep_time': 0.0,
         'upload_time': 0.0,
         'simhash_time': 0.0,
+        'partition_time': 0.0,
         'scatter_time': 0.0,
         'average_time': 0.0,
+        'fill_time': 0.0,
         'compute_time': 0.0,
         'download_time': 0.0,
         'reshape_time': 0.0,
         'flush_time': 0.0,
     }
 
-def generate_document_fde_batch_gpu_3stream_pipeline(
+def generate_document_fde_batch_gpu_3stage(
     doc_embeddings_list: List[np.ndarray],
     config: FixedDimensionalEncodingConfig,
     fde_memmap,  # Pre-created memmap from main code
     batch_start_idx: int,  # Where to write in memmap
     *,
+    ignore_bit=None,
+    force_bit_value=None,  # 0 or 1 to force the bit value when ignore_bit is set
     mini_batch_size: int = 500,  # Ignored - kept for backward compatibility
     log_every: int = 1000
 ) -> dict:
-    """
-    🚀 GPU FDE generation processing all documents in a single batch!
-    
-    Strategy:
-    1. Process all documents in one batch (no mini-batching)
-    2. Use 3 CUDA streams for upload, compute, and download
-    3. Transfer results to CPU and write to memmap after all computation is done
-    
-    Args:
-        doc_embeddings_list: All document embeddings
-        config: FDE configuration
-        fde_memmap: Pre-allocated memmap for output
-        batch_start_idx: Starting index in memmap
-        mini_batch_size: Ignored (kept for backward compatibility)
-        
-    Returns:
-        Timing statistics dictionary
-    """
+
     start_time = time.perf_counter()
     num_docs = len(doc_embeddings_list)
     
@@ -427,6 +601,13 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     logging.info(f"[FDE 3-Stream] Processing {num_docs} documents with 3-stream pipeline")
     logging.info(f"[FDE 3-Stream] Processing all documents in a single batch (no mini-batching)")
     
+    # Bit ablation 설정 로깅
+    if ignore_bit is not None:
+        forced_val = force_bit_value if force_bit_value is not None else 0
+        logging.info(f"[FDE 3-Stream] Bit ablation enabled: ignore_bit={ignore_bit}, force_bit_value={forced_val}")
+    else:
+        logging.info(f"[FDE 3-Stream] Bit ablation disabled")
+    
     # Configuration
     use_identity_proj = config.projection_type == ProjectionType.DEFAULT_IDENTITY
     projection_dim = config.dimension if use_identity_proj else config.projection_dimension
@@ -435,7 +616,7 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     final_fde_dim = config.num_repetitions * final_fde_dim_per_rep
     
     # ==========================================
-    # Prepare random matrices (shared across all batches)
+    # Random matrices preparation (shared across all batches)
     # ==========================================
     prep_start = time.perf_counter()
     
@@ -476,8 +657,10 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     # Timing accumulators
     upload_time = 0.0
     simhash_time = 0.0
+    partition_time = 0.0
     scatter_time = 0.0
     average_time = 0.0
+    fill_time = 0.0
     compute_time = 0.0
     download_time = 0.0
     reshape_time = 0.0
@@ -513,24 +696,61 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     compute_start = time.perf_counter()
     
     with stream_compute:
-        # Kernel 1: SimHash
+        # ===========================
+        # 3-1. CuPy GEMM -> projection 수행
+        # ===========================
         simhash_start = time.perf_counter()
         
-        total_tokens = num_docs * config.num_repetitions * max_len
-        threads_per_block = 256
-        num_blocks = (total_tokens + threads_per_block - 1) // threads_per_block
+        # 1-Dimensional Embedding으로 펼치기: T = num_docs * max_len
+        total_tokens = num_docs * max_len
+        dim = config.dimension
+        num_bits = config.num_simhash_projections
+        reps = config.num_repetitions
         
-        SIMHASH_KERNEL(
-            (num_blocks,), (threads_per_block,),
-            (embeddings_gpu, doc_lengths_gpu, simhash_matrices_gpu,
-             ams_matrices_gpu if ams_matrices_gpu is not None else cp.zeros(1, dtype=cp.float32),
-             sketches_gpu, projected_gpu, partition_indices_gpu,
-             num_docs, max_len, config.dimension, config.num_simhash_projections,
-             projection_dim, config.num_repetitions,
-             1 if use_identity_proj else 0)
-        )
+        embeddings_2d = embeddings_gpu.reshape(total_tokens, dim)  # (T, D)
+        
+        for rep_idx in range(reps):
+            # SimHash: (T, D) @ (D, num_bits) -> (T, num_bits)
+            simhash_mat_rep = simhash_matrices_gpu[rep_idx]             # (D, num_bits)
+            sketches_rep = embeddings_2d @ simhash_mat_rep              # (T, num_bits)
+            
+            # (num_docs, max_len, num_bits)로 reshape 후, rep 축에 넣기
+            sketches_rep_4d = sketches_rep.reshape(num_docs, max_len, num_bits)
+            sketches_gpu[:, rep_idx, :, :] = sketches_rep_4d
+            
+            # Projection: identity or AMS
+            if use_identity_proj:
+                # projection이 필요없는 경우 그대로 복사
+                projected_gpu[:, rep_idx, :, :] = embeddings_gpu
+            else:
+                ams_mat_rep = ams_matrices_gpu[rep_idx]                 # (D, proj_dim)
+                proj_rep = embeddings_2d @ ams_mat_rep                  # (T, proj_dim)
+                proj_rep_4d = proj_rep.reshape(num_docs, max_len, projection_dim)
+                projected_gpu[:, rep_idx, :, :] = proj_rep_4d
+        
         stream_compute.synchronize()
         simhash_time = time.perf_counter() - simhash_start
+
+        # ===========================
+        # 3-2. partition 계산 커널 호출
+        # ===========================
+        partition_start = time.perf_counter()
+        
+        total_tokens_all_reps = num_docs * reps * max_len
+        threads_per_block = 256
+        num_blocks = (total_tokens_all_reps + threads_per_block - 1) // threads_per_block
+        
+        # Bit ablation 파라미터 설정
+        ignore_bit_val = ignore_bit if ignore_bit is not None else -1
+        force_bit_val = force_bit_value if force_bit_value is not None else -1
+        
+        SIMHASH_PARTITION_KERNEL(
+            (num_blocks,), (threads_per_block,),
+            (sketches_gpu, doc_lengths_gpu, partition_indices_gpu,
+             num_docs, max_len, num_bits, reps, ignore_bit_val, force_bit_val)
+        )
+        stream_compute.synchronize()
+        partition_time = time.perf_counter() - partition_start
         
         # Kernel 2: Scatter-add
         scatter_start = time.perf_counter()
@@ -560,8 +780,33 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
         )
         stream_compute.synchronize()
         average_time = time.perf_counter() - average_start
+        
+        # Kernel 4: Fill empty partitions if needed
+        fill_time = 0.0
+        if config.fill_empty_partitions and config.encoding_type == EncodingType.AVERAGE:
+            fill_start = time.perf_counter()
+            
+            # Precompute partition bits table (CPU, then transfer to GPU)
+            part_bits_tbl = _partition_bits_table(config.num_simhash_projections)
+            part_bits_tbl_gpu = cp.asarray(part_bits_tbl, dtype=cp.uint8)  # [num_partitions, num_bits]
+            
+            # Call FILL_EMPTY_PARTITIONS_KERNEL
+            total_partitions = num_docs * config.num_repetitions * num_partitions
+            num_blocks = (total_partitions + threads_per_block - 1) // threads_per_block
+            
+            FILL_EMPTY_PARTITIONS_KERNEL(
+                (num_blocks,), (threads_per_block,),
+                (partition_sums_gpu, partition_counts_gpu, sketches_gpu, projected_gpu,
+                 doc_lengths_gpu, part_bits_tbl_gpu,
+                 num_docs, config.num_repetitions, num_partitions, max_len,
+                 config.num_simhash_projections, projection_dim)
+            )
+            stream_compute.synchronize()
+            fill_time = time.perf_counter() - fill_start
+            if fill_time > 0:
+                logging.info(f"[FDE 3-Stream] Fill empty partitions: {fill_time:.3f}s")
     
-    compute_time = simhash_time + scatter_time + average_time
+    compute_time = simhash_time + scatter_time + average_time + fill_time
     
     # ========================================
     # STEP 4: Download to CPU (Stream 3)
@@ -610,8 +855,10 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     _GPU_CUMULATIVE_TIMING['prep_time'] += prep_time
     _GPU_CUMULATIVE_TIMING['upload_time'] += upload_time
     _GPU_CUMULATIVE_TIMING['simhash_time'] += simhash_time
+    _GPU_CUMULATIVE_TIMING['partition_time'] += partition_time
     _GPU_CUMULATIVE_TIMING['scatter_time'] += scatter_time
     _GPU_CUMULATIVE_TIMING['average_time'] += average_time
+    _GPU_CUMULATIVE_TIMING['fill_time'] += fill_time
     _GPU_CUMULATIVE_TIMING['compute_time'] += compute_time
     _GPU_CUMULATIVE_TIMING['download_time'] += download_time
     _GPU_CUMULATIVE_TIMING['reshape_time'] += reshape_time
@@ -620,7 +867,7 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     # Get cumulative times (across all batches) - use dictionary directly to avoid duplication
     cumul = _GPU_CUMULATIVE_TIMING
     
-    # Try to get final memmap flush time from main_weight module
+    # Final memmap flush time from main_weight module
     final_memmap_flush_time = 0.0
     try:
         import sys
@@ -660,9 +907,12 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     logging.info("=" * 80)
     logging.info(f"Data preparation:    {prep_time:8.3f}s  ({prep_time/total_time*100:5.1f}%)")
     logging.info(f"Upload time:         {upload_time:8.3f}s  ({upload_time/total_time*100:5.1f}%)")
-    logging.info(f"SimHash kernel:      {simhash_time:8.3f}s  ({simhash_time/total_time*100:5.1f}%)")
+    logging.info(f"SimHash(Projection) kernel:      {simhash_time:8.3f}s  ({simhash_time/total_time*100:5.1f}%)")
+    logging.info(f"Partition kernel:    {partition_time:8.3f}s  ({partition_time/total_time*100:5.1f}%)")
     logging.info(f"Scatter-add kernel:  {scatter_time:8.3f}s  ({scatter_time/total_time*100:5.1f}%)")
     logging.info(f"Average kernel:      {average_time:8.3f}s  ({average_time/total_time*100:5.1f}%)")
+    if fill_time > 0:
+        logging.info(f"Fill empty kernel:   {fill_time:8.3f}s  ({fill_time/total_time*100:5.1f}%)")
     logging.info(f"Compute time:        {compute_time:8.3f}s  ({compute_time/total_time*100:5.1f}%)")
     logging.info(f"Download time:       {download_time:8.3f}s  ({download_time/total_time*100:5.1f}%)")
     logging.info(f"Reshape time:        {reshape_time:8.3f}s  ({reshape_time/total_time*100:5.1f}%)")
@@ -674,9 +924,12 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     logging.info("-" * 80)
     logging.info(f"   Data preparation (cumulative):    {cumul['prep_time']:8.3f}s")
     logging.info(f"   Upload (cumulative):             {cumul['upload_time']:8.3f}s")
-    logging.info(f"   SimHash kernel (cumulative):      {cumul['simhash_time']:8.3f}s")
+    logging.info(f"   SimHash(Projection) kernel (cumulative):      {cumul['simhash_time']:8.3f}s")
+    logging.info(f"   Partition kernel (cumulative):    {cumul['partition_time']:8.3f}s")
     logging.info(f"   Scatter-add kernel (cumulative): {cumul['scatter_time']:8.3f}s")
     logging.info(f"   Average kernel (cumulative):     {cumul['average_time']:8.3f}s")
+    if cumul.get('fill_time', 0) > 0:
+        logging.info(f"   Fill empty kernel (cumulative):   {cumul['fill_time']:8.3f}s")
     logging.info(f"   Compute (cumulative):           {cumul['compute_time']:8.3f}s")
     logging.info(f"   Download (cumulative):          {cumul['download_time']:8.3f}s")
     logging.info(f"   Reshape (cumulative):          {cumul['reshape_time']:8.3f}s")
@@ -696,12 +949,15 @@ def generate_document_fde_batch_gpu_3stream_pipeline(
     del embeddings_gpu, doc_lengths_gpu, sketches_gpu, projected_gpu, partition_indices_gpu
     del partition_counts_gpu, partition_sums_gpu
     
+    
     return {
         'prep_time': prep_time,
         'upload_time': upload_time,
         'simhash_time': simhash_time,
+        'partition_time': partition_time,
         'scatter_time': scatter_time,
         'average_time': average_time,
+        'fill_time': fill_time,
         'compute_time': compute_time,
         'download_time': download_time,
         'reshape_time': reshape_time,
