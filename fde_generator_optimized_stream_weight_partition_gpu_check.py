@@ -223,14 +223,12 @@ def _apply_count_sketch_to_vector(
 def _simhash_matrix_from_seed_gpu(
     dimension: int, num_projections: int, seed: int
 ) -> cp.ndarray:
-    #Generate SimHash matrix on GPU
-    rng = cp.random.default_rng(seed)
+    # === CPU에서 난수 생성 (numpy) ===
+    rng = np.random.default_rng(seed)
+    simhash_cpu = rng.standard_normal((dimension, num_projections)).astype(np.float32)
 
-    # 평균 0, 표준편차 1인 가우시안
-    simhash_mat = rng.standard_normal(
-        size=(dimension, num_projections),
-        dtype=cp.float32,
-    )
+    # === GPU로 그대로 복사 ===
+    simhash_mat = cp.asarray(simhash_cpu)
     return simhash_mat
 
 

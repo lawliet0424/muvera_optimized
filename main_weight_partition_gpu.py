@@ -273,6 +273,7 @@ class ColbertFdeRetriever:
         self._meta_path = os.path.join(self._cache_dir, "meta.json")
         self._queries_dir = os.path.join(self._cache_dir, "queries")
         self._doc_emb_dir = os.path.join(self._cache_dir, "doc_embeds")
+        self._partition_indices_path = os.path.join(self._cache_dir, "partition_indices.txt")
 
         os.makedirs(self._cache_dir, exist_ok=True)
         os.makedirs(self._queries_dir, exist_ok=True)
@@ -352,6 +353,7 @@ class ColbertFdeRetriever:
                         ignore_bit=k,
                         force_bit_value=forced_value,
                         log_every=min(1000, len(batch_embeddings)),
+                        partition_indices_output_path=self._partition_indices_path,
                     )
                     
                     # 배치 완료 후 메모리 해제
@@ -709,6 +711,7 @@ class ColbertFdeRetriever:
                 fde_index,  # 전체 memmap 전달
                 batch_start,  # 시작 인덱스
                 log_every=ATOMIC_BATCH_SIZE,
+                partition_indices_output_path=self._partition_indices_path,
             )
             
             # GPU 버전은 memmap에 직접 쓰므로, 결과를 다시 읽어올 필요 없음

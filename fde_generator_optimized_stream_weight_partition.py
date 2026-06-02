@@ -63,8 +63,8 @@ def _apply_count_sketch_to_vector(
 ) -> np.ndarray:
     rng = np.random.default_rng(seed)
     out = np.zeros(final_dimension, dtype=np.float32)
-    indices = rng.integers(0, final_dimension, size=input_vector.shape[0])
-    signs = rng.choice([-1.0, 1.0], size=input_vector.shape[0])
+    sign_bits = rng.integers(0, 2, size=dimension, dtype=np.int8)
+    signs = (sign_bits * 2 - 1).astype(np.float32)
     np.add.at(out, indices, signs * input_vector)
     return out
 
@@ -197,6 +197,7 @@ def _generate_fde_internal(
             rep_fde_sum[start_idx : start_idx + projection_dim] += projected_matrix[i]
             partition_counts[partition_indices[i]] += 1
 
+        
         if config.encoding_type == EncodingType.AVERAGE:
             for i in range(num_partitions):
                 start_idx = i * projection_dim
@@ -213,6 +214,7 @@ def _generate_fde_internal(
                     rep_fde_sum[start_idx : start_idx + projection_dim] = (
                         projected_matrix[nearest_point_idx]
                     )
+        
 
         rep_start_index = rep_num * num_partitions * projection_dim
         out_fde[rep_start_index : rep_start_index + rep_fde_sum.size] = rep_fde_sum
@@ -265,7 +267,8 @@ def generate_document_fde_batch(
     memmap_path: Optional[str] = None,           # e.g., "/path/to/fde_index.mmap"
     max_bytes_in_memory: int = 2 * 1024**3,      # 2GB safety threshold
     log_every: int = 10000,                       # progress logging
-    flush_interval: int = 1000                    # 배치별 flush 간격
+    flush_interval: int = 1000,                   # 배치별 flush 간격
+    partition_indices_output_path: Optional[str] = None  # Path to save partition_indices as txt
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     Streaming implementation: no np.vstack; processes docs one by one.
@@ -344,6 +347,18 @@ def generate_document_fde_batch(
     # partition_counter[doc_idx][rep_num][partition_idx] = count
     # 3D numpy array: (num_docs, num_repetitions, num_partitions)
     partition_counter = np.zeros((num_docs, config.num_repetitions, num_partitions), dtype=np.int32)
+
+    # Initialize partition_indices output file if requested
+    if partition_indices_output_path is not None:
+        logging.info(f"[FDE Batch] Will save partition_indices to: {partition_indices_output_path}")
+        os.makedirs(os.path.dirname(partition_indices_output_path) if os.path.dirname(partition_indices_output_path) else '.', exist_ok=True)
+        # Write header if new file
+        if not os.path.exists(partition_indices_output_path):
+            with open(partition_indices_output_path, 'w', encoding='utf-8') as f:
+                f.write("doc_idx\trep_idx\ttoken_idx\tpartition_index\tdoc_length\n")
+            logging.info(f"[FDE Batch] Created partition_indices file: {partition_indices_output_path}")
+    else:
+        logging.info("[FDE Batch] partition_indices_output_path is None, skipping partition indices saving")
 
     # For each repetition, stream over docs
     for rep_num in range(config.num_repetitions):
@@ -439,6 +454,18 @@ def generate_document_fde_batch(
             # Write this doc's rep chunk
             out_fdes[d, rep_offset:rep_offset + final_fde_dim_per_rep] = rep_sum.reshape(-1)
 
+            # Save partition_indices to txt if requested
+            if partition_indices_output_path is not None:
+                try:
+                    # Append mode (file should already exist with header from initialization)
+                    with open(partition_indices_output_path, 'a', encoding='utf-8') as f:
+                        for token_idx in range(Ld):
+                            p_idx_val = int(p_idx[token_idx])
+                            f.write(f"{d}\t{rep_num}\t{token_idx}\t{p_idx_val}\t{Ld}\n")
+                        f.flush()  # Ensure data is written immediately
+                except Exception as e:
+                    logging.warning(f"[FDE Batch] Failed to write partition_indices: {e}")
+
             # 배치별 flush (메모리 효율성)
             if (d + 1) % flush_interval == 0 and memmap_used and hasattr(out_fdes, "flush"):
                 out_fdes.flush()
@@ -494,6 +521,9 @@ def generate_document_fde_batch(
     logging.info(f"[FDE Batch] Batch generation completed in {total_time:.3f}s")
     logging.info(f"[FDE Batch] Output shape: {out_fdes.shape}")
     logging.info(f"[FDE Batch] Partition counter shape: {partition_counter.shape}")
+    
+    if partition_indices_output_path is not None:
+        logging.info(f"[FDE Batch] Partition indices saved to {partition_indices_output_path}")
 
     return out_fdes, partition_counter
 

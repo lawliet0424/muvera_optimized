@@ -36,7 +36,7 @@ from fde_generator_optimized_stream_weight_partition import (
 # ======================
 # --- Configuration ----
 # ======================
-DATASET_REPO_ID = "arguana"
+DATASET_REPO_ID = "scidocs"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
 TOP_K = 10
 FILENAME = "main_weight_partition"
@@ -272,6 +272,7 @@ class ColbertFdeRetriever:
         self._meta_path = os.path.join(self._cache_dir, "meta.json")
         self._queries_dir = os.path.join(self._cache_dir, "queries")
         self._doc_emb_dir = os.path.join(self._cache_dir, "doc_embeds")
+        self._partition_indices_path = os.path.join(self._cache_dir, "partition_indices.txt")
 
         os.makedirs(self._cache_dir, exist_ok=True)
         os.makedirs(self._queries_dir, exist_ok=True)
@@ -328,7 +329,8 @@ class ColbertFdeRetriever:
                     self.doc_config,
                     ignore_bit=k,
                     force_bit_value=forced_value,
-                    memmap_path=None
+                    memmap_path=None,
+                    partition_indices_output_path=self._partition_indices_path
                 )
                 
                 # 튜플인 경우 첫 번째 요소만 사용 (partition_counter는 ablation에서 사용하지 않음)
@@ -670,9 +672,9 @@ class ColbertFdeRetriever:
             batch_fde_result = generate_document_fde_batch(
                 batch_embeddings,
                 self.doc_config,
-
                 memmap_path=batch_memmap_path,  # 배치별 memmap 사용
                 max_bytes_in_memory=512 * 1024**2,  # 512MB로 제한
+                partition_indices_output_path=self._partition_indices_path,
                 log_every=ATOMIC_BATCH_SIZE,
                 flush_interval=ATOMIC_BATCH_SIZE,
             )
@@ -903,11 +905,23 @@ if __name__ == "__main__":
         # 지연시간 로그 파일 초기화
         latency_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_simhash{args.simhash}_rerank{args.rerank}_proj{args.projection}")
         os.makedirs(latency_dir, exist_ok=True)
-        with open(os.path.join(latency_dir, "latency.tsv"), "w", encoding="utf-8") as f:
-            f.write("QID\tSearch\tRerank\n")
+        logging.info(f"[Search] Creating latency directory: {latency_dir}")
+        logging.info(f"[Search] QUERY_SEARCH_DIR: {QUERY_SEARCH_DIR}")
+        logging.info(f"[Search] Full latency_dir path: {os.path.abspath(latency_dir)}")
+        
+        # latency.tsv 파일 초기화 (retriever의 _log_latency가 append 모드로 사용하므로 여기서는 헤더만 작성)
+        # retriever의 latency_log_path와 동일한 경로를 사용해야 함
+        latency_file = os.path.join(latency_dir, "latency.tsv")
+        if not os.path.exists(latency_file):
+            with open(latency_file, "w", encoding="utf-8") as f:
+                f.write("QID\tSearch\tRerank\n")
+            logging.info(f"[Search] Created latency.tsv file: {latency_file}")
+        else:
+            logging.info(f"[Search] latency.tsv file already exists: {latency_file}")
         
         # 결과 저장 파일 경로 설정
         results_file = os.path.join(latency_dir, "results.txt")
+        logging.info(f"[Search] Results will be saved to: {results_file}")
 
         for query_id, query_text in queries.items():
             start_time = time.perf_counter()
@@ -986,10 +1000,17 @@ if __name__ == "__main__":
         print(line)
     
     # 파일에 저장
-    with open(results_file, "w", encoding="utf-8") as f:
-        f.write("\n".join(report_lines))
-    
-    logging.info(f"Results saved to: {results_file}")
+    try:
+        with open(results_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(report_lines))
+        logging.info(f"Results saved to: {results_file}")
+    except Exception as e:
+        logging.error(f"Failed to save results to {results_file}: {e}")
+        # Fallback: 현재 디렉토리에 저장
+        fallback_file = f"results_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+        with open(fallback_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(report_lines))
+        logging.info(f"Results saved to fallback location: {fallback_file}")
 
     # Run Bit Ablation
     logging.info("--- PHASE 3: BIT ABLATION ---")
@@ -1154,6 +1175,7 @@ if __name__ == "__main__":
     # Repetition ablation 결과 저장
     repetition_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{args.rep}_simhash{args.simhash}_rerank{args.rerank}_proj{args.projection}")
     os.makedirs(repetition_dir, exist_ok=True)
+    logging.info(f"[Repetition Ablation] Saving results to: {repetition_dir}")
     
     # JSON 형식으로 저장
     repetition_json_path = os.path.join(repetition_dir, "repetition_ablation_results.json")

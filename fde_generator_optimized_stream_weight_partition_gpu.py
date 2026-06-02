@@ -302,47 +302,50 @@ def _distance_to_simhash_partition(sketch_vector, partition_index: int) -> int:
 def _apply_count_sketch_to_vector(
     input_vector: np.ndarray, final_dimension: int, seed: int
 ) -> np.ndarray:
-    """Apply count sketch projection (supports both numpy and cupy arrays)."""
-    # Convert to numpy if cupy array
-    if hasattr(input_vector, 'get'):  # cupy array
+    """
+    이미 NumPy RNG를 쓰고 있어서 seed만 동일하면 CPU/GPU 동일해질 수 있음.
+    (cupy 입력이면 numpy로 내려서 처리)
+    """
+    if hasattr(input_vector, "get"):  # cupy array
         input_vector = cp.asnumpy(input_vector)
+
     rng = np.random.default_rng(seed)
     out = np.zeros(final_dimension, dtype=np.float32)
     indices = rng.integers(0, final_dimension, size=input_vector.shape[0])
-    signs = rng.choice([-1.0, 1.0], size=input_vector.shape[0])
+    signs = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=input_vector.shape[0])
     np.add.at(out, indices, signs * input_vector)
     return out
 
 def _simhash_matrix_from_seed_gpu(
     dimension: int, num_projections: int, seed: int
 ) -> cp.ndarray:
-    #Generate SimHash matrix on GPU
-    rng = cp.random.default_rng(seed)
+    """
+    Method 1) NumPy에서 난수 생성(=CPU와 동일 RNG) -> GPU로 전송
+    CPU의 _simhash_matrix_from_seed()와 동일 분포/동일 seed 시 동일 값.
+    """
+    rng = np.random.default_rng(seed)
+    simhash_np = rng.normal(loc=0.0, scale=1.0, size=(dimension, num_projections)).astype(np.float32)
 
-    # 평균 0, 표준편차 1인 가우시안
-    simhash_mat = rng.standard_normal(
-        size=(dimension, num_projections),
-        dtype=cp.float32,
-    )
-    return simhash_mat
+    #비교
+    return cp.asarray(simhash_np)
 
 
 def _ams_projection_matrix_from_seed_gpu(
     dimension: int, projection_dim: int, seed: int
 ) -> cp.ndarray:
-    #Generate AMS projection matrix on GPU
-    rng = cp.random.default_rng(seed)
-    out = cp.zeros((dimension, projection_dim), dtype=cp.float32)
-    indices = rng.integers(0, projection_dim, size=dimension)
+    """
+    Method 1) NumPy에서 indices/signs 생성 -> GPU로 전송
+    CPU의 _ams_projection_matrix_from_seed()와 동일 로직으로 맞춤.
+    """
+    rng = np.random.default_rng(seed)
+    indices_cpu = rng.integers(0, projection_dim, size=dimension, dtype=np.int64)
+    sign_bits = rng.integers(0, 2, size=dimension, dtype=np.int8)
+    signs_cpu = (sign_bits * 2 - 1).astype(np.float32)
 
-    # 0 또는 1 샘플링
-    sign_bits = rng.integers(0, 2, size=dimension, dtype=cp.int8)
-    # 0 -> -1, 1 -> +1 로 매핑
-    signs = (sign_bits * 2 - 1).astype(cp.float32)
-    
-    out[cp.arange(dimension), indices] = signs
-    return out
+    out_cpu = np.zeros((dimension, projection_dim), dtype=np.float32)
+    out_cpu[np.arange(dimension), indices_cpu] = signs_cpu
 
+    return cp.asarray(out_cpu)
 
 def _pad_doc_embeddings(doc_embeddings_list: List[np.ndarray]) -> tuple:
     #Pad document embeddings to uniform length
@@ -588,7 +591,8 @@ def generate_document_fde_batch_gpu_3stage(
     ignore_bit=None,
     force_bit_value=None,  # 0 or 1 to force the bit value when ignore_bit is set
     mini_batch_size: int = 500,  # Ignored - kept for backward compatibility
-    log_every: int = 1000
+    log_every: int = 1000,
+    partition_indices_output_path: Optional[str] = None  # Path to save partition_indices as txt
 ) -> dict:
 
     start_time = time.perf_counter()
@@ -815,6 +819,8 @@ def generate_document_fde_batch_gpu_3stage(
     
     with stream_download:
         partition_sums_cpu = cp.asnumpy(partition_sums_gpu)
+        # Download partition_indices for saving to txt (always download, save conditionally)
+        partition_indices_cpu = cp.asnumpy(partition_indices_gpu) if partition_indices_output_path is not None else None
     
     stream_download.synchronize()
     download_time = time.perf_counter() - download_start
@@ -842,6 +848,38 @@ def generate_document_fde_batch_gpu_3stage(
     fde_memmap.flush()  # Flush to disk
     
     flush_time = time.perf_counter() - flush_start
+    
+    # ========================================
+    # STEP 7: Save partition_indices to txt (if requested)
+    # ========================================
+    if partition_indices_output_path is not None:
+        logging.info(f"[FDE 3-Stream] partition_indices_output_path: {partition_indices_output_path}")
+        logging.info(f"[FDE 3-Stream] partition_indices_cpu is None: {partition_indices_cpu is None}")
+    
+    if partition_indices_output_path is not None and partition_indices_cpu is not None:
+        save_start = time.perf_counter()
+        os.makedirs(os.path.dirname(partition_indices_output_path) if os.path.dirname(partition_indices_output_path) else '.', exist_ok=True)
+        
+        # Append mode if file exists (for batch processing), otherwise create new
+        mode = 'a' if os.path.exists(partition_indices_output_path) else 'w'
+        
+        with open(partition_indices_output_path, mode, encoding='utf-8') as f:
+            # Write header if new file
+            if mode == 'w':
+                f.write("doc_idx\trep_idx\ttoken_idx\tpartition_index\tdoc_length\n")
+            
+            # Write partition indices for each document, repetition, and token
+            for doc_idx in range(num_docs):
+                doc_len = doc_lengths[doc_idx]
+                for rep_idx in range(config.num_repetitions):
+                    for token_idx in range(doc_len):
+                        p_idx = int(partition_indices_cpu[doc_idx, rep_idx, token_idx])
+                        # Global doc index (batch_start_idx + doc_idx)
+                        global_doc_idx = batch_start_idx + doc_idx
+                        f.write(f"{global_doc_idx}\t{rep_idx}\t{token_idx}\t{p_idx}\t{doc_len}\n")
+        
+        save_time = time.perf_counter() - save_start
+        logging.info(f"[FDE 3-Stream] Saved partition_indices to {partition_indices_output_path} in {save_time:.3f}s")
     
     logging.info(f"[FDE 3-Stream] Completed: upload={upload_time:.3f}s, compute={compute_time:.3f}s, download={download_time:.3f}s, reshape={reshape_time:.3f}s, flush={flush_time:.3f}s")
     
