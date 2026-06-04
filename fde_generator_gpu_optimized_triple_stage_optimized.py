@@ -5,9 +5,7 @@ import os
 import numpy as np
 import cupy as cp
 from typing import Optional, List
-import threading
-from queue import Queue
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import Enum
 
 # ==============================================================================
@@ -145,6 +143,72 @@ void compute_averages(
 }
 ''', 'compute_averages')
 
+# Kernel 4: Fill empty partitions (sketch Hamming vs gray->binary target bits; matches CPU)
+FILL_EMPTY_PARTITIONS_KERNEL = cp.RawKernel(r'''
+extern "C" __global__
+void fill_empty_partitions(
+    float* __restrict__ partition_sums,
+    const int* __restrict__ partition_counts,
+    const float* __restrict__ sketches,
+    const float* __restrict__ projected,
+    const int* __restrict__ doc_lengths,
+    const unsigned char* __restrict__ partition_bits_table,
+    const int num_docs,
+    const int num_reps,
+    const int num_partitions,
+    const int max_len,
+    const int num_bits,
+    const int proj_dim
+) {
+    int global_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_partitions = num_docs * num_reps * num_partitions;
+
+    if (global_id >= total_partitions) return;
+
+    int p_idx = global_id % num_partitions;
+    int temp = global_id / num_partitions;
+    int rep_idx = temp % num_reps;
+    int doc_idx = temp / num_reps;
+
+    int count_offset = (doc_idx * num_reps + rep_idx) * num_partitions + p_idx;
+    if (partition_counts[count_offset] > 0) return;
+
+    int doc_len = doc_lengths[doc_idx];
+    if (doc_len == 0) return;
+
+    const unsigned char* target_bits = &partition_bits_table[p_idx * num_bits];
+    int min_dist = num_bits + 1;
+    int nearest_token_idx = -1;
+
+    for (int token_idx = 0; token_idx < doc_len; token_idx++) {
+        int sketch_offset = ((doc_idx * num_reps + rep_idx) * max_len + token_idx) * num_bits;
+        const float* sketch = &sketches[sketch_offset];
+
+        int dist = 0;
+        for (int b = 0; b < num_bits; b++) {
+            unsigned char sketch_bit = (sketch[b] > 0.0f) ? 1 : 0;
+            if (sketch_bit != target_bits[b]) {
+                dist++;
+            }
+        }
+
+        if (dist < min_dist) {
+            min_dist = dist;
+            nearest_token_idx = token_idx;
+        }
+    }
+
+    if (nearest_token_idx >= 0) {
+        int proj_offset = ((doc_idx * num_reps + rep_idx) * max_len + nearest_token_idx) * proj_dim;
+        int sum_offset = count_offset * proj_dim;
+        for (int d = 0; d < proj_dim; d++) {
+            partition_sums[sum_offset + d] = projected[proj_offset + d];
+        }
+    }
+}
+''', 'fill_empty_partitions')
+
+
 class EncodingType(Enum):
     DEFAULT_SUM = 0
     AVERAGE = 1
@@ -166,47 +230,6 @@ class FixedDimensionalEncodingConfig:
     final_projection_dimension: Optional[int] = None
 
 
-def _append_to_gray_code(gray_code: int, bit: bool) -> int:
-    return (gray_code << 1) + (int(bit) ^ (gray_code & 1))
-
-def _gray_code_to_binary(num: int) -> int:
-    mask = num >> 1
-    while mask != 0:
-        num = num ^ mask
-        mask >>= 1
-    return num
-
-def _simhash_matrix_from_seed_gpu(
-    dimension: int, num_projections: int, seed: int
-) -> cp.ndarray:
-    #Generate SimHash matrix on GPU
-    rng = cp.random.default_rng(seed)
-
-    # 평균 0, 표준편차 1인 가우시안
-    simhash_mat = rng.standard_normal(
-        size=(dimension, num_projections),
-        dtype=cp.float32,
-    )
-    return simhash_mat
-
-
-def _ams_projection_matrix_from_seed_gpu(
-    dimension: int, projection_dim: int, seed: int
-) -> cp.ndarray:
-    #Generate AMS projection matrix on GPU
-    rng = cp.random.default_rng(seed)
-    out = cp.zeros((dimension, projection_dim), dtype=cp.float32)
-    indices = rng.integers(0, projection_dim, size=dimension)
-
-    # 0 또는 1 샘플링
-    sign_bits = rng.integers(0, 2, size=dimension, dtype=cp.int8)
-    # 0 -> -1, 1 -> +1 로 매핑
-    signs = (sign_bits * 2 - 1).astype(cp.float32)
-    
-    out[cp.arange(dimension), indices] = signs
-    return out
-
-
 def _pad_doc_embeddings(doc_embeddings_list: List[np.ndarray]) -> tuple:
     #Pad document embeddings to uniform length
     doc_lengths = np.array([doc.shape[0] for doc in doc_embeddings_list], dtype=np.int32)
@@ -220,98 +243,57 @@ def _pad_doc_embeddings(doc_embeddings_list: List[np.ndarray]) -> tuple:
     
     return padded, doc_lengths, max_len
 
+# ==============================================================================
+# Helper functions
+# ==============================================================================
 
-def generate_query_fde(
-    point_cloud: np.ndarray, config: FixedDimensionalEncodingConfig
+def _simhash_matrix_from_seed(
+    dimension: int, num_projections: int, seed: int
 ) -> np.ndarray:
-    #Generates a Fixed Dimensional Encoding for a query point cloud (using SUM).
-    if config.fill_empty_partitions:
-        raise ValueError(
-            "Query FDE generation does not support 'fill_empty_partitions'."
-        )
-    query_config = replace(config, encoding_type=EncodingType.DEFAULT_SUM)
-    return _generate_fde_internal(point_cloud, query_config)
+    rng = np.random.default_rng(seed)
+    return rng.normal(loc=0.0, scale=1.0, size=(dimension, num_projections)).astype(
+        np.float32
+    )
 
-# -----------------------------
-# Core FDE generation routines
-# -----------------------------
-def _generate_fde_internal(
-    point_cloud: np.ndarray, config: FixedDimensionalEncodingConfig
+def _ams_projection_matrix_from_seed(
+    dimension: int, projection_dim: int, seed: int
 ) -> np.ndarray:
-    if point_cloud.ndim != 2 or point_cloud.shape[1] != config.dimension:
-        raise ValueError(
-            f"Input data shape {point_cloud.shape} is inconsistent with config dimension {config.dimension}."
-        )
-    if not (0 <= config.num_simhash_projections < 32):
-        raise ValueError(
-            f"num_simhash_projections must be in [0, 31]: {config.num_simhash_projections}"
-        )
+    rng = np.random.default_rng(seed)
+    out = np.zeros((dimension, projection_dim), dtype=np.float32)
+    indices = rng.integers(0, projection_dim, size=dimension)
+    signs = rng.choice([-1.0, 1.0], size=dimension)
+    out[np.arange(dimension), indices] = signs
+    return out
 
-    num_points, original_dim = point_cloud.shape
-    num_partitions = 2**config.num_simhash_projections
+def _apply_count_sketch_to_vector(
+    input_vector: np.ndarray, final_dimension: int, seed: int
+) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    out = np.zeros(final_dimension, dtype=np.float32)
+    indices = rng.integers(0, final_dimension, size=input_vector.shape[0])
+    signs = rng.choice([-1.0, 1.0], size=input_vector.shape[0])
+    np.add.at(out, indices, signs * input_vector)
+    return out
 
-    use_identity_proj = config.projection_type == ProjectionType.DEFAULT_IDENTITY
-    projection_dim = original_dim if use_identity_proj else config.projection_dimension
-    if not use_identity_proj and (not projection_dim or projection_dim <= 0):
-        raise ValueError(
-            "A positive projection_dimension is required for non-identity projections."
-        )
-
-    final_fde_dim = config.num_repetitions * num_partitions * projection_dim
-    out_fde = np.zeros(final_fde_dim, dtype=np.float32)
-
-    for rep_num in range(config.num_repetitions):
-        current_seed = config.seed + rep_num
-
-        sketches = point_cloud @ _simhash_matrix_from_seed(
-            original_dim, config.num_simhash_projections, current_seed
-        )
-
-        if use_identity_proj:
-            projected_matrix = point_cloud
-        elif config.projection_type == ProjectionType.AMS_SKETCH:
-            ams_matrix = _ams_projection_matrix_from_seed(
-                original_dim, projection_dim, current_seed
-            )
-            projected_matrix = point_cloud @ ams_matrix
-
-        rep_fde_sum = np.zeros(num_partitions * projection_dim, dtype=np.float32)
-        partition_counts = np.zeros(num_partitions, dtype=np.int32)
-        partition_indices = np.array(
-            [_simhash_partition_index_gray(sketches[i]) for i in range(num_points)]
-        )
-
-        for i in range(num_points):
-            start_idx = partition_indices[i] * projection_dim
-            rep_fde_sum[start_idx : start_idx + projection_dim] += projected_matrix[i]
-            partition_counts[partition_indices[i]] += 1
-
-        if config.encoding_type == EncodingType.AVERAGE:
-            for i in range(num_partitions):
-                start_idx = i * projection_dim
-                if partition_counts[i] > 0:
-                    rep_fde_sum[start_idx : start_idx + projection_dim] /= (
-                        partition_counts[i]
-                    )
-                elif config.fill_empty_partitions and num_points > 0:
-                    distances = [
-                        _distance_to_simhash_partition(sketches[j], i)
-                        for j in range(num_points)
-                    ]
-                    nearest_point_idx = np.argmin(distances)
-                    rep_fde_sum[start_idx : start_idx + projection_dim] = (
-                        projected_matrix[nearest_point_idx]
-                    )
-
-        rep_start_index = rep_num * num_partitions * projection_dim
-        out_fde[rep_start_index : rep_start_index + rep_fde_sum.size] = rep_fde_sum
-
-    if config.final_projection_dimension and config.final_projection_dimension > 0:
-        return _apply_count_sketch_to_vector(
-            out_fde, config.final_projection_dimension, config.seed
-        )
-
-    return out_fde
+def _partition_bits_table(num_bits: int) -> np.ndarray:
+    """
+    Returns an array of shape [num_partitions, num_bits] with binary bits (0/1)
+    corresponding to *binary* code for each partition index where the index was
+    originally generated as Gray code (Gray->Binary performed here).
+    """
+    P = 1 << num_bits
+    gray = np.arange(P, dtype=np.uint32)
+    binary = gray.copy()
+    g = gray.copy()
+    # vectorized gray->binary via iterative XOR with right shift
+    while True:
+        g >>= 1
+        if not g.any():
+            break
+        binary ^= g
+    shifts = np.arange(num_bits - 1, -1, -1, dtype=np.uint32)
+    bits = ((binary[:, None] >> shifts[None, :]) & 1).astype(np.uint8)  # [P, b]
+    return bits
 
 # ==============================================================================
 # Global variables for cumulative timing across all batches
@@ -323,6 +305,7 @@ _GPU_CUMULATIVE_TIMING = {
     'partition_time': 0.0,
     'scatter_time': 0.0,
     'average_time': 0.0,
+    'fill_time': 0.0,
     'compute_time': 0.0,
     'download_time': 0.0,
     'reshape_time': 0.0,
@@ -339,11 +322,171 @@ def reset_gpu_cumulative_timing():
         'partition_time': 0.0,
         'scatter_time': 0.0,
         'average_time': 0.0,
+        'fill_time': 0.0,
         'compute_time': 0.0,
         'download_time': 0.0,
         'reshape_time': 0.0,
         'flush_time': 0.0,
     }
+
+def generate_query_fde_gpu(
+    point_cloud: np.ndarray, config: FixedDimensionalEncodingConfig
+) -> np.ndarray:
+    """
+    Query FDE on GPU: GEMM (SimHash + projection) + kernel 1 (partition) + kernel 2 (SUM).
+    No average (kernel 3) or fill-empty (kernel 4).
+    """
+    if config.fill_empty_partitions:
+        raise ValueError(
+            "Query FDE generation does not support 'fill_empty_partitions'."
+        )
+    if point_cloud.ndim != 2 or point_cloud.shape[1] != config.dimension:
+        raise ValueError(
+            f"Input shape {point_cloud.shape} inconsistent with dimension {config.dimension}."
+        )
+    if not (0 <= config.num_simhash_projections < 32):
+        raise ValueError(
+            f"num_simhash_projections must be in [0, 31]: {config.num_simhash_projections}"
+        )
+
+    use_identity_proj = config.projection_type == ProjectionType.DEFAULT_IDENTITY
+    projection_dim = (
+        config.dimension if use_identity_proj else config.projection_dimension
+    )
+    if not use_identity_proj and (not projection_dim or projection_dim <= 0):
+        raise ValueError(
+            "A positive projection_dimension is required for non-identity projections."
+        )
+
+    num_tokens = point_cloud.shape[0]
+    num_docs = 1
+    max_len = num_tokens
+    num_bits = config.num_simhash_projections
+    reps = config.num_repetitions
+    num_partitions = 2 ** num_bits
+    final_fde_dim_per_rep = num_partitions * projection_dim
+    final_fde_dim = reps * final_fde_dim_per_rep
+
+    simhash_matrices_list = []
+    ams_matrices_list = []
+    for rep_num in range(reps):
+        current_seed = config.seed + rep_num
+        simhash_matrices_list.append(
+            cp.asarray(
+                _simhash_matrix_from_seed(
+                    config.dimension, num_bits, current_seed
+                ),
+                dtype=cp.float32,
+            )
+        )
+        if not use_identity_proj:
+            ams_matrices_list.append(
+                cp.asarray(
+                    _ams_projection_matrix_from_seed(
+                        config.dimension, projection_dim, current_seed
+                    ),
+                    dtype=cp.float32,
+                )
+            )
+    simhash_matrices_gpu = cp.stack(simhash_matrices_list, axis=0)
+    ams_matrices_gpu = (
+        cp.stack(ams_matrices_list, axis=0) if not use_identity_proj else None
+    )
+
+    embeddings_gpu = cp.asarray(
+        point_cloud.astype(np.float32, copy=False)[np.newaxis, :, :]
+    )
+    doc_lengths_gpu = cp.asarray(np.array([num_tokens], dtype=np.int32))
+
+    sketches_gpu = cp.zeros((num_docs, reps, max_len, num_bits), dtype=cp.float32)
+    projected_gpu = cp.zeros(
+        (num_docs, reps, max_len, projection_dim), dtype=cp.float32
+    )
+    partition_indices_gpu = cp.zeros((num_docs, reps, max_len), dtype=cp.int32)
+    partition_sums_gpu = cp.zeros(
+        (num_docs, reps, num_partitions, projection_dim), dtype=cp.float32
+    )
+    partition_counts_gpu = cp.zeros(
+        (num_docs, reps, num_partitions), dtype=cp.int32
+    )
+
+    dim = config.dimension
+    embeddings_2d = embeddings_gpu.reshape(num_docs * max_len, dim)
+
+    for rep_idx in range(reps):
+        sketches_rep = embeddings_2d @ simhash_matrices_gpu[rep_idx]
+        sketches_gpu[:, rep_idx, :, :] = sketches_rep.reshape(
+            num_docs, max_len, num_bits
+        )
+        if use_identity_proj:
+            projected_gpu[:, rep_idx, :, :] = embeddings_gpu
+        else:
+            proj_rep = embeddings_2d @ ams_matrices_gpu[rep_idx]
+            projected_gpu[:, rep_idx, :, :] = proj_rep.reshape(
+                num_docs, max_len, projection_dim
+            )
+
+    threads_per_block = 256
+    total_tokens_all_reps = num_docs * reps * max_len
+    num_blocks = (total_tokens_all_reps + threads_per_block - 1) // threads_per_block
+
+    SIMHASH_PARTITION_KERNEL(
+        (num_blocks,),
+        (threads_per_block,),
+        (
+            sketches_gpu,
+            doc_lengths_gpu,
+            partition_indices_gpu,
+            num_docs,
+            max_len,
+            num_bits,
+            reps,
+        ),
+    )
+
+    shared_mem_size = (num_partitions * projection_dim * 4) + (num_partitions * 4)
+    SCATTER_ADD_KERNEL(
+        (num_docs, reps),
+        (threads_per_block,),
+        (
+            projected_gpu,
+            partition_indices_gpu,
+            doc_lengths_gpu,
+            partition_sums_gpu,
+            partition_counts_gpu,
+            num_docs,
+            reps,
+            max_len,
+            projection_dim,
+            num_partitions,
+        ),
+        shared_mem=shared_mem_size,
+    )
+
+    cp.cuda.Stream.null.synchronize()
+
+    partition_sums_cpu = cp.asnumpy(partition_sums_gpu)
+    out_fde = np.zeros(final_fde_dim, dtype=np.float32)
+    for rep_idx in range(reps):
+        rep_offset = rep_idx * final_fde_dim_per_rep
+        out_fde[rep_offset : rep_offset + final_fde_dim_per_rep] = (
+            partition_sums_cpu[0, rep_idx].reshape(-1)
+        )
+
+    if config.final_projection_dimension and config.final_projection_dimension > 0:
+        out_fde = _apply_count_sketch_to_vector(
+            out_fde, config.final_projection_dimension, config.seed
+        )
+
+    return out_fde
+
+
+def generate_query_fde(
+    point_cloud: np.ndarray, config: FixedDimensionalEncodingConfig
+) -> np.ndarray:
+    """Alias for GPU query FDE (SUM via kernel 1 + 2)."""
+    return generate_query_fde_gpu(point_cloud, config)
+
 
 def generate_document_fde_batch_gpu_3stage(
     doc_embeddings_list: List[np.ndarray],
@@ -379,23 +522,29 @@ def generate_document_fde_batch_gpu_3stage(
     
     simhash_matrices_list = []
     ams_matrices_list = []
-    
+
     for rep_num in range(config.num_repetitions):
         current_seed = config.seed + rep_num
-        simhash_mat = _simhash_matrix_from_seed_gpu(
-            config.dimension, config.num_simhash_projections, current_seed
+        simhash_mat = cp.asarray(
+            _simhash_matrix_from_seed(
+                config.dimension, config.num_simhash_projections, current_seed
+            ),
+            dtype=cp.float32,
         )
         simhash_matrices_list.append(simhash_mat)
-        
+
         if not use_identity_proj:
-            ams_mat = _ams_projection_matrix_from_seed_gpu(
-                config.dimension, projection_dim, current_seed
+            ams_mat = cp.asarray(
+                _ams_projection_matrix_from_seed(
+                    config.dimension, projection_dim, current_seed
+                ),
+                dtype=cp.float32,
             )
             ams_matrices_list.append(ams_mat)
-    
+
     simhash_matrices_gpu = cp.stack(simhash_matrices_list, axis=0)
     ams_matrices_gpu = cp.stack(ams_matrices_list, axis=0) if not use_identity_proj else None
-    
+
     prep_time = time.perf_counter() - prep_start
     logging.info(f"[FDE 3-Stream] Random matrices prepared in {prep_time:.3f}s")
     
@@ -417,6 +566,7 @@ def generate_document_fde_batch_gpu_3stage(
     partition_time = 0.0
     scatter_time = 0.0
     average_time = 0.0
+    fill_time = 0.0
     compute_time = 0.0
     download_time = 0.0
     reshape_time = 0.0
@@ -435,105 +585,154 @@ def generate_document_fde_batch_gpu_3stage(
     with stream_upload:
         embeddings_gpu = cp.asarray(padded_embeddings)
         doc_lengths_gpu = cp.asarray(doc_lengths)
-        
-        # Allocate output buffers
-        sketches_gpu = cp.zeros((num_docs, config.num_repetitions, max_len, config.num_simhash_projections), dtype=cp.float32)
-        projected_gpu = cp.zeros((num_docs, config.num_repetitions, max_len, projection_dim), dtype=cp.float32)
-        partition_indices_gpu = cp.zeros((num_docs, config.num_repetitions, max_len), dtype=cp.int32)
-        partition_sums_gpu = cp.zeros((num_docs, config.num_repetitions, num_partitions, projection_dim), dtype=cp.float32)
-        partition_counts_gpu = cp.zeros((num_docs, config.num_repetitions, num_partitions), dtype=cp.int32)
-    
+
+        sketches_gpu = cp.zeros(
+            (num_docs, config.num_repetitions, max_len, config.num_simhash_projections),
+            dtype=cp.float32,
+        )
+        projected_gpu = cp.zeros(
+            (num_docs, config.num_repetitions, max_len, projection_dim), dtype=cp.float32
+        )
+        partition_indices_gpu = cp.zeros(
+            (num_docs, config.num_repetitions, max_len), dtype=cp.int32
+        )
+        partition_sums_gpu = cp.zeros(
+            (num_docs, config.num_repetitions, num_partitions, projection_dim),
+            dtype=cp.float32,
+        )
+        partition_counts_gpu = cp.zeros(
+            (num_docs, config.num_repetitions, num_partitions), dtype=cp.int32
+        )
+
     stream_upload.synchronize()
     upload_time = time.perf_counter() - upload_start
     
     # ========================================
     # STEP 3: Compute on GPU (Stream 2)
     # ========================================
-    compute_start = time.perf_counter()
-    
     with stream_compute:
-        # ===========================
-        # 3-1. CuPy GEMM -> projection 수행
-        # ===========================
         simhash_start = time.perf_counter()
-        
-        # 1-Dimensional Embedding으로 펼치기: T = num_docs * max_len
+
         total_tokens = num_docs * max_len
         dim = config.dimension
         num_bits = config.num_simhash_projections
         reps = config.num_repetitions
-        
-        embeddings_2d = embeddings_gpu.reshape(total_tokens, dim)  # (T, D)
-        
+
+        embeddings_2d = embeddings_gpu.reshape(total_tokens, dim)
+
         for rep_idx in range(reps):
-            # SimHash: (T, D) @ (D, num_bits) -> (T, num_bits)
-            simhash_mat_rep = simhash_matrices_gpu[rep_idx]             # (D, num_bits)
-            sketches_rep = embeddings_2d @ simhash_mat_rep              # (T, num_bits)
-            
-            # (num_docs, max_len, num_bits)로 reshape 후, rep 축에 넣기
-            sketches_rep_4d = sketches_rep.reshape(num_docs, max_len, num_bits)
-            sketches_gpu[:, rep_idx, :, :] = sketches_rep_4d
-            
-            # Projection: identity or AMS
+            simhash_mat_rep = simhash_matrices_gpu[rep_idx]
+            sketches_rep = embeddings_2d @ simhash_mat_rep
+            sketches_gpu[:, rep_idx, :, :] = sketches_rep.reshape(num_docs, max_len, num_bits)
+
             if use_identity_proj:
-                # projection이 필요없는 경우 그대로 복사
                 projected_gpu[:, rep_idx, :, :] = embeddings_gpu
             else:
-                ams_mat_rep = ams_matrices_gpu[rep_idx]                 # (D, proj_dim)
-                proj_rep = embeddings_2d @ ams_mat_rep                  # (T, proj_dim)
-                proj_rep_4d = proj_rep.reshape(num_docs, max_len, projection_dim)
-                projected_gpu[:, rep_idx, :, :] = proj_rep_4d
-        
+                ams_mat_rep = ams_matrices_gpu[rep_idx]
+                proj_rep = embeddings_2d @ ams_mat_rep
+                projected_gpu[:, rep_idx, :, :] = proj_rep.reshape(
+                    num_docs, max_len, projection_dim
+                )
+
         stream_compute.synchronize()
         simhash_time = time.perf_counter() - simhash_start
 
-        # ===========================
-        # 3-2. partition 계산 커널 호출
-        # ===========================
         partition_start = time.perf_counter()
-        
+
         total_tokens_all_reps = num_docs * reps * max_len
         threads_per_block = 256
         num_blocks = (total_tokens_all_reps + threads_per_block - 1) // threads_per_block
-        
+
         SIMHASH_PARTITION_KERNEL(
-            (num_blocks,), (threads_per_block,),
-            (sketches_gpu, doc_lengths_gpu, partition_indices_gpu,
-             num_docs, max_len, num_bits, reps)
+            (num_blocks,),
+            (threads_per_block,),
+            (
+                sketches_gpu,
+                doc_lengths_gpu,
+                partition_indices_gpu,
+                num_docs,
+                max_len,
+                num_bits,
+                reps,
+            ),
         )
         stream_compute.synchronize()
         partition_time = time.perf_counter() - partition_start
-        
-        # Kernel 2: Scatter-add
+
         scatter_start = time.perf_counter()
-        
+
         shared_mem_size = (num_partitions * projection_dim * 4) + (num_partitions * 4)
         grid_dim = (num_docs, config.num_repetitions)
-        
+
         SCATTER_ADD_KERNEL(
-            grid_dim, (threads_per_block,),
-            (projected_gpu, partition_indices_gpu, doc_lengths_gpu, partition_sums_gpu, partition_counts_gpu,
-             num_docs, config.num_repetitions, max_len, projection_dim, num_partitions),
-            shared_mem=shared_mem_size
+            grid_dim,
+            (threads_per_block,),
+            (
+                projected_gpu,
+                partition_indices_gpu,
+                doc_lengths_gpu,
+                partition_sums_gpu,
+                partition_counts_gpu,
+                num_docs,
+                config.num_repetitions,
+                max_len,
+                projection_dim,
+                num_partitions,
+            ),
+            shared_mem=shared_mem_size,
         )
         stream_compute.synchronize()
         scatter_time = time.perf_counter() - scatter_start
-        
-        # Kernel 3: Average
+
         average_start = time.perf_counter()
-        
+
         total_partitions = num_docs * config.num_repetitions * num_partitions
         num_blocks = (total_partitions + threads_per_block - 1) // threads_per_block
-        
+
         AVERAGE_KERNEL(
-            (num_blocks,), (threads_per_block,),
-            (partition_sums_gpu, partition_counts_gpu, num_docs, config.num_repetitions,
-             num_partitions, projection_dim)
+            (num_blocks,),
+            (threads_per_block,),
+            (
+                partition_sums_gpu,
+                partition_counts_gpu,
+                num_docs,
+                config.num_repetitions,
+                num_partitions,
+                projection_dim,
+            ),
         )
         stream_compute.synchronize()
         average_time = time.perf_counter() - average_start
-    
-    compute_time = simhash_time + scatter_time + average_time
+
+        if config.fill_empty_partitions:
+            fill_start = time.perf_counter()
+
+            part_bits_tbl_gpu = cp.asarray(
+                _partition_bits_table(config.num_simhash_projections),
+                dtype=cp.uint8,
+            )
+            FILL_EMPTY_PARTITIONS_KERNEL(
+                (num_blocks,),
+                (threads_per_block,),
+                (
+                    partition_sums_gpu,
+                    partition_counts_gpu,
+                    sketches_gpu,
+                    projected_gpu,
+                    doc_lengths_gpu,
+                    part_bits_tbl_gpu,
+                    num_docs,
+                    config.num_repetitions,
+                    num_partitions,
+                    max_len,
+                    num_bits,
+                    projection_dim,
+                ),
+            )
+            stream_compute.synchronize()
+            fill_time = time.perf_counter() - fill_start
+
+    compute_time = simhash_time + partition_time + scatter_time + average_time + fill_time
     
     # ========================================
     # STEP 4: Download to CPU (Stream 3)
@@ -556,16 +755,38 @@ def generate_document_fde_batch_gpu_3stage(
         for rep_idx in range(config.num_repetitions):
             rep_offset = rep_idx * final_fde_dim_per_rep
             fde_chunk = partition_sums_cpu[doc_idx, rep_idx].reshape(-1)
-            fde_cpu[doc_idx, rep_offset:rep_offset + final_fde_dim_per_rep] = fde_chunk
+            fde_cpu[doc_idx, rep_offset : rep_offset + final_fde_dim_per_rep] = fde_chunk
     
     reshape_time = time.perf_counter() - reshape_start
     
     # ========================================
-    # STEP 6: Write to memmap and flush
+    # STEP 6: Optional final count-sketch projection (CPU, matches stream batch)
+    # ========================================
+    if config.final_projection_dimension and config.final_projection_dimension > 0:
+        target_dim = config.final_projection_dimension
+        if fde_memmap.shape[1] != target_dim:
+            raise ValueError(
+                f"fde_memmap width {fde_memmap.shape[1]} must equal "
+                f"final_projection_dimension {target_dim}"
+            )
+        for doc_idx in range(num_docs):
+            fde_cpu[doc_idx] = _apply_count_sketch_to_vector(
+                fde_cpu[doc_idx], target_dim, config.seed
+            )
+
+    # ========================================
+    # STEP 7: Write to memmap and flush
     # ========================================
     flush_start = time.perf_counter()
-    
-    fde_memmap[batch_start_idx:batch_start_idx + num_docs] = fde_cpu
+
+    write_width = (
+        config.final_projection_dimension
+        if config.final_projection_dimension and config.final_projection_dimension > 0
+        else final_fde_dim
+    )
+    fde_memmap[batch_start_idx:batch_start_idx + num_docs, :write_width] = (
+        fde_cpu[:, :write_width]
+    )
     fde_memmap.flush()  # Flush to disk
     
     flush_time = time.perf_counter() - flush_start
@@ -585,6 +806,7 @@ def generate_document_fde_batch_gpu_3stage(
     _GPU_CUMULATIVE_TIMING['partition_time'] += partition_time
     _GPU_CUMULATIVE_TIMING['scatter_time'] += scatter_time
     _GPU_CUMULATIVE_TIMING['average_time'] += average_time
+    _GPU_CUMULATIVE_TIMING['fill_time'] += fill_time
     _GPU_CUMULATIVE_TIMING['compute_time'] += compute_time
     _GPU_CUMULATIVE_TIMING['download_time'] += download_time
     _GPU_CUMULATIVE_TIMING['reshape_time'] += reshape_time
@@ -637,6 +859,8 @@ def generate_document_fde_batch_gpu_3stage(
     logging.info(f"Partition kernel:    {partition_time:8.3f}s  ({partition_time/total_time*100:5.1f}%)")
     logging.info(f"Scatter-add kernel:  {scatter_time:8.3f}s  ({scatter_time/total_time*100:5.1f}%)")
     logging.info(f"Average kernel:      {average_time:8.3f}s  ({average_time/total_time*100:5.1f}%)")
+    if fill_time > 0.0:
+        logging.info(f"Fill-empty kernel:   {fill_time:8.3f}s  ({fill_time/total_time*100:5.1f}%)")
     logging.info(f"Compute time:        {compute_time:8.3f}s  ({compute_time/total_time*100:5.1f}%)")
     logging.info(f"Download time:       {download_time:8.3f}s  ({download_time/total_time*100:5.1f}%)")
     logging.info(f"Reshape time:        {reshape_time:8.3f}s  ({reshape_time/total_time*100:5.1f}%)")
@@ -652,6 +876,7 @@ def generate_document_fde_batch_gpu_3stage(
     logging.info(f"   Partition kernel (cumulative):    {cumul['partition_time']:8.3f}s")
     logging.info(f"   Scatter-add kernel (cumulative): {cumul['scatter_time']:8.3f}s")
     logging.info(f"   Average kernel (cumulative):     {cumul['average_time']:8.3f}s")
+    logging.info(f"   Fill-empty kernel (cumulative):  {cumul['fill_time']:8.3f}s")
     logging.info(f"   Compute (cumulative):           {cumul['compute_time']:8.3f}s")
     logging.info(f"   Download (cumulative):          {cumul['download_time']:8.3f}s")
     logging.info(f"   Reshape (cumulative):          {cumul['reshape_time']:8.3f}s")
@@ -679,6 +904,7 @@ def generate_document_fde_batch_gpu_3stage(
         'partition_time': partition_time,
         'scatter_time': scatter_time,
         'average_time': average_time,
+        'fill_time': fill_time,
         'compute_time': compute_time,
         'download_time': download_time,
         'reshape_time': reshape_time,
@@ -703,6 +929,7 @@ if __name__ == "__main__":
         num_simhash_projections=4,
         seed=42,
         encoding_type=EncodingType.AVERAGE,
+        fill_empty_partitions=True,
         projection_type=ProjectionType.AMS_SKETCH,
         projection_dimension=128,
     )
@@ -713,7 +940,7 @@ if __name__ == "__main__":
     fde_memmap = np.memmap("test_fde.mmap", mode="w+", dtype=np.float32, shape=(num_docs, final_fde_dim))
     
     logging.info("Testing 3-STREAM PIPELINE...")
-    stats = generate_document_fde_batch_gpu_3stream_pipeline(
+    stats = generate_document_fde_batch_gpu_3stage(
         test_embeddings,
         config,
         fde_memmap,

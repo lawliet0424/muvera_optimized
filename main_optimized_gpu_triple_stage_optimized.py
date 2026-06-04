@@ -29,16 +29,15 @@ from beir.retrieval.search.dense import DenseRetrievalExactSearch as DRES
 
 import argparse
 
-# FDE 구현 (GPU 버전 사용)
+# FDE 구현 (document batch + query FDE on GPU)
 from fde_generator_gpu_optimized_triple_stage_optimized import (
     FixedDimensionalEncodingConfig,
     EncodingType,
     ProjectionType,
-    generate_query_fde,
-    #generate_document_fde_batch,
-    _simhash_matrix_from_seed_gpu,
-    _ams_projection_matrix_from_seed_gpu,
-    generate_document_fde_batch_gpu_3stage
+    generate_query_fde_gpu,
+    generate_document_fde_batch_gpu_3stage,
+    _simhash_matrix_from_seed,
+    _ams_projection_matrix_from_seed,
 )
 
 # ======================
@@ -254,6 +253,7 @@ class ColbertFdeRetriever:
             num_repetitions=self.num_repetitions,
             num_simhash_projections=self.num_simhash_projections,
             seed=42,
+            encoding_type=EncodingType.AVERAGE,
             fill_empty_partitions=True,
             projection_type=projection_type,
             projection_dimension=projection_dimension,
@@ -408,6 +408,29 @@ class ColbertFdeRetriever:
         emb = np.load(emb_path) if os.path.exists(emb_path) else None
         fde = np.load(fde_path) if os.path.exists(fde_path) else None
         return emb, fde
+
+    def _query_fde_config(self) -> FixedDimensionalEncodingConfig:
+        """Query FDE: SUM encoding, no fill-empty (document config와 projection만 공유)."""
+        return replace(
+            self.doc_config,
+            encoding_type=EncodingType.DEFAULT_SUM,
+            fill_empty_partitions=False,
+        )
+
+    def _compute_query_fde(self, query_embeddings: np.ndarray) -> np.ndarray:
+        """GPU query FDE (GEMM + partition kernel + scatter-add SUM)."""
+        query_fde = generate_query_fde_gpu(
+            query_embeddings.astype(np.float32, copy=False),
+            self._query_fde_config(),
+        )
+        if query_fde.ndim != 1:
+            raise ValueError(f"Expected 1D query FDE, got shape {query_fde.shape}")
+        if self.fde_index is not None and query_fde.shape[0] != self.fde_index.shape[1]:
+            raise ValueError(
+                f"Query FDE dimension {query_fde.shape[0]} does not match "
+                f"document index dimension {self.fde_index.shape[1]}"
+            )
+        return query_fde
 
     # --------- Chamfer(MaxSim) ---------
     @staticmethod
@@ -700,15 +723,7 @@ class ColbertFdeRetriever:
                 continue
             query_embeddings_map = self.ranker.encode_queries(queries=[qtext])
             query_embeddings = to_numpy(next(iter(query_embeddings_map.values())))
-            query_config = replace(self.doc_config, fill_empty_partitions=False)
-            query_fde_result = generate_query_fde(query_embeddings, query_config)
-            
-            # query_fde_result가 튜플인 경우 첫 번째 요소만 사용
-            if isinstance(query_fde_result, tuple):
-                query_fde = query_fde_result[0]
-            else:
-                query_fde = query_fde_result
-
+            query_fde = self._compute_query_fde(query_embeddings)
             self._save_query_cache(key, query_embeddings, query_fde)
             missing += 1
         logging.info(f"[{self.__class__.__name__}] Precomputed {missing} uncached queries.")
@@ -727,15 +742,7 @@ class ColbertFdeRetriever:
         if cached_emb is None or cached_fde is None:
             query_embeddings_map = self.ranker.encode_queries(queries=[query])
             query_embeddings = to_numpy(next(iter(query_embeddings_map.values())))
-            query_config = replace(self.doc_config, fill_empty_partitions=False)
-            query_fde_result = generate_query_fde(query_embeddings, query_config)
-            
-            # query_fde_result가 튜플인 경우 첫 번째 요소만 사용
-            if isinstance(query_fde_result, tuple):
-                query_fde = query_fde_result[0]
-            else:
-                query_fde = query_fde_result
-            
+            query_fde = self._compute_query_fde(query_embeddings)
             self._save_query_cache(key, query_embeddings, query_fde)
         else:
             query_embeddings = cached_emb
