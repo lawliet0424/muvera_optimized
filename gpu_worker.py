@@ -12,8 +12,8 @@
 
 원본 파이썬 파일 작업 흐름 대비 구현 현황
 -------------------------------------------
-[구현됨]        ColBERT 모델 로드, FDE config 구성, embedding 수신/재조립,
-                누락 문서 ColBERT 배치 인코딩, generate_document_fde_batch_gpu_3stage 호출,
+[구현됨]        ColBERT 모델 로드, FDE config 구성, 원문 수신,
+                ColBERT 배치 인코딩, generate_document_fde_batch_gpu_3stage 호출,
                 GPU timing 전 필드 ShardStatus 전송, local SSD flush baseline 비교
 
 [주석 표시됨]   캐시 디렉터리/경로 계산(Storage Node 담당), partition_count.csv(미반환),
@@ -45,7 +45,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Tuple
 
 import grpc
 import numpy as np
@@ -158,16 +158,16 @@ def fde_output_dim(config: FixedDimensionalEncodingConfig) -> int:
 
 def receive_shard(
     stream: Iterator[pb2.DocumentChunk],
-) -> Tuple[int, int, int, List[str], List[Optional[np.ndarray]], List[dict]]:
+) -> Tuple[int, int, int, List[str], List[dict]]:
     """
-    GetShard 스트림을 파싱하여 문서별 embedding 과 원문 메타를 반환한다.
+    GetShard 스트림을 파싱하여 문서 원문 메타를 반환한다.
+    Storage Node 는 텍스트(title, text)만 전송한다.
     """
     shard_index = -1
     doc_start   = 0
     doc_end     = 0
     total_docs  = 0
 
-    partial_emb: Dict[int, bytearray] = {}
     doc_meta: Dict[int, dict] = {}
 
     for chunk in stream:
@@ -181,36 +181,20 @@ def receive_shard(
 
         if di not in doc_meta:
             doc_meta[di] = {
-                "doc_id":    chunk.doc_id,
-                "seq_len":   chunk.seq_len,
-                "embed_dim": chunk.embed_dim,
-                "title":     chunk.corpus_title,
-                "text":      chunk.corpus_text,
+                "doc_id": chunk.doc_id,
+                "title":  chunk.corpus_title,
+                "text":   chunk.corpus_text,
             }
 
-        if chunk.embedding_data:
-            partial_emb.setdefault(di, bytearray())
-            partial_emb[di].extend(chunk.embedding_data)
-
-    doc_ids: List[str]                     = []
-    embeddings: List[Optional[np.ndarray]] = []
-    metas: List[dict]                      = []
+    doc_ids: List[str] = []
+    metas: List[dict]  = []
 
     for di in range(total_docs):
         meta = doc_meta.get(di, {})
         doc_ids.append(meta.get("doc_id", ""))
         metas.append(meta)
 
-        raw = partial_emb.get(di)
-        if raw and meta.get("seq_len", 0) > 0 and meta.get("embed_dim", 0) > 0:
-            arr = np.frombuffer(bytes(raw), dtype=np.float32).reshape(
-                meta["seq_len"], meta["embed_dim"]
-            ).copy()
-            embeddings.append(arr)
-        else:
-            embeddings.append(None)
-
-    return shard_index, doc_start, doc_end, doc_ids, embeddings, metas
+    return shard_index, doc_start, doc_end, doc_ids, metas
 
 
 # ===========================================================================
@@ -237,7 +221,7 @@ class ColBERTEncoder:
         except ImportError:
             logger.warning(
                 "[ColBERT] neural_cherche 없음 — "
-                "pre-computed embedding 없는 문서는 zero-vector 로 대체됩니다."
+                "ColBERT 인코딩을 수행할 수 없습니다."
             )
             self._ranker = None
 
@@ -267,10 +251,6 @@ def measure_local_flush(fde_array: np.ndarray, tmp_dir: str) -> float:
     """
     fde_array 를 임시 파일에 mmap 으로 저장하고 flush 시간을 반환한다.
     gRPC 전송 대신 로컬 SSD 에 저장했을 때의 기준선(baseline).
-
-    원본 대응:
-        index() → fde_index.flush() (배치별 + 최종)
-        generate_document_fde_batch_gpu_3stage() → STEP7 fde_memmap.flush()
     """
     num_docs, fde_dim = fde_array.shape
     fd, tmp_path = tempfile.mkstemp(dir=tmp_dir, suffix=".mmap")
@@ -335,7 +315,6 @@ def process_shard(
     doc_start: int,
     doc_end: int,
     doc_ids: List[str],
-    embeddings: List[Optional[np.ndarray]],
     metas: List[dict],
     config: FixedDimensionalEncodingConfig,
     encoder: ColBERTEncoder,
@@ -344,66 +323,45 @@ def process_shard(
     """
     한 shard 를 처리하여 (fde_array, timing_dict) 를 반환한다.
 
-    원본 index() 의 배치 처리 루프 전체에 대응:
-        Step1: missing embedding 탐지 + ColBERT 인코딩
-        Step2: FDE memmap 생성 + generate_document_fde_batch_gpu_3stage 호출
-        Step3: flush + timing 집계
+    Step1: ColBERT 인코딩 (Storage Node 가 텍스트만 전송)
+    Step2: FDE memmap 생성 + generate_document_fde_batch_gpu_3stage 호출
+    Step3: flush + timing 집계
     """
     t_shard_start = time.perf_counter()
 
     # ------------------------------------------------------------------ #
-    # Step 1: 누락 embedding → ColBERT 인코딩
-    #
-    # 원본: index() Step2
-    to_encode_docs = [{id, title, text} for did in batch_missing_ids]
-    encoded_map    = self.ranker.encode_documents(documents=to_encode_docs)
-    arr            = to_numpy(encoded_map[did])
-
-    for i, did in zip(missing_indices, encoded_ids):
-        common_path = os.path.join(common_doc_embeds_dir, f"{doc_pos:08d}.npy")
-        if not os.path.exists(common_path):
-            np.save(common_path, embeddings[i])
-            logger.info("[doc-embed] saved: %s", common_path)
-
-    t_embed_start   = time.perf_counter()
-    missing_indices = [i for i, e in enumerate(embeddings) if e is None]
-
-    if missing_indices:
-        logger.info(
-            "[Shard %d] ColBERT 인코딩 시작: %d 문서",
-            shard_index, len(missing_indices)
-        )
-        docs_to_encode = [
-            {
-                "id":    metas[i]["doc_id"],
-                "title": metas[i].get("title", ""),
-                "text":  metas[i].get("text", ""),
-            }
-            for i in missing_indices
-        ]
-        encoded_map = encoder.encode(docs_to_encode)
-
-        for i in missing_indices:
-            did = metas[i]["doc_id"]
-            if did in encoded_map:
-                embeddings[i] = encoded_map[did]
-            else:
-                logger.warning(
-                    "[Shard %d] 인코딩 실패 doc=%s → zero-vector 대체",
-                    shard_index, did,
-                )
-                embeddings[i] = np.zeros((1, config.dimension), dtype=np.float32)
-
-        # 명시적 메모리 해제 (원본 index() 의 del encoded_map[did] 패턴)
-        del encoded_map
-        del docs_to_encode
-        gc.collect()
-
-    # zero-vector fallback
-    valid_embeddings: List[np.ndarray] = [
-        e if e is not None else np.zeros((1, config.dimension), dtype=np.float32)
-        for e in embeddings
+    # Step 1: ColBERT 인코딩
+    # ------------------------------------------------------------------ #
+    t_embed_start = time.perf_counter()
+    logger.info(
+        "[Shard %d] ColBERT 인코딩 시작: %d 문서",
+        shard_index, len(metas),
+    )
+    docs_to_encode = [
+        {
+            "id":    meta["doc_id"],
+            "title": meta.get("title", ""),
+            "text":  meta.get("text", ""),
+        }
+        for meta in metas
     ]
+    encoded_map = encoder.encode(docs_to_encode)
+
+    valid_embeddings: List[np.ndarray] = []
+    for meta in metas:
+        did = meta["doc_id"]
+        if did in encoded_map:
+            valid_embeddings.append(encoded_map[did])
+        else:
+            logger.warning(
+                "[Shard %d] 인코딩 실패 doc=%s → zero-vector 대체",
+                shard_index, did,
+            )
+            valid_embeddings.append(np.zeros((1, config.dimension), dtype=np.float32))
+
+    del encoded_map
+    del docs_to_encode
+    gc.collect()
     embed_time = time.perf_counter() - t_embed_start
 
     # ── [주석] 원본 log_memory_usage 위치 (배치 인코딩 직후)
@@ -549,7 +507,6 @@ def run_worker(args: argparse.Namespace) -> None:
                 doc_start,
                 doc_end,
                 doc_ids,
-                embeddings,
                 metas,
             ) = receive_shard(stream)
         except grpc.RpcError as exc:
@@ -574,7 +531,6 @@ def run_worker(args: argparse.Namespace) -> None:
                 doc_start   = doc_start,
                 doc_end     = doc_end,
                 doc_ids     = doc_ids,
-                embeddings  = embeddings,
                 metas       = metas,
                 config      = fde_config,
                 encoder     = encoder,
@@ -722,7 +678,7 @@ def parse_args() -> argparse.Namespace:
                    default=_defaults.fill_empty_partitions,
                    help="fill_empty_partitions 활성화")
     p.add_argument("--colbert-model",default=_defaults.colbert_model,
-                   help="ColBERT 모델 이름 (embedding 미제공 문서에 사용)")
+                   help="ColBERT 모델 이름 (문서 텍스트 인코딩에 사용)")
     p.add_argument("--device",       default=_defaults.device,
                    help="PyTorch device (cuda/cpu)")
     p.add_argument("--tmp-dir",      default=_defaults.tmp_dir,

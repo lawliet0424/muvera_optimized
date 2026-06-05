@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional
-
 
 @dataclass
 class StorageNodeConfig:
@@ -29,10 +27,6 @@ class StorageNodeConfig:
 
     # corpus JSON 파일 경로 {doc_id: {title, text}}
     corpus_path: str = "/data/corpus.json"
-
-    # 사전 계산된 ColBERT embedding 디렉터리 ({pos:08d}.npy)
-    # None 이면 원문(title, text)만 전송하고 Worker 가 자체 인코딩
-    embed_dir: Optional[str] = None
 
     # FDE shard mmap 파일 및 보고서 저장 디렉터리
     output_dir: str = "/data/fde_out"
@@ -60,16 +54,7 @@ class StorageNodeConfig:
     server_stop_grace_sec: float = 5.0
 
     # gRPC 단일 메시지 최대 크기 (송신 / 수신 공통, bytes)
-    # embedding 청크가 CHUNK_BYTES 이하이므로 그보다 크게 설정
     grpc_max_message_bytes: int = 4 * 1024 * 1024   # 4 MB
-
-    # ------------------------------------------------------------------
-    # 스트리밍 청크 크기
-    # ------------------------------------------------------------------
-
-    # Storage Node → Worker: 단일 DocumentChunk.embedding_data 최대 크기 (bytes)
-    # 대용량 embedding 을 이 크기로 분할 전송
-    embedding_chunk_bytes: int = 2 * 1024 * 1024    # 2 MB
 
     # Worker → Storage Node: FDE 수신 시 행 단위 버퍼 크기
     # (현재 미사용 — 수신 측에서 row_start/row_end 로 직접 기록)
@@ -95,8 +80,6 @@ class StorageNodeConfig:
         cfg = cls()
         if getattr(args, "corpus_path", None) is not None:
             cfg.corpus_path = str(args.corpus_path)
-        if getattr(args, "embed_dir", None) is not None:
-            cfg.embed_dir = str(args.embed_dir)
         if getattr(args, "output_dir", None) is not None:
             cfg.output_dir = str(args.output_dir)
         if getattr(args, "num_shards", None) is not None:
@@ -120,10 +103,6 @@ class StorageNodeConfig:
             raise ValueError(
                 f"[StorageNodeConfig] corpus_path 파일 없음: {self.corpus_path}"
             )
-        if self.embed_dir is not None and not os.path.isdir(self.embed_dir):
-            raise ValueError(
-                f"[StorageNodeConfig] embed_dir 디렉터리 없음: {self.embed_dir}"
-            )
         if self.num_shards < 1:
             raise ValueError(
                 f"[StorageNodeConfig] num_shards 는 1 이상이어야 합니다: {self.num_shards}"
@@ -131,9 +110,4 @@ class StorageNodeConfig:
         if not (1 <= self.port <= 65535):
             raise ValueError(
                 f"[StorageNodeConfig] 유효하지 않은 port: {self.port}"
-            )
-        if self.grpc_max_message_bytes < self.embedding_chunk_bytes:
-            raise ValueError(
-                "[StorageNodeConfig] grpc_max_message_bytes 는 "
-                "embedding_chunk_bytes 이상이어야 합니다."
             )

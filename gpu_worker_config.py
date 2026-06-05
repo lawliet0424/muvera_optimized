@@ -77,7 +77,7 @@ class WorkerConfig:
     # ------------------------------------------------------------------
 
     # HuggingFace 모델 이름 또는 로컬 경로
-    # Storage Node 가 embedding 을 제공하지 않는 문서에만 사용됨
+    # Storage Node 가 전송한 문서 텍스트를 인코딩하는 데 사용
     colbert_model: str = "raphaelsty/neural-cherche-colbert"
 
     # PyTorch device ("cuda" / "cpu" / "cuda:0" 등)

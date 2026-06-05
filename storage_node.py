@@ -17,11 +17,8 @@ FDE 저장 경로
 
 주의
 ----
-- embed-dir 는 Worker 가 직접 사용하지 않는다.
-  Storage Node 가 문서 원문(title, text)과 embedding 을 같이 전송한다.
-- 이미 처리된 embedding 파일이 embed-dir 에 있으면 재인코딩을 스킵한다.
-- embedding 이 없으면 Storage Node 는 원문만 전송하고,
-  Worker 가 자체 ColBERT 인코더로 인코딩한다.
+- Storage Node 는 문서 원문(title, text)만 전송한다.
+  embedding 은 전송하지 않으며, Worker 가 ColBERT 로 인코딩한다.
 """
 
 from __future__ import annotations
@@ -53,21 +50,6 @@ logging.basicConfig(
     format="%(asctime)s [STORAGE] %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# 청크 크기 — StorageNodeConfig 에서 관리. serve() 진입 시 _init_chunk_constants()
-# 로 config 값으로 덮어쓴다.
-# ---------------------------------------------------------------------------
-CHUNK_BYTES    = 2 * 1024 * 1024   # storage_node_config.embedding_chunk_bytes 기본값
-FDE_CHUNK_ROWS = 512               # storage_node_config.fde_recv_chunk_rows 기본값
-
-
-def _init_chunk_constants(cfg: StorageNodeConfig) -> None:
-    """모듈 레벨 청크 상수를 config 값으로 갱신한다."""
-    global CHUNK_BYTES, FDE_CHUNK_ROWS
-    CHUNK_BYTES    = cfg.embedding_chunk_bytes
-    FDE_CHUNK_ROWS = cfg.fde_recv_chunk_rows
-
 
 # ===========================================================================
 # Shard 분할 헬퍼
@@ -208,21 +190,13 @@ class FdeStore:
 
 
 # ===========================================================================
-# Corpus / Embedding 로더
+# Corpus 로더
 # ===========================================================================
 
 class CorpusLoader:
-    """
-    corpus.json 또는 doc_ids.json + embed_dir 에서 원문과 embedding 을 제공.
-    embed-dir 에 {pos:08d}.npy 파일이 있으면 embedding 을 함께 전송하고,
-    없으면 원문(title, text)만 전송한다.
-    """
+    """corpus.json 에서 문서 원문(title, text)을 제공한다."""
 
-    def __init__(
-        self,
-        corpus_path: str,        # dict{doc_id: {title, text}} JSON
-        embed_dir: Optional[str] = None,
-    ) -> None:
+    def __init__(self, corpus_path: str) -> None:
         logger.info("[Corpus] Loading %s ...", corpus_path)
         with open(corpus_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
@@ -236,24 +210,10 @@ class CorpusLoader:
             self._corpus = raw
 
         self.doc_ids: List[str] = list(self._corpus.keys())
-        self._embed_dir = embed_dir
         logger.info("[Corpus] Loaded %d documents", len(self.doc_ids))
 
     def total_docs(self) -> int:
         return len(self.doc_ids)
-
-    def get_embedding(self, pos: int) -> Optional[np.ndarray]:
-        if not self._embed_dir:
-            return None
-        path = os.path.join(self._embed_dir, f"{pos:08d}.npy")
-        if not os.path.exists(path):
-            return None
-        try:
-            arr = np.load(path, mmap_mode="r").astype(np.float32)
-            return arr
-        except Exception as exc:
-            logger.warning("[Corpus] embed load failed pos=%d: %s", pos, exc)
-            return None
 
     def get_doc(self, pos: int) -> tuple[str, dict]:
         doc_id = self.doc_ids[pos]
@@ -327,64 +287,26 @@ class ShardServicer(pb2_grpc.ShardServiceServicer):
             shard_idx, doc_start, doc_end, worker_id,
         )
 
-        # 문서를 한 건씩 streaming 전송
+        # 문서 원문(title, text)만 streaming 전송 — embedding 은 Worker 가 생성
         for local_idx, pos in enumerate(range(doc_start, doc_end)):
             doc_id, doc = self._corpus.get_doc(pos)
-            embedding = self._corpus.get_embedding(pos)   # Optional
-
-            if embedding is not None:
-                # embedding 파일이 있으면 바이트로 직렬화
-                emb_bytes = embedding.astype(np.float32).tobytes()
-                seq_len   = embedding.shape[0]
-                embed_dim = embedding.shape[1]
-            else:
-                # 없으면 빈 bytes → Worker 가 자체 인코딩
-                emb_bytes = b""
-                seq_len   = 0
-                embed_dim = 0
-
-            # 대용량 embedding 은 청크 분할
-            if len(emb_bytes) > CHUNK_BYTES:
-                chunk_size   = CHUNK_BYTES
-                total_chunks = math.ceil(len(emb_bytes) / chunk_size)
-                for ci in range(total_chunks):
-                    piece = emb_bytes[ci * chunk_size : (ci + 1) * chunk_size]
-                    yield pb2.DocumentChunk(
-                        shard_index        = shard_idx,
-                        total_shards       = total_shards,
-                        doc_start          = doc_start,
-                        doc_end            = doc_end,
-                        total_docs         = num_docs_in_shard,
-                        chunk_index        = ci,
-                        total_chunks       = total_chunks,
-                        is_last            = (local_idx == num_docs_in_shard - 1)
-                                             and (ci == total_chunks - 1),
-                        doc_index_in_shard = local_idx,
-                        seq_len            = seq_len,
-                        embed_dim          = embed_dim,
-                        embedding_data     = piece,
-                        doc_id             = doc_id,
-                        corpus_title       = doc.get("title", ""),
-                        corpus_text        = doc.get("text", ""),
-                    )
-            else:
-                yield pb2.DocumentChunk(
-                    shard_index        = shard_idx,
-                    total_shards       = total_shards,
-                    doc_start          = doc_start,
-                    doc_end            = doc_end,
-                    total_docs         = num_docs_in_shard,
-                    chunk_index        = 0,
-                    total_chunks       = 1,
-                    is_last            = (local_idx == num_docs_in_shard - 1),
-                    doc_index_in_shard = local_idx,
-                    seq_len            = seq_len,
-                    embed_dim          = embed_dim,
-                    embedding_data     = emb_bytes,
-                    doc_id             = doc_id,
-                    corpus_title       = doc.get("title", ""),
-                    corpus_text        = doc.get("text", ""),
-                )
+            yield pb2.DocumentChunk(
+                shard_index        = shard_idx,
+                total_shards       = total_shards,
+                doc_start          = doc_start,
+                doc_end            = doc_end,
+                total_docs         = num_docs_in_shard,
+                chunk_index        = 0,
+                total_chunks       = 1,
+                is_last            = (local_idx == num_docs_in_shard - 1),
+                doc_index_in_shard = local_idx,
+                seq_len            = 0,
+                embed_dim          = 0,
+                embedding_data     = b"",
+                doc_id             = doc_id,
+                corpus_title       = doc.get("title", ""),
+                corpus_text        = doc.get("text", ""),
+            )
 
         logger.info(
             "[GetShard] Sent shard=%d (%d docs) to worker=%s",
@@ -659,12 +581,9 @@ def serve(args: argparse.Namespace) -> None:
     cfg = StorageNodeConfig.from_args(args)
     cfg.validate()
 
-    # 모듈 레벨 청크 상수를 config 값으로 동기화
-    _init_chunk_constants(cfg)
-
     logging.basicConfig(level=getattr(logging, cfg.log_level, logging.INFO))
 
-    corpus     = CorpusLoader(cfg.corpus_path, cfg.embed_dir)
+    corpus     = CorpusLoader(cfg.corpus_path)
     shards     = compute_shards(corpus.total_docs(), cfg.num_shards)
     dispatcher = ShardDispatcher(shards)
     fde_store  = FdeStore(cfg.output_dir)
@@ -684,9 +603,9 @@ def serve(args: argparse.Namespace) -> None:
 
     logger.info(
         "Storage Node started: port=%d  shards=%d  docs=%d  max_workers=%d  "
-        "embedding_chunk_bytes=%d  grpc_max_msg=%d",
+        "grpc_max_msg=%d",
         cfg.port, len(shards), corpus.total_docs(), cfg.max_workers,
-        cfg.embedding_chunk_bytes, cfg.grpc_max_message_bytes,
+        cfg.grpc_max_message_bytes,
     )
 
     try:
@@ -708,9 +627,6 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--corpus-path", default=_defaults.corpus_path,
                    help="corpus JSON 파일 경로 {doc_id: {title, text}}")
-    p.add_argument("--embed-dir",   default=_defaults.embed_dir,
-                   help="사전 계산된 embedding 디렉터리 ({pos:08d}.npy). "
-                        "없으면 원문만 전송하고 Worker 가 직접 인코딩")
     p.add_argument("--output-dir",  default=_defaults.output_dir,
                    help="FDE shard mmap 및 보고서 저장 디렉터리")
     p.add_argument("--num-shards",  type=int, default=_defaults.num_shards,
