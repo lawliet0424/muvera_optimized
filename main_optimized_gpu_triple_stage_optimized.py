@@ -77,6 +77,11 @@ os.makedirs(COMMON_QUERY_EMBEDS_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logging.info(f"Using device: {DEVICE}")
 
+# ========================================================
+# ---------- 배치 단위 처리: 인코딩 → FDE 생성 → 저장 ----------
+# ========================================================
+ATOMIC_BATCH_SIZE = 8000  # 배치 크기 (메모리 매핑으로 안전하게 처리)
+
 # ===========================
 # --- Helper Functions  -----
 # ===========================
@@ -519,9 +524,6 @@ class ColbertFdeRetriever:
             f"[index] preloaded from external/internal: {len(doc_embeddings_map)} / {len(self.doc_ids)}, "
             f"to-encode: {len(missing_doc_ids)}"
         )
-
-        # ---------- 배치 단위 처리: 인코딩 → FDE 생성 → 저장 ----------
-        ATOMIC_BATCH_SIZE = 8000  # 배치 크기 (메모리 매핑으로 안전하게 처리)
         
         #[1017] simhash별 indice별 원소 개수 csv 파일 저장 필요------------------------------------
         simhash_count_dir = os.path.join(QUERY_SEARCH_DIR, f"rep{self.num_repetitions}_simhash{self.num_simhash_projections}_rerank{self.rerank_candidates}")

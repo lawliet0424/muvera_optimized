@@ -1,0 +1,196 @@
+syntax = "proto3";
+
+package fde_pipeline;
+
+// ============================================================
+// 공통 메시지 타입
+// ============================================================
+
+// FDE 생성에 필요한 설정 파라미터
+// FixedDimensionalEncodingConfig 와 1:1 대응
+message FdeConfig {
+  int32  dimension                  = 1;
+  int32  num_repetitions            = 2;
+  int32  num_simhash_projections    = 3;
+  int32  seed                       = 4;
+  int32  encoding_type              = 5;  // EncodingType.value
+  int32  projection_type            = 6;  // ProjectionType.value
+  int32  projection_dimension       = 7;  // 0 = None (identity)
+  bool   fill_empty_partitions      = 8;
+  int32  final_projection_dimension = 9;  // 0 = None
+}
+
+// ============================================================
+// ShardService: Worker → Storage Node
+//   - Worker가 문서 shard 를 요청하고
+//   - FDE shard 를 Storage Node 에 업로드한다
+// ============================================================
+service ShardService {
+
+  // Worker 가 처리할 다음 shard 를 요청
+  // Request : ShardRequest  (worker_id + 완료한 이전 shard 정보)
+  // Response: ShardResponse (streaming, 문서 데이터 청크)
+  rpc GetShard(ShardRequest) returns (stream DocumentChunk);
+
+  // Worker 가 FDE 결과 shard 를 Storage Node 에 업로드
+  // Request : stream FdeChunk  (float32 행 단위 청크)
+  // Response: UploadAck        (저장 완료 확인 + 성능 정보)
+  rpc UploadFdeShard(stream FdeChunk) returns (UploadAck);
+
+  // Worker 가 shard 처리 완료 후 timing 정보를 보고
+  rpc ReportShardStatus(ShardStatus) returns (StatusAck);
+
+  // Storage Node 의 전체 진행 상황 조회
+  rpc GetProgress(ProgressRequest) returns (ProgressResponse);
+}
+
+// ============================================================
+// GetShard
+// ============================================================
+
+message ShardRequest {
+  string worker_id     = 1;  // "worker-0", "worker-1"
+  int32  shard_index   = 2;  // -1 이면 첫 요청
+  // 이전 shard 완료 정보 (첫 요청이면 빈 값)
+  optional CompletedShardInfo completed = 3;
+  FdeConfig          fde_config = 4;
+}
+
+message CompletedShardInfo {
+  int32  shard_index   = 1;
+  string status        = 2;  // "success" | "failure"
+  string error_message = 3;
+}
+
+// 문서 데이터 스트림 청크
+// 한 shard 는 여러 DocumentChunk 로 전송됨
+message DocumentChunk {
+  // 헤더 청크 (chunk_index == 0 일 때만 의미 있음)
+  int32  shard_index   = 1;
+  int32  total_shards  = 2;
+  int32  doc_start     = 3;
+  int32  doc_end       = 4;
+  int32  total_docs    = 5;  // shard 내 문서 수
+
+  // 데이터 청크
+  int32  chunk_index   = 6;
+  int32  total_chunks  = 7;
+  bool   is_last       = 8;
+
+  // 문서 직렬화 데이터
+  // 단일 문서 embedding: shape (seq_len, dim), dtype float32
+  // 직렬화: doc_index(int32) + seq_len(int32) + dim(int32) + float32 배열
+  int32  doc_index_in_shard = 9;   // 이 청크가 담는 문서 번호 (shard 내 0-based)
+  int32  seq_len            = 10;  // 문서 토큰 길이
+  int32  embed_dim          = 11;  // embedding 차원 (128)
+  bytes  embedding_data     = 12;  // float32 little-endian bytes
+  string doc_id             = 13;  // 원본 corpus doc_id
+
+  // 메타데이터 (헤더 청크)
+  string corpus_title       = 14;
+  string corpus_text        = 15;
+}
+
+// ============================================================
+// UploadFdeShard
+// ============================================================
+
+message FdeChunk {
+  // 헤더 청크 (chunk_index == 0)
+  int32  shard_index      = 1;
+  string worker_id        = 2;
+  int32  num_docs         = 3;
+  int32  fde_dim          = 4;
+  int32  total_chunks     = 5;
+
+  // 데이터 청크
+  int32  chunk_index      = 6;
+  bool   is_last          = 7;
+  int32  row_start        = 8;   // 전체 shard 기준 행 시작
+  int32  row_end          = 9;   // 전체 shard 기준 행 끝
+  bytes  fde_data         = 10;  // float32 little-endian bytes
+
+  // Timing (마지막 청크에만)
+  double embed_time_s     = 11;  // ColBERT 인코딩 시간
+  double fde_time_s       = 12;  // GPU FDE 생성 시간
+  double transfer_time_s  = 13;  // gRPC 전송 시간 (계산 후 채움)
+  double total_time_s     = 14;
+}
+
+message UploadAck {
+  int32  shard_index         = 1;
+  string status              = 2;   // "ok" | "error"
+  string message             = 3;
+  double remote_flush_time_s = 4;   // Storage Node 기준 flush 시간
+  double grpc_transfer_time_s= 5;   // Storage Node 측정 수신 시간
+  int64  bytes_received      = 6;
+}
+
+// ============================================================
+// ReportShardStatus
+// ============================================================
+
+message ShardStatus {
+  int32  shard_index         = 1;
+  string worker_id           = 2;
+  string status              = 3;   // "success" | "failure"
+  string error_message       = 4;
+
+  // GPU FDE timing (generate_document_fde_batch_gpu_3stage 반환값)
+  double prep_time_s         = 5;
+  double upload_time_s       = 6;   // CPU→GPU
+  double simhash_time_s      = 7;
+  double partition_time_s    = 8;
+  double scatter_time_s      = 9;
+  double average_time_s      = 10;
+  double fill_time_s         = 11;
+  double compute_time_s      = 12;
+  double download_time_s     = 13;  // GPU→CPU
+  double reshape_time_s      = 14;
+  double flush_time_s        = 15;
+  double fde_total_time_s    = 16;
+
+  // 파이프라인 추가 timing
+  double embed_time_s        = 17;  // ColBERT 인코딩
+  double grpc_recv_time_s    = 18;  // shard 수신
+  double grpc_send_time_s    = 19;  // FDE 전송
+  double remote_flush_time_s = 20;  // Storage Node flush
+  double end_to_end_time_s   = 21;
+
+  int32  num_docs            = 22;
+  int32  doc_start           = 23;
+  int32  doc_end             = 24;
+
+  // baseline 비교용: local SSD flush 시뮬레이션 시간
+  double local_flush_time_s  = 25;  // Worker 측에서 측정한 로컬 flush 시간
+}
+
+message StatusAck {
+  string status  = 1;
+  string message = 2;
+}
+
+// ============================================================
+// GetProgress
+// ============================================================
+
+message ProgressRequest {
+  string requester_id = 1;
+}
+
+message ProgressResponse {
+  int32  total_shards     = 1;
+  int32  completed_shards = 2;
+  int32  failed_shards    = 3;
+  int32  pending_shards   = 4;
+  double elapsed_sec      = 5;
+  repeated ShardSummary shard_summaries = 6;
+}
+
+message ShardSummary {
+  int32  shard_index  = 1;
+  string status       = 2;
+  string worker_id    = 3;
+  int32  num_docs     = 4;
+  double total_time_s = 5;
+}
