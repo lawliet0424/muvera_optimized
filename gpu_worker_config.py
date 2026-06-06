@@ -4,6 +4,13 @@ gpu_worker_config.py
 ====================
 GPU Worker 전용 설정.
 
+배포
+----
+  Storage Node  dccblue@163.239.199.208  /data/muvera_optimized
+  Worker 1      dcceris@163.239.199.213  /home/dcceris/Desktop/muvera_optimized
+  Worker 2      dccbeta@163.239.199.206  /home/dccbeta/muvera_optimized
+  gRPC          163.239.199.208:50051
+
 사용법
 ------
 gpu_worker.py 는 이 모듈을 import 해서 기본값으로 사용한다.
@@ -16,8 +23,32 @@ CLI 인자가 전달되면 CLI 값이 우선한다.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+import socket
+from dataclasses import dataclass, field
 from typing import Optional
+
+# ---------------------------------------------------------------------------
+# 배포 경로
+# ---------------------------------------------------------------------------
+STORAGE_NODE_ADDR = "163.239.199.208:50051"
+
+# GPU FDE kernel 과 동일 — partition 수 = 2^num_simhash_projections
+MAX_SIMHASH_PROJECTIONS = 31
+
+WORKER_PROJECT_DIRS: dict[str, str] = {
+    "dcceris": "/home/dcceris/Desktop/muvera_optimized",
+    "dccbeta": "/home/dccbeta/muvera_optimized",
+}
+
+
+def _default_worker_project_dir() -> str:
+    """호스트명으로 Worker 프로젝트 루트를 결정한다."""
+    hostname = socket.gethostname().lower()
+    for key, path in WORKER_PROJECT_DIRS.items():
+        if key in hostname:
+            return path
+    return os.path.expanduser("~/muvera_optimized")
 
 
 @dataclass
@@ -26,11 +57,16 @@ class WorkerConfig:
     # gRPC 클라이언트
     # ------------------------------------------------------------------
 
-    # Storage Node 주소 (host:port)
-    server: str = "dccblue@163.239.199.208"
+    # Storage Node 주소 (dccblue@163.239.199.208)
+    server: str = STORAGE_NODE_ADDR
 
     # Worker 식별자. None 이면 런타임에 "hostname-PID" 로 자동 생성
     worker_id: Optional[str] = None
+
+    # Worker 프로젝트 루트 (호스트명으로 자동 선택)
+    #   dcceris → /home/dcceris/Desktop/muvera_optimized
+    #   dccbeta → /home/dccbeta/muvera_optimized
+    project_dir: str = field(default_factory=_default_worker_project_dir)
 
     # gRPC 단일 메시지 최대 크기 (송신 / 수신 공통, bytes)
     # Storage Node 의 grpc_max_message_bytes 와 반드시 같거나 크게 설정
@@ -59,7 +95,7 @@ class WorkerConfig:
     # SimHash repetition 횟수
     num_repetitions: int = 2
 
-    # SimHash projection 비트 수 (partition 수 = 2^num_simhash_projections)
+    # SimHash projection 비트 수 (partition 수 = 2^num_simhash_projections, 최대 31)
     num_simhash_projections: int = 5
 
     # 랜덤 시드
@@ -92,14 +128,6 @@ class WorkerConfig:
     grpc_fde_chunk_bytes: int = 3 * 1024 * 1024    # 3 MB
 
     # ------------------------------------------------------------------
-    # 로컬 SSD baseline 측정
-    # ------------------------------------------------------------------
-
-    # measure_local_flush() 가 tmpfile 을 생성할 디렉터리
-    # 실제 FDE 저장 경로와 같은 마운트 포인트를 사용해야 공정한 비교가 됨
-    tmp_dir: str = "/tmp/fde_worker"
-
-    # ------------------------------------------------------------------
     # 로깅
     # ------------------------------------------------------------------
 
@@ -120,6 +148,8 @@ class WorkerConfig:
             cfg.server        = args.server
         if getattr(args, "worker_id",     None) is not None:
             cfg.worker_id     = args.worker_id
+        if getattr(args, "project_dir",   None) is not None:
+            cfg.project_dir   = str(args.project_dir)
         if getattr(args, "rep",           None) is not None:
             cfg.num_repetitions = int(args.rep)
         if getattr(args, "simhash",       None) is not None:
@@ -132,8 +162,6 @@ class WorkerConfig:
             cfg.colbert_model = args.colbert_model
         if getattr(args, "device",        None) is not None:
             cfg.device        = args.device
-        if getattr(args, "tmp_dir",       None) is not None:
-            cfg.tmp_dir       = args.tmp_dir
         return cfg
 
     def grpc_channel_options(self) -> list:
@@ -151,9 +179,10 @@ class WorkerConfig:
             raise ValueError(
                 f"[WorkerConfig] num_repetitions 는 1 이상이어야 합니다: {self.num_repetitions}"
             )
-        if not (1 <= self.num_simhash_projections <= 128):
+        if not (1 <= self.num_simhash_projections <= MAX_SIMHASH_PROJECTIONS):
             raise ValueError(
-                f"[WorkerConfig] num_simhash_projections 는 1~128 사이여야 합니다: "
+                f"[WorkerConfig] num_simhash_projections 는 "
+                f"1~{MAX_SIMHASH_PROJECTIONS} 사이여야 합니다: "
                 f"{self.num_simhash_projections}"
             )
         if self.grpc_fde_chunk_bytes >= self.grpc_max_message_bytes:

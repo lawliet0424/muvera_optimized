@@ -9,11 +9,8 @@
   ├ compute_time    : simhash + partition + scatter + average
   ├ download_time   : GPU→CPU 전송
   └ flush_time      : (내부 flush — memmap 을 쓰지 않으면 0)
-- local_flush_time  : [BASELINE] 로컬 SSD flush 시뮬레이션
-- grpc_send_time    : Worker → Storage Node gRPC 전송
-- remote_flush_time : Storage Node mmap.flush()
-- grpc_total        : grpc_send + remote_flush
-- grpc_overhead     : grpc_total - local_flush  (양수 = gRPC 비용)
+- grpc_send_time    : Worker → Storage Node UploadFdeShard RPC (remote flush 포함)
+- remote_flush_time : Storage Node mmap flush+fsync (grpc_send 의 부분집합)
 - end_to_end_time   : 전체 shard 처리 (recv → embed → FDE → send → report)
 """
 
@@ -61,22 +58,13 @@ class ShardPerfRecord:
     flush_time:        float = 0.0   # 내부 flush
     fde_total:         float = 0.0
 
-    # I/O 비교 지표
-    local_flush_time:  float = 0.0   # ★ BASELINE: 로컬 SSD flush
+    # I/O 지표
     grpc_recv_time:    float = 0.0   # Storage Node → Worker 수신
     grpc_send_time:    float = 0.0   # Worker → Storage Node 전송
-    remote_flush_time: float = 0.0   # Storage Node mmap.flush()
+    remote_flush_time: float = 0.0   # Storage Node flush+fsync (grpc_send 에 포함)
 
-    # 파생 지표 (자동 계산)
-    grpc_total:        float = field(init=False, default=0.0)
-    grpc_overhead:     float = field(init=False, default=0.0)
     end_to_end:        float = 0.0
-
     error_message:     str   = ""
-
-    def __post_init__(self):
-        self.grpc_total    = self.grpc_send_time + self.remote_flush_time
-        self.grpc_overhead = self.grpc_total - self.local_flush_time
 
     @property
     def docs_per_sec(self) -> float:
@@ -88,11 +76,8 @@ class ShardPerfRecord:
             f"docs={self.num_docs} "
             f"embed={self.embed_time:.4f}s "
             f"fde={self.fde_total:.4f}s "
-            f"local_flush={self.local_flush_time:.6f}s "
             f"grpc_send={self.grpc_send_time:.6f}s "
             f"remote_flush={self.remote_flush_time:.6f}s "
-            f"grpc_total={self.grpc_total:.6f}s "
-            f"grpc_overhead={self.grpc_overhead:+.6f}s "
             f"end_to_end={self.end_to_end:.4f}s "
             f"docs/s={self.docs_per_sec:.1f}"
         )
@@ -116,7 +101,7 @@ class PerfLogger:
 
     def from_status_proto(self, msg, remote_flush_time: float = 0.0) -> ShardPerfRecord:
         """ShardStatus proto → ShardPerfRecord."""
-        rec = ShardPerfRecord(
+        return ShardPerfRecord(
             shard_index       = msg.shard_index,
             worker_id         = msg.worker_id,
             status            = msg.status,
@@ -136,14 +121,12 @@ class PerfLogger:
             reshape_time      = msg.reshape_time_s,
             flush_time        = msg.flush_time_s,
             fde_total         = msg.fde_total_time_s,
-            local_flush_time  = msg.local_flush_time_s,
             grpc_recv_time    = msg.grpc_recv_time_s,
             grpc_send_time    = msg.grpc_send_time_s,
             remote_flush_time = remote_flush_time or msg.remote_flush_time_s,
             end_to_end        = msg.end_to_end_time_s,
             error_message     = msg.error_message,
         )
-        return rec
 
     # ------------------------------------------------------------------ #
     # 집계
@@ -160,7 +143,6 @@ class PerfLogger:
         def _sum(attr): return sum(getattr(r, attr) for r in recs)
         def _avg(attr): return _sum(attr) / len(recs)
         def _max(attr): return max(getattr(r, attr) for r in recs)
-        def _min(attr): return min(getattr(r, attr) for r in recs)
 
         total_docs     = sum(r.num_docs for r in recs)
         total_elapsed  = time.time() - self._start
@@ -172,20 +154,13 @@ class PerfLogger:
             "total_elapsed_sec":     round(total_elapsed, 3),
             "throughput_docs_per_s": round(total_docs / max(total_elapsed, 1e-9), 2),
 
-            # ColBERT
             "embed_time_sum":        round(_sum("embed_time"), 4),
             "embed_time_avg":        round(_avg("embed_time"), 4),
 
-            # GPU FDE
             "fde_total_sum":         round(_sum("fde_total"), 4),
             "fde_total_avg":         round(_avg("fde_total"), 4),
             "compute_time_sum":      round(_sum("compute_time"), 4),
             "download_time_sum":     round(_sum("download_time"), 4),
-
-            # ★ I/O 비교
-            "local_flush_sum":       round(_sum("local_flush_time"), 6),
-            "local_flush_avg":       round(_avg("local_flush_time"), 6),
-            "local_flush_max":       round(_max("local_flush_time"), 6),
 
             "grpc_send_sum":         round(_sum("grpc_send_time"), 6),
             "grpc_send_avg":         round(_avg("grpc_send_time"), 6),
@@ -195,11 +170,6 @@ class PerfLogger:
             "remote_flush_avg":      round(_avg("remote_flush_time"), 6),
             "remote_flush_max":      round(_max("remote_flush_time"), 6),
 
-            "grpc_total_sum":        round(_sum("grpc_total"), 6),
-            "grpc_total_avg":        round(_avg("grpc_total"), 6),
-            "grpc_overhead_avg":     round(_avg("grpc_overhead"), 6),
-
-            # end-to-end
             "e2e_avg":               round(_avg("end_to_end"), 4),
             "e2e_max":               round(_max("end_to_end"), 4),
         }
@@ -230,31 +200,16 @@ class PerfLogger:
         print(f"    download(GPU→CPU): sum={agg['download_time_sum']:.4f}s")
         print()
         print(f"  {'─'*60}")
-        print(f"  {'I/O Comparison (per shard avg)':}")
+        print(f"  {'I/O (per shard avg)':}")
         print(f"  {'─'*60}")
-        print(f"  [BASELINE] local SSD flush : "
-              f"avg={agg['local_flush_avg']:.6f}s  "
-              f"max={agg['local_flush_max']:.6f}s  "
-              f"sum={agg['local_flush_sum']:.6f}s")
-        print(f"  [gRPC]     grpc send       : "
+        print(f"  grpc send (RPC)  : "
               f"avg={agg['grpc_send_avg']:.6f}s  "
               f"max={agg['grpc_send_max']:.6f}s  "
               f"sum={agg['grpc_send_sum']:.6f}s")
-        print(f"  [gRPC]     remote flush    : "
+        print(f"  remote flush     : "
               f"avg={agg['remote_flush_avg']:.6f}s  "
               f"max={agg['remote_flush_max']:.6f}s  "
               f"sum={agg['remote_flush_sum']:.6f}s")
-        print(f"  [gRPC]     total (send+remote): "
-              f"avg={agg['grpc_total_avg']:.6f}s  "
-              f"sum={agg['grpc_total_sum']:.6f}s")
-        print(f"  {'─'*60}")
-        grpc_overhead = agg["grpc_overhead_avg"]
-        sign = "+" if grpc_overhead >= 0 else ""
-        verdict = "SLOWER" if grpc_overhead > 0 else "FASTER"
-        print(
-            f"  gRPC overhead vs local SSD : {sign}{grpc_overhead:.6f}s/shard  "
-            f"→  gRPC is {verdict} than local flush"
-        )
         print(f"  {'─'*60}")
         print(f"  End-to-end (avg) : {agg['e2e_avg']:.4f}s  "
               f"max={agg['e2e_max']:.4f}s")
@@ -268,8 +223,7 @@ class PerfLogger:
         "shard_index", "worker_id", "status", "num_docs", "doc_start", "doc_end",
         "embed_time", "prep_time", "upload_time", "compute_time",
         "download_time", "reshape_time", "flush_time", "fde_total",
-        "local_flush_time", "grpc_recv_time", "grpc_send_time",
-        "remote_flush_time", "grpc_total", "grpc_overhead", "end_to_end",
+        "grpc_recv_time", "grpc_send_time", "remote_flush_time", "end_to_end",
         "docs_per_sec", "error_message",
     ]
 
@@ -280,10 +234,7 @@ class PerfLogger:
             w.writeheader()
             for r in sorted(self._records, key=lambda x: x.shard_index):
                 row = asdict(r)
-                row["docs_per_sec"]    = f"{r.docs_per_sec:.2f}"
-                row["grpc_total"]      = f"{r.grpc_total:.6f}"
-                row["grpc_overhead"]   = f"{r.grpc_overhead:.6f}"
-                # float 포맷
+                row["docs_per_sec"] = f"{r.docs_per_sec:.2f}"
                 for k, v in row.items():
                     if isinstance(v, float):
                         row[k] = f"{v:.6f}"
@@ -333,7 +284,6 @@ def load_from_manifest(manifest_path: str) -> PerfLogger:
             reshape_time      = t.get("reshape_time",   0.0),
             flush_time        = t.get("flush_time",     0.0),
             fde_total         = t.get("fde_total",      0.0),
-            local_flush_time  = t.get("local_flush",    0.0),
             grpc_recv_time    = t.get("grpc_recv",      0.0),
             grpc_send_time    = t.get("grpc_send",      0.0),
             remote_flush_time = t.get("remote_flush",   0.0),

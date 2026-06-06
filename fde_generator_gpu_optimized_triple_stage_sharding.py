@@ -491,8 +491,8 @@ def generate_query_fde(
 def generate_document_fde_batch_gpu_3stage(
     doc_embeddings_list: List[np.ndarray],
     config: FixedDimensionalEncodingConfig,
-    fde_memmap,  # Pre-created memmap from main code
-    batch_start_idx: int,  # Where to write in memmap
+    fde_memmap,  # Worker: in-memory ndarray (gRPC upload); not disk memmap
+    batch_start_idx: int,  # Write offset in output buffer
     *,
     mini_batch_size: int = 500,  # Ignored - kept for backward compatibility
     log_every: int = 1000
@@ -775,10 +775,8 @@ def generate_document_fde_batch_gpu_3stage(
             )
 
     # ========================================
-    # STEP 7: Write to memmap and flush
+    # STEP 7: Write to output buffer (Worker RAM → gRPC; flush is Storage Node only)
     # ========================================
-    flush_start = time.perf_counter()
-
     write_width = (
         config.final_projection_dimension
         if config.final_projection_dimension and config.final_projection_dimension > 0
@@ -787,12 +785,11 @@ def generate_document_fde_batch_gpu_3stage(
     fde_memmap[batch_start_idx:batch_start_idx + num_docs, :write_width] = (
         fde_cpu[:, :write_width]
     )
-    if hasattr(fde_memmap, "flush"):
-        fde_memmap.flush()
 
-    flush_time = time.perf_counter() - flush_start
-    
-    logging.info(f"[FDE 3-Stream] Completed: upload={upload_time:.3f}s, compute={compute_time:.3f}s, download={download_time:.3f}s, reshape={reshape_time:.3f}s, flush={flush_time:.3f}s")
+    logging.info(
+        "[FDE 3-Stream] Completed: upload=%.3fs, compute=%.3fs, download=%.3fs, reshape=%.3fs",
+        upload_time, compute_time, download_time, reshape_time,
+    )
     
     # ==========================================
     # Performance Summary
@@ -935,19 +932,19 @@ if __name__ == "__main__":
         projection_dimension=128,
     )
     
-    # Create memmap
+    # Output buffer (Worker / gRPC path)
     num_partitions = 2 ** config.num_simhash_projections
     final_fde_dim = config.num_repetitions * num_partitions * 128
-    fde_memmap = np.memmap("test_fde.mmap", mode="w+", dtype=np.float32, shape=(num_docs, final_fde_dim))
+    fde_out = np.zeros((num_docs, final_fde_dim), dtype=np.float32)
     
     logging.info("Testing 3-STREAM PIPELINE...")
     stats = generate_document_fde_batch_gpu_3stage(
         test_embeddings,
         config,
-        fde_memmap,
+        fde_out,
         batch_start_idx=0,
         mini_batch_size=200
     )
     
     logging.info("✅ Test passed!")
-    logging.info(f"Final FDE shape: {fde_memmap.shape}")
+    logging.info(f"Final FDE shape: {fde_out.shape}")

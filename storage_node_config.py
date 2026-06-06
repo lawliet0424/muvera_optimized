@@ -4,104 +4,175 @@ storage_node_config.py
 ======================
 Storage Node 전용 설정.
 
+배포 (dccblue@163.239.199.208)
+------------------------------
+  project_dir          /data/muvera_optimized
+  datasets_root        /data/datasets
+  dataset_collection   flare
+  dataset              (필수)  → corpus: /data/datasets/flare/{dataset}/corpus.jsonl
+                                  output: /data/muvera_optimized/data/fde_out/{dataset}/
+
+경로 결정 우선순위
+------------------
+corpus (최종 corpus_path — BEIR 디렉터리):
+  1. --corpus-path
+  2. --dataset  →  {datasets_root}/{dataset_collection}/{dataset}/
+  3. {project_dir}/data/corpus.json
+
+output (최종 output_dir):
+  1. --output-dir
+  2. --dataset 지정 시  → {project_dir}/data/fde_out/{dataset}/
+  3. {project_dir}/data/fde_out/
+
 사용법
 ------
-storage_node.py 는 이 모듈을 import 해서 기본값으로 사용한다.
-CLI 인자가 전달되면 CLI 값이 우선한다.
-
     from storage_node_config import StorageNodeConfig
-    cfg = StorageNodeConfig()           # 파일 기본값 사용
-    cfg = StorageNodeConfig.from_args(parsed_args)   # CLI 오버라이드
+    cfg = StorageNodeConfig()
+    cfg = StorageNodeConfig.from_args(parsed_args)
 """
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from typing import Optional
+
+# ---------------------------------------------------------------------------
+# 배포 경로 — dccblue@163.239.199.208 (Storage Node)
+# ---------------------------------------------------------------------------
+DEFAULT_PROJECT_DIR          = "/data/muvera_optimized"
+DEFAULT_DATASETS_ROOT        = "/data/datasets"
+DEFAULT_DATASET_COLLECTION   = "flare"
+DEFAULT_DATASET              = None   # --dataset 로 지정 (예: scidocs)
+
+
+def dataset_dir(datasets_root: str, collection: str, dataset: str) -> str:
+    """BEIR corpus 디렉터리: {root}/{collection}/{dataset}/"""
+    return os.path.join(datasets_root, collection, dataset)
+
 
 @dataclass
 class StorageNodeConfig:
     # ------------------------------------------------------------------
-    # 데이터 경로
+    # 데이터 경로 (입력)
     # ------------------------------------------------------------------
 
-    # corpus JSON 파일 경로 {doc_id: {title, text}}
-    corpus_path: str = "/data/corpus.json"
+    project_dir: str = DEFAULT_PROJECT_DIR
+    datasets_root: str = DEFAULT_DATASETS_ROOT
+    dataset_collection: str = DEFAULT_DATASET_COLLECTION
+    dataset: Optional[str] = DEFAULT_DATASET
 
-    # FDE shard mmap 파일 및 보고서 저장 디렉터리
-    output_dir: str = "/data/fde_out"
+    # ------------------------------------------------------------------
+    # 데이터 경로 (resolve_paths() 로 계산되는 최종 값)
+    # ------------------------------------------------------------------
+
+    corpus_path: str = ""
+    output_dir: str = ""
+
+    # CLI 직접 지정 시에만 사용 (resolve_paths 입력)
+    _corpus_override: Optional[str] = field(default=None, repr=False)
+    _output_override: Optional[str] = field(default=None, repr=False)
 
     # ------------------------------------------------------------------
     # Shard 분할
     # ------------------------------------------------------------------
 
-    # corpus 를 몇 개의 shard 로 나눌지
-    # Worker 수 이상으로 설정하면 idle Worker 없이 처리 가능
     num_shards: int = 8
+
+    # Worker 장애 시 inprogress shard 를 pending 으로 되돌리는 lease
+    shard_lease_timeout_sec: float = 600.0
+    shard_max_attempts: int = 3
+    lease_reaper_interval_sec: float = 30.0
 
     # ------------------------------------------------------------------
     # gRPC 서버
     # ------------------------------------------------------------------
 
-    # 바인딩 포트
     port: int = 50051
-
-    # ThreadPoolExecutor 크기 (동시 RPC 처리 수)
-    # Worker 수 × 2 정도로 설정 권장
     max_workers: int = 8
-
-    # 서버 종료 시 진행 중인 RPC 대기 시간(초)
     server_stop_grace_sec: float = 5.0
-
-    # gRPC 단일 메시지 최대 크기 (송신 / 수신 공통, bytes)
     grpc_max_message_bytes: int = 4 * 1024 * 1024   # 4 MB
-
-    # Worker → Storage Node: FDE 수신 시 행 단위 버퍼 크기
-    # (현재 미사용 — 수신 측에서 row_start/row_end 로 직접 기록)
     fde_recv_chunk_rows: int = 512
 
     # ------------------------------------------------------------------
     # 로깅
     # ------------------------------------------------------------------
 
-    # Python logging 레벨 문자열 ("DEBUG" / "INFO" / "WARNING" / "ERROR")
     log_level: str = "INFO"
 
     # ------------------------------------------------------------------
     # 헬퍼
     # ------------------------------------------------------------------
 
+    def __post_init__(self) -> None:
+        self.resolve_paths()
+
+    def resolve_paths(self) -> None:
+        """인자 조합에 따라 corpus_path / output_dir 최종 경로를 계산한다."""
+        if self._corpus_override:
+            self.corpus_path = self._corpus_override
+        elif self.dataset:
+            self.corpus_path = dataset_dir(
+                self.datasets_root, self.dataset_collection, self.dataset
+            )
+        else:
+            self.corpus_path = os.path.join(self.project_dir, "data", "corpus.json")
+
+        if self._output_override:
+            self.output_dir = self._output_override
+        elif self.dataset:
+            self.output_dir = os.path.join(
+                self.project_dir, "data", "fde_out", self.dataset
+            )
+        else:
+            self.output_dir = os.path.join(self.project_dir, "data", "fde_out")
+
     @classmethod
     def from_args(cls, args) -> "StorageNodeConfig":
-        """
-        argparse.Namespace 의 값으로 config 를 생성한다.
-        CLI 에 전달되지 않은 항목은 dataclass 기본값을 유지한다.
-        """
         cfg = cls()
+
+        if getattr(args, "project_dir", None) is not None:
+            cfg.project_dir = str(args.project_dir)
+        if getattr(args, "datasets_root", None) is not None:
+            cfg.datasets_root = str(args.datasets_root)
+        if getattr(args, "dataset_collection", None) is not None:
+            cfg.dataset_collection = str(args.dataset_collection)
+        if getattr(args, "dataset", None) is not None:
+            raw = str(args.dataset).strip()
+            cfg.dataset = raw if raw else None
         if getattr(args, "corpus_path", None) is not None:
-            cfg.corpus_path = str(args.corpus_path)
+            cfg._corpus_override = str(args.corpus_path)
         if getattr(args, "output_dir", None) is not None:
-            cfg.output_dir = str(args.output_dir)
+            cfg._output_override = str(args.output_dir)
         if getattr(args, "num_shards", None) is not None:
             cfg.num_shards = int(args.num_shards)
+        if getattr(args, "shard_lease_timeout_sec", None) is not None:
+            cfg.shard_lease_timeout_sec = float(args.shard_lease_timeout_sec)
+        if getattr(args, "shard_max_attempts", None) is not None:
+            cfg.shard_max_attempts = int(args.shard_max_attempts)
+        if getattr(args, "lease_reaper_interval_sec", None) is not None:
+            cfg.lease_reaper_interval_sec = float(args.lease_reaper_interval_sec)
         if getattr(args, "port", None) is not None:
             cfg.port = int(args.port)
         if getattr(args, "max_workers", None) is not None:
             cfg.max_workers = int(args.max_workers)
+
+        cfg.resolve_paths()
         return cfg
 
     def grpc_server_options(self) -> list:
-        """grpc.server(options=...) 에 전달할 리스트를 반환한다."""
         return [
             ("grpc.max_send_message_length",    self.grpc_max_message_bytes),
             ("grpc.max_receive_message_length", self.grpc_max_message_bytes),
         ]
 
     def validate(self) -> None:
-        """필수 경로 존재 여부 등 기본 검증. 실패 시 ValueError."""
-        if not os.path.isfile(self.corpus_path):
+        if not _corpus_source_exists(self.corpus_path):
             raise ValueError(
-                f"[StorageNodeConfig] corpus_path 파일 없음: {self.corpus_path}"
+                f"[StorageNodeConfig] corpus 소스 없음: {self.corpus_path}\n"
+                f"  기대 경로: {dataset_dir(self.datasets_root, self.dataset_collection, self.dataset or '<dataset>')}/corpus.jsonl\n"
+                f"  (dataset={self.dataset!r}, collection={self.dataset_collection!r}, "
+                f"datasets_root={self.datasets_root})"
             )
         if self.num_shards < 1:
             raise ValueError(
@@ -111,3 +182,24 @@ class StorageNodeConfig:
             raise ValueError(
                 f"[StorageNodeConfig] 유효하지 않은 port: {self.port}"
             )
+        if self.shard_lease_timeout_sec <= 0:
+            raise ValueError(
+                f"[StorageNodeConfig] shard_lease_timeout_sec > 0 이어야 합니다: "
+                f"{self.shard_lease_timeout_sec}"
+            )
+        if self.shard_max_attempts < 1:
+            raise ValueError(
+                f"[StorageNodeConfig] shard_max_attempts >= 1 이어야 합니다: "
+                f"{self.shard_max_attempts}"
+            )
+
+
+def _corpus_source_exists(corpus_path: str) -> bool:
+    """단일 JSON 파일 또는 BEIR corpus 디렉터리 존재 여부."""
+    if os.path.isfile(corpus_path):
+        return True
+    if os.path.isdir(corpus_path):
+        for name in ("corpus.jsonl", "corpus.json"):
+            if os.path.isfile(os.path.join(corpus_path, name)):
+                return True
+    return False

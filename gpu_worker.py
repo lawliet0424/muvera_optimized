@@ -1,20 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-파이프라인
-----------
-1. Storage Node 로부터 문서 원문을 streaming 수신
-2. 로컬 ColBERT 모델로 인코딩  ← 메모리 내 처리
-3. generate_document_fde_batch_gpu_3stage() 로 FDE 생성
-   - 중간 embedding 은 SSD 에 저장하지 않고 메모리에서 직접 FDE 에 전달
-4. FDE 결과를 gRPC streaming 으로 Storage Node 에 업로드
-5. timing 정보 + local SSD flush 시뮬레이션 결과를 ReportShardStatus 로 전송
-6. 다음 shard 를 요청 (GetShard 재호출)
+파이프라인 (shard 당)
+---------------------
+1. Storage Node 로부터 문서 원문 streaming 수신
+2. ColBERT embedding 생성 (RAM)
+3. CUDA FDE 생성 → RAM ndarray 유지
+4. FDE chunk gRPC streaming 업로드
+5. UploadAck 수신·검증 후 RAM 해제
+6. ReportShardStatus 로 timing 전송
+7. 다음 shard 요청 (GetShard)
+
+배포
+----
+  Storage Node  dccblue@163.239.199.208  /data/muvera_optimized
+  Worker 1      dcceris@163.239.199.213  ~/Desktop/muvera_optimized
+  Worker 2      dccbeta@163.239.199.206  ~/muvera_optimized
+  gRPC          163.239.199.208:50051
 
 원본 파이썬 파일 작업 흐름 대비 구현 현황
 -------------------------------------------
 [구현됨]        ColBERT 모델 로드, FDE config 구성, 원문 수신,
                 ColBERT 배치 인코딩, generate_document_fde_batch_gpu_3stage 호출,
-                GPU timing 전 필드 ShardStatus 전송, local SSD flush baseline 비교
+                GPU timing 전 필드 ShardStatus 전송
 
 [주석 표시됨]   캐시 디렉터리/경로 계산(Storage Node 담당), partition_count.csv(미반환),
                 log_memory_usage(psutil), 인코딩 결과 공통 디렉터리 저장
@@ -22,13 +29,6 @@
 [미구현]        쿼리 인코딩(encode_queries), generate_query_fde_gpu, FDE 검색(dot-product),
                 Chamfer 재랭킹, 쿼리/문서 embedding 캐시 관리, latency.tsv 로깅
                 → 이 기능들은 별도 QueryWorker(또는 QueryService RPC)로 분리 권장
-
-local SSD flush 기준선(baseline) 측정
---------------------------------------
-Worker 는 FDE 결과를 Storage Node 에 전송하는 동시에
-"만약 로컬에 저장했다면 얼마나 걸렸을지" 를 tempfile 을 이용해
-실제로 측정한다. 이 값을 ShardStatus.local_flush_time_s 에 담아
-Storage Node 의 remote_flush_time_s 와 비교 가능하게 로그를 남긴다.
 """
 
 from __future__ import annotations
@@ -42,7 +42,6 @@ import os
 import socket
 import struct
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Dict, Iterator, List, Tuple
@@ -53,11 +52,11 @@ import psutil
 
 import fde_pipeline_pb2 as pb2
 
-from gpu_worker_config import WorkerConfig
+from gpu_worker_config import WorkerConfig, MAX_SIMHASH_PROJECTIONS
 import fde_pipeline_pb2_grpc as pb2_grpc
 
 # 기존 FDE 생성 함수 재사용 (CUDA kernel 수정 없음)
-from fde_generator_gpu_optimized_triple_stage_optimized import (
+from fde_generator_gpu_optimized_triple_stage_sharding import (
     FixedDimensionalEncodingConfig,
     EncodingType,
     ProjectionType,
@@ -244,33 +243,6 @@ class ColBERTEncoder:
         return result
 
 # ===========================================================================
-# local SSD flush 시뮬레이션 (baseline 측정)
-# ===========================================================================
-
-def measure_local_flush(fde_array: np.ndarray, tmp_dir: str) -> float:
-    """
-    fde_array 를 임시 파일에 mmap 으로 저장하고 flush 시간을 반환한다.
-    gRPC 전송 대신 로컬 SSD 에 저장했을 때의 기준선(baseline).
-    """
-    num_docs, fde_dim = fde_array.shape
-    fd, tmp_path = tempfile.mkstemp(dir=tmp_dir, suffix=".mmap")
-    os.close(fd)
-    try:
-        mm = np.memmap(tmp_path, mode="w+", dtype=np.float32, shape=(num_docs, fde_dim))
-        mm[:] = fde_array
-        t0 = time.perf_counter()
-        mm.flush()
-        elapsed = time.perf_counter() - t0
-        del mm
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-    return elapsed
-
-
-# ===========================================================================
 # FDE 업로드 스트림 생성기
 # ===========================================================================
 
@@ -306,6 +278,28 @@ def fde_upload_stream(
         )
 
 
+def validate_upload_ack(
+    ack: pb2.UploadAck,
+    shard_index: int,
+    expected_bytes: int,
+) -> None:
+    """UploadFdeShard 응답 검증. 실패 시 RuntimeError."""
+    if ack.status != "ok":
+        raise RuntimeError(
+            f"UploadFdeShard rejected: status={ack.status!r} message={ack.message!r}"
+        )
+    if ack.shard_index != shard_index:
+        raise RuntimeError(
+            f"UploadAck shard_index mismatch: got {ack.shard_index}, "
+            f"expected {shard_index}"
+        )
+    if ack.bytes_received != expected_bytes:
+        raise RuntimeError(
+            f"UploadAck bytes_received mismatch: got {ack.bytes_received}, "
+            f"expected {expected_bytes}"
+        )
+
+
 # ===========================================================================
 # 단일 shard 처리
 # ===========================================================================
@@ -318,14 +312,12 @@ def process_shard(
     metas: List[dict],
     config: FixedDimensionalEncodingConfig,
     encoder: ColBERTEncoder,
-    tmp_dir: str,
 ) -> Tuple[np.ndarray, dict]:
     """
     한 shard 를 처리하여 (fde_array, timing_dict) 를 반환한다.
 
     Step1: ColBERT 인코딩 (Storage Node 가 텍스트만 전송)
-    Step2: FDE memmap 생성 + generate_document_fde_batch_gpu_3stage 호출
-    Step3: flush + timing 집계
+    Step2: generate_document_fde_batch_gpu_3stage (메모리 내 ndarray)
     """
     t_shard_start = time.perf_counter()
 
@@ -348,16 +340,26 @@ def process_shard(
     encoded_map = encoder.encode(docs_to_encode)
 
     valid_embeddings: List[np.ndarray] = []
+    missing_ids: List[str] = []
     for meta in metas:
         did = meta["doc_id"]
         if did in encoded_map:
             valid_embeddings.append(encoded_map[did])
         else:
-            logger.warning(
-                "[Shard %d] 인코딩 실패 doc=%s → zero-vector 대체",
-                shard_index, did,
-            )
-            valid_embeddings.append(np.zeros((1, config.dimension), dtype=np.float32))
+            missing_ids.append(did)
+
+    if missing_ids:
+        preview = missing_ids[:10]
+        suffix = (
+            f" ... (+{len(missing_ids) - 10} more)"
+            if len(missing_ids) > 10
+            else ""
+        )
+        raise RuntimeError(
+            f"[Shard {shard_index}] ColBERT 인코딩 실패: "
+            f"{len(missing_ids)}/{len(metas)} docs missing: "
+            f"{preview}{suffix}"
+        )
 
     del encoded_map
     del docs_to_encode
@@ -405,18 +407,6 @@ def process_shard(
         fde_timing.get("reshape_time",  0),
     )
 
-    # ------------------------------------------------------------------ #
-    # Step 3: local SSD flush 시뮬레이션 (baseline 측정)
-    # [gRPC 전송 전에 측정]
-    # ------------------------------------------------------------------ #
-    local_flush_time = measure_local_flush(fde_array, tmp_dir)
-    logger.info(
-        "[Shard %d] [BASELINE] local SSD flush: %.6fs  (%.2f MB)",
-        shard_index,
-        local_flush_time,
-        fde_array.nbytes / (1024 * 1024),
-    )
-
     # 배치 완료 후 메모리 해제 (원본 del batch_embeddings + gc.collect() 패턴)
     del valid_embeddings
     gc.collect()
@@ -426,12 +416,37 @@ def process_shard(
     timing = {
         "embed_time":              embed_time,
         "fde_time":                fde_time,
-        "local_flush":             local_flush_time,
         "shard_total_before_send": t_shard_total,
         **fde_timing,
     }
 
     return fde_array, timing
+
+
+def _report_shard_abandon(
+    stub: pb2_grpc.ShardServiceStub,
+    cfg: WorkerConfig,
+    worker_id: str,
+    shard_index: int,
+    reason: str,
+) -> None:
+    """Worker 조기 종료 시 in-flight shard 를 Storage Node 에 반환."""
+    if shard_index < 0:
+        return
+    msg = pb2.ShardStatus(
+        shard_index   = shard_index,
+        worker_id     = worker_id,
+        status        = "failure",
+        error_message = reason,
+        num_docs      = 0,
+    )
+    try:
+        stub.ReportShardStatus(msg, timeout=cfg.report_status_timeout_sec)
+        logger.warning(
+            "[Worker] shard=%d abandon reported: %s", shard_index, reason
+        )
+    except grpc.RpcError as exc:
+        logger.warning("[Worker] abandon ReportShardStatus failed: %s", exc)
 
 
 # ===========================================================================
@@ -455,14 +470,13 @@ def run_worker(args: argparse.Namespace) -> None:
         device     = cfg.device,
     )
 
-    os.makedirs(cfg.tmp_dir, exist_ok=True)
-
     logger.info(
-        "Worker 시작: id=%s  server=%s  rep=%d  simhash=%d  device=%s  "
-        "fill_empty=%s  grpc_chunk_bytes=%d",
-        worker_id, cfg.server,
+        "Worker 시작: id=%s  project=%s  server=%s  rep=%d  simhash=%d  "
+        "device=%s  fill_empty=%s  grpc_chunk_bytes=%d",
+        worker_id, cfg.project_dir, cfg.server,
         cfg.num_repetitions, cfg.num_simhash_projections,
-        cfg.device, cfg.fill_empty_partitions, cfg.grpc_fde_chunk_bytes,
+        cfg.device, cfg.fill_empty_partitions,
+        cfg.grpc_fde_chunk_bytes,
     )
     log_memory_usage("worker start")
 
@@ -472,182 +486,187 @@ def run_worker(args: argparse.Namespace) -> None:
     )
     stub = pb2_grpc.ShardServiceStub(channel)
 
-    shard_count    = 0
-    prev_shard_idx = -1
-    prev_status    = ""
+    shard_count     = 0
+    prev_shard_idx  = -1
+    prev_status     = ""
+    in_flight_shard = -1
+    proc_error      = ""
 
     # ------------------------------------------------------------------ #
     # 메인 shard 처리 루프
-    # 원본 대응: index() 의 for batch_start in range(0, len(doc_ids), ATOMIC_BATCH_SIZE)
     # ------------------------------------------------------------------ #
-    while True:
-        t_loop_start = time.perf_counter()
+    try:
+        while True:
+            t_loop_start = time.perf_counter()
 
-        # ---- GetShard 요청 ----
-        request = pb2.ShardRequest(
-            worker_id   = worker_id,
-            shard_index = prev_shard_idx,
-            fde_config  = config_to_proto(config),
-        )
-        if prev_shard_idx >= 0:
-            request.completed.CopyFrom(
-                pb2.CompletedShardInfo(
-                    shard_index   = prev_shard_idx,
-                    status        = prev_status,
-                    error_message = "",
+            # ---- GetShard 요청 ----
+            request = pb2.ShardRequest(
+                worker_id   = worker_id,
+                shard_index = prev_shard_idx,
+                fde_config  = config_to_proto(fde_config),
+            )
+            if prev_shard_idx >= 0:
+                request.completed.CopyFrom(
+                    pb2.CompletedShardInfo(
+                        shard_index   = prev_shard_idx,
+                        status        = prev_status,
+                        error_message = proc_error if prev_status == "failure" else "",
+                    )
                 )
-            )
 
-        # ---- shard streaming 수신 ----
-        t_recv_start = time.perf_counter()
-        try:
-            stream = stub.GetShard(request, timeout=cfg.get_shard_timeout_sec)
-            (
-                shard_index,
-                doc_start,
-                doc_end,
-                doc_ids,
-                metas,
-            ) = receive_shard(stream)
-        except grpc.RpcError as exc:
-            logger.warning("[Worker] GetShard RPC 오류: %s", exc)
-            break
-
-        grpc_recv_time = time.perf_counter() - t_recv_start
-
-        if shard_index < 0 or not doc_ids:
-            logger.info("[Worker] 더 이상 처리할 shard 없음 — 종료")
-            break
-
-        logger.info(
-            "[Worker] shard=%d docs=[%d,%d) 수신  grpc_recv=%.4fs",
-            shard_index, doc_start, doc_end, grpc_recv_time,
-        )
-
-        # ---- GPU 처리 ----
-        try:
-            fde_array, timing = process_shard(
-                shard_index = shard_index,
-                doc_start   = doc_start,
-                doc_end     = doc_end,
-                doc_ids     = doc_ids,
-                metas       = metas,
-                config      = fde_config,
-                encoder     = encoder,
-                tmp_dir     = cfg.tmp_dir,
-            )
-            proc_status = "success"
-            proc_error  = ""
-        except Exception as exc:
-            logger.exception("[Worker] Shard %d 처리 실패: %s", shard_index, exc)
-            proc_status = "failure"
-            proc_error  = str(exc)
-            fde_array   = None
-            timing      = {}
-
-        # ---- FDE 업로드 (gRPC streaming) ----
-        grpc_send_time    = 0.0
-        remote_flush_time = 0.0
-
-        if proc_status == "success" and fde_array is not None:
-            t_send_start = time.perf_counter()
+            # ---- shard streaming 수신 ----
+            t_recv_start = time.perf_counter()
             try:
-                ack = stub.UploadFdeShard(
-                    fde_upload_stream(
-                        shard_index = shard_index,
-                        worker_id   = worker_id,
-                        fde_array   = fde_array,
-                        embed_time  = timing.get("embed_time", 0.0),
-                        fde_time    = timing.get("fde_time",   0.0),
-                    ),
-                    timeout=cfg.upload_fde_timeout_sec,
-                )
-                grpc_send_time    = time.perf_counter() - t_send_start
-                remote_flush_time = ack.remote_flush_time_s
-
-                # ── [PERF LOG] local SSD flush vs. gRPC 전송 + remote flush 비교
-                local_flush = timing.get("local_flush", 0.0)
-                grpc_total  = grpc_send_time + remote_flush_time
-                logger.info(
-                    "[PERF COMPARE] shard=%d worker=%s | "
-                    "local_ssd_flush=%.6fs | "
-                    "grpc_send=%.6fs | "
-                    "remote_flush=%.6fs | "
-                    "grpc_total(send+remote)=%.6fs | "
-                    "diff(grpc-local)=%+.6fs | "
-                    "fde_size_mb=%.3f",
-                    shard_index, worker_id,
-                    local_flush,
-                    grpc_send_time,
-                    remote_flush_time,
-                    grpc_total,
-                    grpc_total - local_flush,
-                    fde_array.nbytes / (1024 * 1024),
-                )
-
+                stream = stub.GetShard(request, timeout=cfg.get_shard_timeout_sec)
+                (
+                    shard_index,
+                    doc_start,
+                    doc_end,
+                    doc_ids,
+                    metas,
+                ) = receive_shard(stream)
             except grpc.RpcError as exc:
-                logger.error("[Worker] UploadFdeShard RPC 오류: %s", exc)
+                logger.warning("[Worker] GetShard RPC 오류: %s", exc)
+                break
+
+            grpc_recv_time = time.perf_counter() - t_recv_start
+
+            if shard_index < 0 or not doc_ids:
+                logger.info("[Worker] 더 이상 처리할 shard 없음 — 종료")
+                break
+
+            in_flight_shard = shard_index
+
+            logger.info(
+                "[Worker] shard=%d docs=[%d,%d) 수신  grpc_recv=%.4fs",
+                shard_index, doc_start, doc_end, grpc_recv_time,
+            )
+
+            proc_error = ""
+
+            # ---- GPU 처리 ----
+            try:
+                fde_array, timing = process_shard(
+                    shard_index = shard_index,
+                    doc_start   = doc_start,
+                    doc_end     = doc_end,
+                    doc_ids     = doc_ids,
+                    metas       = metas,
+                    config      = fde_config,
+                    encoder     = encoder,
+                )
+                proc_status = "success"
+            except Exception as exc:
+                logger.exception("[Worker] Shard %d 처리 실패: %s", shard_index, exc)
                 proc_status = "failure"
                 proc_error  = str(exc)
+                fde_array   = None
+                timing      = {}
 
-        end_to_end = time.perf_counter() - t_loop_start
+            # ---- FDE 업로드 (gRPC streaming) ----
+            grpc_send_time    = 0.0
+            remote_flush_time = 0.0
 
-        # ---- ShardStatus 보고 ----
-        # 원본 대응: TIMING / CUMULATIVE_TIMING 전체 필드를 proto 로 전송
-        status_msg = pb2.ShardStatus(
-            shard_index         = shard_index,
-            worker_id           = worker_id,
-            status              = proc_status,
-            error_message       = proc_error,
-            num_docs            = len(doc_ids),
-            doc_start           = doc_start,
-            doc_end             = doc_end,
-            # GPU FDE timing (generate_document_fde_batch_gpu_3stage 반환값 전체)
-            prep_time_s         = timing.get("prep_time",      0.0),
-            upload_time_s       = timing.get("upload_time",    0.0),
-            simhash_time_s      = timing.get("simhash_time",   0.0),
-            partition_time_s    = timing.get("partition_time", 0.0),
-            scatter_time_s      = timing.get("scatter_time",   0.0),
-            average_time_s      = timing.get("average_time",   0.0),
-            fill_time_s         = timing.get("fill_time",      0.0),
-            compute_time_s      = timing.get("compute_time",   0.0),
-            download_time_s     = timing.get("download_time",  0.0),
-            reshape_time_s      = timing.get("reshape_time",   0.0),
-            flush_time_s        = timing.get("flush_time",     0.0),
-            fde_total_time_s    = timing.get("fde_time",       0.0),
-            # 파이프라인 timing
-            embed_time_s        = timing.get("embed_time",     0.0),
-            grpc_recv_time_s    = grpc_recv_time,
-            grpc_send_time_s    = grpc_send_time,
-            remote_flush_time_s = remote_flush_time,
-            local_flush_time_s  = timing.get("local_flush",   0.0),
-            end_to_end_time_s   = end_to_end,
-        )
+            if proc_status == "success" and fde_array is not None:
+                t_send_start = time.perf_counter()
+                try:
+                    ack = stub.UploadFdeShard(
+                        fde_upload_stream(
+                            shard_index = shard_index,
+                            worker_id   = worker_id,
+                            fde_array   = fde_array,
+                            embed_time  = timing.get("embed_time", 0.0),
+                            fde_time    = timing.get("fde_time",   0.0),
+                        ),
+                        timeout=cfg.upload_fde_timeout_sec,
+                    )
+                    fde_bytes = fde_array.nbytes
+                    validate_upload_ack(ack, shard_index, fde_bytes)
+                    grpc_send_time    = time.perf_counter() - t_send_start
+                    remote_flush_time = ack.remote_flush_time_s
+                    del fde_array
+                    fde_array = None
+                    gc.collect()
 
-        try:
-            stub.ReportShardStatus(status_msg, timeout=cfg.report_status_timeout_sec)
-        except grpc.RpcError as exc:
-            logger.warning("[Worker] ReportShardStatus 오류: %s", exc)
+                    logger.info(
+                        "[PERF] shard=%d worker=%s | "
+                        "grpc_send(RPC total)=%.6fs | "
+                        "remote_flush(subset)=%.6fs | "
+                        "fde_size_mb=%.3f",
+                        shard_index, worker_id,
+                        grpc_send_time,
+                        remote_flush_time,
+                        fde_bytes / (1024 * 1024),
+                    )
 
-        prev_shard_idx = shard_index
-        prev_status    = proc_status
-        shard_count   += 1
+                except grpc.RpcError as exc:
+                    logger.error("[Worker] UploadFdeShard RPC 오류: %s", exc)
+                    proc_status = "failure"
+                    proc_error  = str(exc)
+                except RuntimeError as exc:
+                    logger.error("[Worker] UploadFdeShard 검증 실패: %s", exc)
+                    proc_status = "failure"
+                    proc_error  = str(exc)
 
-        logger.info(
-            "[Worker] shard=%d 완료  end_to_end=%.3fs  "
-            "(recv=%.3fs embed=%.3fs fde=%.3fs send=%.3fs local_flush=%.3fs)",
-            shard_index, end_to_end,
-            grpc_recv_time,
-            timing.get("embed_time",  0),
-            timing.get("fde_time",    0),
-            grpc_send_time,
-            timing.get("local_flush", 0),
-        )
-        log_memory_usage(f"shard {shard_index} done")
+            end_to_end = time.perf_counter() - t_loop_start
 
-    channel.close()
-    logger.info("[Worker] 종료. 처리한 shard 수: %d", shard_count)
-    log_memory_usage("worker end")
+            # ---- ShardStatus 보고 ----
+            status_msg = pb2.ShardStatus(
+                shard_index         = shard_index,
+                worker_id           = worker_id,
+                status              = proc_status,
+                error_message       = proc_error,
+                num_docs            = len(doc_ids),
+                doc_start           = doc_start,
+                doc_end             = doc_end,
+                prep_time_s         = timing.get("prep_time",      0.0),
+                upload_time_s       = timing.get("upload_time",    0.0),
+                simhash_time_s      = timing.get("simhash_time",   0.0),
+                partition_time_s    = timing.get("partition_time", 0.0),
+                scatter_time_s      = timing.get("scatter_time",   0.0),
+                average_time_s      = timing.get("average_time",   0.0),
+                fill_time_s         = timing.get("fill_time",      0.0),
+                compute_time_s      = timing.get("compute_time",   0.0),
+                download_time_s     = timing.get("download_time",  0.0),
+                reshape_time_s      = timing.get("reshape_time",   0.0),
+                flush_time_s        = timing.get("flush_time",     0.0),
+                fde_total_time_s    = timing.get("fde_time",       0.0),
+                embed_time_s        = timing.get("embed_time",     0.0),
+                grpc_recv_time_s    = grpc_recv_time,
+                grpc_send_time_s    = grpc_send_time,
+                remote_flush_time_s = remote_flush_time,
+                end_to_end_time_s   = end_to_end,
+            )
+
+            try:
+                stub.ReportShardStatus(status_msg, timeout=cfg.report_status_timeout_sec)
+            except grpc.RpcError as exc:
+                logger.warning("[Worker] ReportShardStatus 오류: %s", exc)
+
+            in_flight_shard = -1
+            prev_shard_idx  = shard_index
+            prev_status     = proc_status
+            shard_count    += 1
+
+            logger.info(
+                "[Worker] shard=%d 완료  end_to_end=%.3fs  "
+                "(recv=%.3fs embed=%.3fs fde=%.3fs send=%.3fs)",
+                shard_index, end_to_end,
+                grpc_recv_time,
+                timing.get("embed_time",  0),
+                timing.get("fde_time",    0),
+                grpc_send_time,
+            )
+            log_memory_usage(f"shard {shard_index} done")
+
+    finally:
+        if in_flight_shard >= 0:
+            _report_shard_abandon(
+                stub, cfg, worker_id, in_flight_shard, "worker early exit"
+            )
+        channel.close()
+        logger.info("[Worker] 종료. 처리한 shard 수: %d", shard_count)
+        log_memory_usage("worker end")
 
 
 # ===========================================================================
@@ -665,13 +684,15 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--server",       default=_defaults.server,
-                   help="Storage Node gRPC address (host:port)")
+                   help="Storage Node gRPC address (163.239.199.208:50051)")
+    p.add_argument("--project-dir",  default=None,
+                   help="Worker 프로젝트 루트 (기본: 호스트명으로 자동 선택)")
     p.add_argument("--worker-id",    default=_defaults.worker_id,
                    help="Worker 식별자 (기본: hostname-PID)")
     p.add_argument("--rep",          type=int, default=_defaults.num_repetitions,
                    help="num_repetitions (FDE 반복 횟수)")
     p.add_argument("--simhash",      type=int, default=_defaults.num_simhash_projections,
-                   help="num_simhash_projections (partition 비트 수)")
+                   help=f"num_simhash_projections (1~{MAX_SIMHASH_PROJECTIONS})")
     p.add_argument("--projection",   type=int, default=_defaults.projection_dimension,
                    help="AMS projection_dimension (None=identity)")
     p.add_argument("--fill-empty",   action="store_true",
@@ -681,8 +702,6 @@ def parse_args() -> argparse.Namespace:
                    help="ColBERT 모델 이름 (문서 텍스트 인코딩에 사용)")
     p.add_argument("--device",       default=_defaults.device,
                    help="PyTorch device (cuda/cpu)")
-    p.add_argument("--tmp-dir",      default=_defaults.tmp_dir,
-                   help="local SSD flush baseline 측정용 임시 디렉터리")
     return p.parse_args()
 
 

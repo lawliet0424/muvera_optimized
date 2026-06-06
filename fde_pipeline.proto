@@ -1,5 +1,23 @@
 syntax = "proto3";
 
+// ============================================================
+// 배포 경로 
+// ============================================================
+//
+// Storage Node  dccblue@163.239.199.208
+//   코드/실행   /data/muvera_optimized
+//   corpus      /data/datasets/flare/{dataset}/corpus.jsonl
+//   FDE 출력    /data/muvera_optimized/data/fde_out/{dataset}/
+//   gRPC        163.239.199.208:50051
+//
+// GPU Worker 1  dcceris@163.239.199.213
+//   코드/실행   ~/Desktop/muvera_optimized
+//
+// GPU Worker 2  dccbeta@163.239.199.206
+//   코드/실행   ~/muvera_optimized
+//
+// ============================================================
+
 package fde_pipeline;
 
 // ============================================================
@@ -11,7 +29,7 @@ package fde_pipeline;
 message FdeConfig {
   int32  dimension                  = 1;
   int32  num_repetitions            = 2;
-  int32  num_simhash_projections    = 3;
+  int32  num_simhash_projections    = 3;  // 1~31 (partition 수 = 2^bits)
   int32  seed                       = 4;
   int32  encoding_type              = 5;  // EncodingType.value
   int32  projection_type            = 6;  // ProjectionType.value
@@ -121,7 +139,7 @@ message UploadAck {
   int32  shard_index         = 1;
   string status              = 2;   // "ok" | "error"
   string message             = 3;
-  double remote_flush_time_s = 4;   // Storage Node 기준 flush 시간
+  double remote_flush_time_s = 4;   // Storage Node flush+fsync (grpc_send RPC 에 포함)
   double grpc_transfer_time_s= 5;   // Storage Node 측정 수신 시간
   int64  bytes_received      = 6;
 }
@@ -153,16 +171,15 @@ message ShardStatus {
   // 파이프라인 추가 timing
   double embed_time_s        = 17;  // ColBERT 인코딩
   double grpc_recv_time_s    = 18;  // shard 수신
-  double grpc_send_time_s    = 19;  // FDE 전송
-  double remote_flush_time_s = 20;  // Storage Node flush
+  double grpc_send_time_s    = 19;  // UploadFdeShard RPC 왕복 (remote flush 포함)
+  double remote_flush_time_s = 20;  // Storage Node flush+fsync (grpc_send 의 부분집합)
   double end_to_end_time_s   = 21;
 
   int32  num_docs            = 22;
   int32  doc_start           = 23;
   int32  doc_end             = 24;
 
-  // baseline 비교용: local SSD flush 시뮬레이션 시간
-  double local_flush_time_s  = 25;  // Worker 측에서 측정한 로컬 flush 시간
+  reserved 25;  // 구 local_flush_time_s (분산 배포에서 미사용)
 }
 
 message StatusAck {
