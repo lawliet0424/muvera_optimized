@@ -77,7 +77,8 @@ class StorageNodeConfig:
     # Shard 분할
     # ------------------------------------------------------------------
 
-    num_shards: int = 8
+    # GetShard 1회당 전송 문서 수 (worker 수와 무관, 기본 10 000 ≈ 8 000~12 000 최적 구간)
+    shard_doc_size: int = 10_000
 
     # Worker 장애 시 inprogress shard 를 pending 으로 되돌리는 lease
     shard_lease_timeout_sec: float = 600.0
@@ -144,8 +145,8 @@ class StorageNodeConfig:
             cfg._corpus_override = str(args.corpus_path)
         if getattr(args, "output_dir", None) is not None:
             cfg._output_override = str(args.output_dir)
-        if getattr(args, "num_shards", None) is not None:
-            cfg.num_shards = int(args.num_shards)
+        if getattr(args, "shard_doc_size", None) is not None:
+            cfg.shard_doc_size = int(args.shard_doc_size)
         if getattr(args, "shard_lease_timeout_sec", None) is not None:
             cfg.shard_lease_timeout_sec = float(args.shard_lease_timeout_sec)
         if getattr(args, "shard_max_attempts", None) is not None:
@@ -174,9 +175,10 @@ class StorageNodeConfig:
                 f"  (dataset={self.dataset!r}, collection={self.dataset_collection!r}, "
                 f"datasets_root={self.datasets_root})"
             )
-        if self.num_shards < 1:
+        if self.shard_doc_size < 1:
             raise ValueError(
-                f"[StorageNodeConfig] num_shards 는 1 이상이어야 합니다: {self.num_shards}"
+                f"[StorageNodeConfig] shard_doc_size 는 1 이상이어야 합니다: "
+                f"{self.shard_doc_size}"
             )
         if not (1 <= self.port <= 65535):
             raise ValueError(

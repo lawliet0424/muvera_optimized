@@ -74,16 +74,14 @@ logger = logging.getLogger(__name__)
 # Shard 분할 헬퍼
 # ===========================================================================
 
-def compute_shards(total_docs: int, num_shards: int) -> list[tuple[int, int]]:
-    """corpus 를 균등하게 shard 로 분할."""
-    actual = min(num_shards, total_docs)
-    size = math.ceil(total_docs / actual)
+def compute_shards(total_docs: int, shard_doc_size: int) -> list[tuple[int, int]]:
+    """corpus 를 shard_doc_size 단위로 분할 (마지막 shard 는 잔여분)."""
+    if total_docs <= 0:
+        return []
+    size = max(1, shard_doc_size)
     shards = []
-    for i in range(actual):
-        s = i * size
+    for s in range(0, total_docs, size):
         e = min(s + size, total_docs)
-        if s >= total_docs:
-            break
         shards.append((s, e))
     return shards
 
@@ -602,6 +600,69 @@ class ShardServicer(pb2_grpc.ShardServiceServicer):
         self._log_lock   = threading.Lock()
         self._canonical_fde_config: Optional[pb2.FdeConfig] = None
         self._fde_config_lock = threading.Lock()
+        # shard별 Storage Node wall-clock (time.time())
+        self._shard_wall_ts: Dict[int, dict] = {}
+        self._wall_ts_lock = threading.Lock()
+        self._pipeline_wall_ts: Dict[str, Optional[float]] = {
+            "first_get_shard_recv_ts": None,
+            "last_status_recv_ts":     None,
+        }
+
+    def _record_shard_wall_ts(self, shard_idx: int, **fields: float) -> None:
+        with self._wall_ts_lock:
+            self._shard_wall_ts.setdefault(shard_idx, {}).update(fields)
+
+    def _get_shard_wall_ts(self, shard_idx: int) -> dict:
+        with self._wall_ts_lock:
+            return dict(self._shard_wall_ts.get(shard_idx, {}))
+
+    @staticmethod
+    def _build_timing_from_status(request: pb2.ShardStatus, wall_ts: dict) -> dict:
+        """ShardStatus duration + wall-clock timestamps → timing dict."""
+        storage_status_recv_ts = wall_ts.get("storage_status_recv_ts", 0.0)
+        storage_get_shard_recv_ts = wall_ts.get("storage_get_shard_recv_ts", 0.0)
+
+        timing = {
+            "prep_time":        request.prep_time_s,
+            "upload_time":      request.upload_time_s,
+            "simhash_time":     request.simhash_time_s,
+            "partition_time":   request.partition_time_s,
+            "scatter_time":     request.scatter_time_s,
+            "average_time":     request.average_time_s,
+            "fill_time":        request.fill_time_s,
+            "compute_time":     request.compute_time_s,
+            "download_time":    request.download_time_s,
+            "reshape_time":     request.reshape_time_s,
+            "flush_time":       request.flush_time_s,
+            "fde_total":        request.fde_total_time_s,
+            "embed_time":       request.embed_time_s,
+            "grpc_recv":        request.grpc_recv_time_s,
+            "grpc_send":        request.grpc_send_time_s,
+            "remote_flush":     request.remote_flush_time_s,
+            "end_to_end":       request.end_to_end_time_s,
+            # Worker wall-clock (time.time())
+            "worker_get_shard_req_ts":  request.worker_get_shard_req_ts,
+            "worker_get_shard_done_ts": request.worker_get_shard_done_ts,
+            "worker_process_start_ts":  request.worker_process_start_ts,
+            "worker_process_done_ts":   request.worker_process_done_ts,
+            "worker_upload_req_ts":     request.worker_upload_req_ts,
+            "worker_upload_done_ts":    request.worker_upload_done_ts,
+            "worker_status_report_ts":  request.worker_status_report_ts,
+            # Storage Node wall-clock (time.time())
+            **wall_ts,
+        }
+
+        w_req = request.worker_get_shard_req_ts
+        w_end = request.worker_status_report_ts
+        if w_req > 0 and w_end > 0:
+            timing["worker_wall_total_s"] = w_end - w_req
+
+        if storage_get_shard_recv_ts > 0 and storage_status_recv_ts > 0:
+            timing["storage_shard_wall_s"] = (
+                storage_status_recv_ts - storage_get_shard_recv_ts
+            )
+
+        return timing
 
     def _canonical_fde_dim(self) -> Optional[int]:
         with self._fde_config_lock:
@@ -685,6 +746,9 @@ class ShardServicer(pb2_grpc.ShardServiceServicer):
         self, request: pb2.ShardRequest, context: grpc.ServicerContext
     ) -> Iterator[pb2.DocumentChunk]:
         worker_id = request.worker_id
+        t_get_shard_recv = time.time()
+        if self._pipeline_wall_ts["first_get_shard_recv_ts"] is None:
+            self._pipeline_wall_ts["first_get_shard_recv_ts"] = t_get_shard_recv
 
         self._validate_worker_fde_config(request, context)
         self._dispatcher.expire_leases()
@@ -721,6 +785,10 @@ class ShardServicer(pb2_grpc.ShardServiceServicer):
             shard_idx, doc_start, doc_end, worker_id,
         )
 
+        self._record_shard_wall_ts(
+            shard_idx, storage_get_shard_recv_ts=t_get_shard_recv
+        )
+
         try:
             self._ensure_shard_preallocated(shard_idx)  # shard_{N}.mmap.tmp
         except (RuntimeError, ValueError) as exc:
@@ -752,9 +820,16 @@ class ShardServicer(pb2_grpc.ShardServiceServicer):
                 corpus_text        = doc.get("text", ""),
             )
 
+        t_get_shard_send_done = time.time()
+        self._record_shard_wall_ts(
+            shard_idx, storage_get_shard_send_done_ts=t_get_shard_send_done
+        )
+
         logger.info(
-            "[GetShard] Sent shard=%d (%d docs) to worker=%s",
+            "[GetShard] Sent shard=%d (%d docs) to worker=%s  "
+            "wall_send=%.3fs",
             shard_idx, num_docs_in_shard, worker_id,
+            t_get_shard_send_done - t_get_shard_recv,
         )
 
     # ------------------------------------------------------------------ #
@@ -815,6 +890,10 @@ class ShardServicer(pb2_grpc.ShardServiceServicer):
                     upload_error = str(exc)
                     break
 
+                self._record_shard_wall_ts(
+                    shard_index,
+                    storage_upload_recv_start_ts=time.time(),
+                )
                 self._dispatcher.touch_lease(shard_index)
                 row_bitmap = bytearray(num_docs)
                 logger.info(
@@ -946,6 +1025,9 @@ class ShardServicer(pb2_grpc.ShardServiceServicer):
 
         # flush + fsync + atomic rename → ACK
         remote_flush_time = self._store.finalize(shard_index)
+        self._record_shard_wall_ts(
+            shard_index, storage_upload_done_ts=time.time()
+        )
 
         logger.info(
             "[Upload] shard=%d DONE  grpc_recv=%.4fs  remote_flush=%.4fs  "
@@ -984,25 +1066,11 @@ class ShardServicer(pb2_grpc.ShardServiceServicer):
     ) -> pb2.StatusAck:
         self._dispatcher.expire_leases()
 
-        timing = {
-            "prep_time":        request.prep_time_s,
-            "upload_time":      request.upload_time_s,
-            "simhash_time":     request.simhash_time_s,
-            "partition_time":   request.partition_time_s,
-            "scatter_time":     request.scatter_time_s,
-            "average_time":     request.average_time_s,
-            "fill_time":        request.fill_time_s,
-            "compute_time":     request.compute_time_s,
-            "download_time":    request.download_time_s,
-            "reshape_time":     request.reshape_time_s,
-            "flush_time":       request.flush_time_s,
-            "fde_total":        request.fde_total_time_s,
-            "embed_time":       request.embed_time_s,
-            "grpc_recv":        request.grpc_recv_time_s,
-            "grpc_send":        request.grpc_send_time_s,
-            "remote_flush":     request.remote_flush_time_s,
-            "end_to_end":       request.end_to_end_time_s,
-        }
+        t_status_recv = time.time()
+        self._pipeline_wall_ts["last_status_recv_ts"] = t_status_recv
+        wall_ts = self._get_shard_wall_ts(request.shard_index)
+        wall_ts["storage_status_recv_ts"] = t_status_recv
+        timing = self._build_timing_from_status(request, wall_ts)
 
         if request.status == "success":
             self._dispatcher.mark_done(request.shard_index, timing)
@@ -1082,6 +1150,13 @@ class ShardServicer(pb2_grpc.ShardServiceServicer):
         summary = self._dispatcher.summary()
         logs    = self._status_log[:]
 
+        pts = self._pipeline_wall_ts
+        pipeline_wall_total_s = None
+        if pts["first_get_shard_recv_ts"] and pts["last_status_recv_ts"]:
+            pipeline_wall_total_s = round(
+                pts["last_status_recv_ts"] - pts["first_get_shard_recv_ts"], 3
+            )
+
         # ---- final_manifest.json ----
         manifest = {
             "generated_at":         time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1089,6 +1164,11 @@ class ShardServicer(pb2_grpc.ShardServiceServicer):
             "done":                 summary["done"],
             "failed":               summary["failed"],
             "total_elapsed_sec":    round(summary["elapsed_sec"], 3),
+            "pipeline_wall_clock": {
+                "first_get_shard_recv_ts": pts["first_get_shard_recv_ts"],
+                "last_status_recv_ts":     pts["last_status_recv_ts"],
+                "pipeline_wall_total_s":   pipeline_wall_total_s,
+            },
             "shards": [
                 {
                     "shard_index":  e["shard_index"],
@@ -1111,7 +1191,9 @@ class ShardServicer(pb2_grpc.ShardServiceServicer):
         fields = [
             "shard_index", "worker_id", "status", "num_docs",
             "embed_time", "fde_total", "grpc_send", "remote_flush",
-            "end_to_end",
+            "end_to_end", "worker_wall_total_s", "storage_shard_wall_s",
+            "worker_get_shard_req_ts", "worker_status_report_ts",
+            "storage_get_shard_recv_ts", "storage_status_recv_ts",
             "prep_time", "upload_time", "compute_time", "download_time",
         ]
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -1129,6 +1211,12 @@ class ShardServicer(pb2_grpc.ShardServiceServicer):
                     "grpc_send":    f"{t.get('grpc_send', 0):.4f}",
                     "remote_flush": f"{t.get('remote_flush', 0):.4f}",
                     "end_to_end":   f"{t.get('end_to_end', 0):.4f}",
+                    "worker_wall_total_s":  f"{t.get('worker_wall_total_s', 0):.4f}",
+                    "storage_shard_wall_s": f"{t.get('storage_shard_wall_s', 0):.4f}",
+                    "worker_get_shard_req_ts":  f"{t.get('worker_get_shard_req_ts', 0):.3f}",
+                    "worker_status_report_ts":  f"{t.get('worker_status_report_ts', 0):.3f}",
+                    "storage_get_shard_recv_ts":f"{t.get('storage_get_shard_recv_ts', 0):.3f}",
+                    "storage_status_recv_ts":   f"{t.get('storage_status_recv_ts', 0):.3f}",
                     "prep_time":    f"{t.get('prep_time', 0):.4f}",
                     "upload_time":  f"{t.get('upload_time', 0):.4f}",
                     "compute_time": f"{t.get('compute_time', 0):.4f}",
@@ -1167,7 +1255,7 @@ def serve(args: argparse.Namespace) -> None:
     logging.basicConfig(level=getattr(logging, cfg.log_level, logging.INFO))
 
     corpus     = CorpusLoader(cfg.corpus_path)
-    shards     = compute_shards(corpus.total_docs(), cfg.num_shards)
+    shards     = compute_shards(corpus.total_docs(), cfg.shard_doc_size)
     dispatcher = ShardDispatcher(
         shards,
         lease_timeout_sec=cfg.shard_lease_timeout_sec,
@@ -1197,10 +1285,11 @@ def serve(args: argparse.Namespace) -> None:
     server.start()
 
     logger.info(
-        "Storage Node started: project=%s  dataset=%s  port=%d  shards=%d  docs=%d  "
-        "corpus=%s  output=%s  max_workers=%d  grpc_max_msg=%d  "
-        "lease_timeout=%.0fs  max_attempts=%d",
-        cfg.project_dir, cfg.dataset, cfg.port, len(shards), corpus.total_docs(),
+        "Storage Node started: project=%s  dataset=%s  port=%d  shards=%d  "
+        "shard_doc_size=%d  docs=%d  corpus=%s  output=%s  max_workers=%d  "
+        "grpc_max_msg=%d  lease_timeout=%.0fs  max_attempts=%d",
+        cfg.project_dir, cfg.dataset, cfg.port, len(shards),
+        cfg.shard_doc_size, corpus.total_docs(),
         cfg.corpus_path, cfg.output_dir, cfg.max_workers,
         cfg.grpc_max_message_bytes,
         cfg.shard_lease_timeout_sec, cfg.shard_max_attempts,
@@ -1238,8 +1327,8 @@ def parse_args() -> argparse.Namespace:
                         "지정 시 --dataset 보다 우선")
     p.add_argument("--output-dir",  default=None,
                    help="FDE 출력 디렉터리. 지정 시 --dataset 보다 우선")
-    p.add_argument("--num-shards",  type=int, default=_defaults.num_shards,
-                   help="corpus 를 나눌 shard 수")
+    p.add_argument("--shard-doc-size", type=int, default=_defaults.shard_doc_size,
+                   help="GetShard 1회당 전송 문서 수 (기본 10000, 권장 8000~12000)")
     p.add_argument("--shard-lease-timeout-sec", type=float,
                    default=_defaults.shard_lease_timeout_sec,
                    help="Worker 장애 시 inprogress shard lease 만료(초)")

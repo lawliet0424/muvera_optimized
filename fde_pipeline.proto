@@ -180,6 +180,15 @@ message ShardStatus {
   int32  doc_end             = 24;
 
   reserved 25;  // 구 local_flush_time_s (분산 배포에서 미사용)
+
+  // Wall-clock timestamps (time.time(), Unix epoch seconds) — Worker 측 기록
+  double worker_get_shard_req_ts  = 26;  // GetShard RPC 호출 직전
+  double worker_get_shard_done_ts = 27;  // DocumentChunk 수신 완료
+  double worker_process_start_ts  = 28;  // ColBERT+FDE 시작
+  double worker_process_done_ts   = 29;  // ColBERT+FDE 완료
+  double worker_upload_req_ts     = 30;  // UploadFdeShard RPC 호출 직전
+  double worker_upload_done_ts    = 31;  // UploadAck 수신 완료
+  double worker_status_report_ts  = 32;  // ReportShardStatus RPC 호출 직전
 }
 
 message StatusAck {

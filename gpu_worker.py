@@ -491,6 +491,7 @@ def run_worker(args: argparse.Namespace) -> None:
     prev_status     = ""
     in_flight_shard = -1
     proc_error      = ""
+    worker_pipeline_start_ts = time.time()
 
     # ------------------------------------------------------------------ #
     # 메인 shard 처리 루프
@@ -498,6 +499,7 @@ def run_worker(args: argparse.Namespace) -> None:
     try:
         while True:
             t_loop_start = time.perf_counter()
+            t_get_shard_req = time.time()
 
             # ---- GetShard 요청 ----
             request = pb2.ShardRequest(
@@ -530,6 +532,7 @@ def run_worker(args: argparse.Namespace) -> None:
                 break
 
             grpc_recv_time = time.perf_counter() - t_recv_start
+            t_get_shard_done = time.time()
 
             if shard_index < 0 or not doc_ids:
                 logger.info("[Worker] 더 이상 처리할 shard 없음 — 종료")
@@ -543,6 +546,8 @@ def run_worker(args: argparse.Namespace) -> None:
             )
 
             proc_error = ""
+            t_process_start = time.time()
+            t_process_done  = t_process_start
 
             # ---- GPU 처리 ----
             try:
@@ -556,19 +561,24 @@ def run_worker(args: argparse.Namespace) -> None:
                     encoder     = encoder,
                 )
                 proc_status = "success"
+                t_process_done = time.time()
             except Exception as exc:
                 logger.exception("[Worker] Shard %d 처리 실패: %s", shard_index, exc)
                 proc_status = "failure"
                 proc_error  = str(exc)
                 fde_array   = None
                 timing      = {}
+                t_process_done = time.time()
 
             # ---- FDE 업로드 (gRPC streaming) ----
             grpc_send_time    = 0.0
             remote_flush_time = 0.0
+            t_upload_req      = 0.0
+            t_upload_done     = 0.0
 
             if proc_status == "success" and fde_array is not None:
                 t_send_start = time.perf_counter()
+                t_upload_req = time.time()
                 try:
                     ack = stub.UploadFdeShard(
                         fde_upload_stream(
@@ -583,6 +593,7 @@ def run_worker(args: argparse.Namespace) -> None:
                     fde_bytes = fde_array.nbytes
                     validate_upload_ack(ack, shard_index, fde_bytes)
                     grpc_send_time    = time.perf_counter() - t_send_start
+                    t_upload_done     = time.time()
                     remote_flush_time = ack.remote_flush_time_s
                     del fde_array
                     fde_array = None
@@ -600,15 +611,19 @@ def run_worker(args: argparse.Namespace) -> None:
                     )
 
                 except grpc.RpcError as exc:
+                    t_upload_done = time.time()
                     logger.error("[Worker] UploadFdeShard RPC 오류: %s", exc)
                     proc_status = "failure"
                     proc_error  = str(exc)
                 except RuntimeError as exc:
+                    t_upload_done = time.time()
                     logger.error("[Worker] UploadFdeShard 검증 실패: %s", exc)
                     proc_status = "failure"
                     proc_error  = str(exc)
 
             end_to_end = time.perf_counter() - t_loop_start
+            t_status_report = time.time()
+            worker_wall_total_s = t_status_report - t_get_shard_req
 
             # ---- ShardStatus 보고 ----
             status_msg = pb2.ShardStatus(
@@ -636,6 +651,13 @@ def run_worker(args: argparse.Namespace) -> None:
                 grpc_send_time_s    = grpc_send_time,
                 remote_flush_time_s = remote_flush_time,
                 end_to_end_time_s   = end_to_end,
+                worker_get_shard_req_ts  = t_get_shard_req,
+                worker_get_shard_done_ts = t_get_shard_done,
+                worker_process_start_ts  = t_process_start,
+                worker_process_done_ts   = t_process_done,
+                worker_upload_req_ts     = t_upload_req,
+                worker_upload_done_ts    = t_upload_done,
+                worker_status_report_ts  = t_status_report,
             )
 
             try:
@@ -649,13 +671,17 @@ def run_worker(args: argparse.Namespace) -> None:
             shard_count    += 1
 
             logger.info(
-                "[Worker] shard=%d 완료  end_to_end=%.3fs  "
-                "(recv=%.3fs embed=%.3fs fde=%.3fs send=%.3fs)",
-                shard_index, end_to_end,
+                "[Worker] shard=%d 완료  end_to_end=%.3fs  wall_total=%.3fs  "
+                "(recv=%.3fs embed=%.3fs fde=%.3fs send=%.3fs)  "
+                "ts: get_req=%.3f get_done=%.3f proc_done=%.3f "
+                "upload_done=%.3f status=%.3f",
+                shard_index, end_to_end, worker_wall_total_s,
                 grpc_recv_time,
                 timing.get("embed_time",  0),
                 timing.get("fde_time",    0),
                 grpc_send_time,
+                t_get_shard_req, t_get_shard_done, t_process_done,
+                t_upload_done, t_status_report,
             )
             log_memory_usage(f"shard {shard_index} done")
 
@@ -665,7 +691,15 @@ def run_worker(args: argparse.Namespace) -> None:
                 stub, cfg, worker_id, in_flight_shard, "worker early exit"
             )
         channel.close()
-        logger.info("[Worker] 종료. 처리한 shard 수: %d", shard_count)
+        worker_pipeline_end_ts = time.time()
+        logger.info(
+            "[Worker] 종료. 처리한 shard 수: %d  pipeline_wall_total=%.3fs  "
+            "(start=%.3f end=%.3f)",
+            shard_count,
+            worker_pipeline_end_ts - worker_pipeline_start_ts,
+            worker_pipeline_start_ts,
+            worker_pipeline_end_ts,
+        )
         log_memory_usage("worker end")
 
 

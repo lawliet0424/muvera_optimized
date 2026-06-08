@@ -66,6 +66,22 @@ class ShardPerfRecord:
     end_to_end:        float = 0.0
     error_message:     str   = ""
 
+    # Wall-clock timestamps (time.time(), Unix epoch)
+    worker_get_shard_req_ts:  float = 0.0
+    worker_get_shard_done_ts: float = 0.0
+    worker_process_start_ts:  float = 0.0
+    worker_process_done_ts:   float = 0.0
+    worker_upload_req_ts:     float = 0.0
+    worker_upload_done_ts:    float = 0.0
+    worker_status_report_ts:  float = 0.0
+    storage_get_shard_recv_ts:   float = 0.0
+    storage_get_shard_send_done_ts: float = 0.0
+    storage_upload_recv_start_ts:  float = 0.0
+    storage_upload_done_ts:        float = 0.0
+    storage_status_recv_ts:        float = 0.0
+    worker_wall_total_s:    float = 0.0
+    storage_shard_wall_s:   float = 0.0
+
     @property
     def docs_per_sec(self) -> float:
         return self.num_docs / max(self.end_to_end, 1e-9)
@@ -126,6 +142,13 @@ class PerfLogger:
             remote_flush_time = remote_flush_time or msg.remote_flush_time_s,
             end_to_end        = msg.end_to_end_time_s,
             error_message     = msg.error_message,
+            worker_get_shard_req_ts  = msg.worker_get_shard_req_ts,
+            worker_get_shard_done_ts = msg.worker_get_shard_done_ts,
+            worker_process_start_ts  = msg.worker_process_start_ts,
+            worker_process_done_ts   = msg.worker_process_done_ts,
+            worker_upload_req_ts     = msg.worker_upload_req_ts,
+            worker_upload_done_ts    = msg.worker_upload_done_ts,
+            worker_status_report_ts  = msg.worker_status_report_ts,
         )
 
     # ------------------------------------------------------------------ #
@@ -224,6 +247,9 @@ class PerfLogger:
         "embed_time", "prep_time", "upload_time", "compute_time",
         "download_time", "reshape_time", "flush_time", "fde_total",
         "grpc_recv_time", "grpc_send_time", "remote_flush_time", "end_to_end",
+        "worker_wall_total_s", "storage_shard_wall_s",
+        "worker_get_shard_req_ts", "worker_status_report_ts",
+        "storage_get_shard_recv_ts", "storage_status_recv_ts",
         "docs_per_sec", "error_message",
     ]
 
@@ -289,6 +315,20 @@ def load_from_manifest(manifest_path: str) -> PerfLogger:
             remote_flush_time = t.get("remote_flush",   0.0),
             end_to_end        = t.get("end_to_end",     0.0),
             error_message     = shard.get("error_message", ""),
+            worker_get_shard_req_ts  = t.get("worker_get_shard_req_ts",  0.0),
+            worker_get_shard_done_ts = t.get("worker_get_shard_done_ts", 0.0),
+            worker_process_start_ts  = t.get("worker_process_start_ts",  0.0),
+            worker_process_done_ts   = t.get("worker_process_done_ts",   0.0),
+            worker_upload_req_ts     = t.get("worker_upload_req_ts",     0.0),
+            worker_upload_done_ts    = t.get("worker_upload_done_ts",    0.0),
+            worker_status_report_ts  = t.get("worker_status_report_ts",  0.0),
+            storage_get_shard_recv_ts    = t.get("storage_get_shard_recv_ts",    0.0),
+            storage_get_shard_send_done_ts = t.get("storage_get_shard_send_done_ts", 0.0),
+            storage_upload_recv_start_ts = t.get("storage_upload_recv_start_ts", 0.0),
+            storage_upload_done_ts       = t.get("storage_upload_done_ts",       0.0),
+            storage_status_recv_ts       = t.get("storage_status_recv_ts",       0.0),
+            worker_wall_total_s  = t.get("worker_wall_total_s",  0.0),
+            storage_shard_wall_s = t.get("storage_shard_wall_s", 0.0),
         )
         perf.record_shard(rec)
 

@@ -12,3 +12,4 @@ gpu_partition_indices.txt
 *.ncu-rep
 *.nsys-rep
 gpu_result/
+data/
