@@ -4,7 +4,7 @@
 generate_document_fde_batch 함수에 직접 time.perf_counter()를 삽입하여
 각 작업별 시간을 측정하는 버전
 """
-import os, json, time, hashlib, logging, pathlib, math
+import os, json, time, hashlib, logging, pathlib, math, socket
 from collections import OrderedDict
 from dataclasses import replace
 from typing import Optional, List, Tuple, Dict
@@ -30,6 +30,7 @@ from beir.retrieval.search.dense import DenseRetrievalExactSearch as DRES
 import argparse
 
 # FDE 구현 (document batch + query FDE on GPU)
+from perf_logger import PerfLogger, ShardPerfRecord
 from fde_generator_gpu_optimized_triple_stage_optimized import (
     FixedDimensionalEncodingConfig,
     EncodingType,
@@ -43,7 +44,8 @@ from fde_generator_gpu_optimized_triple_stage_optimized import (
 # ======================
 # --- Configuration ----
 # ======================
-DATASET_REPO_ID = "scidocs"
+DATASET_REPO_ID = "treccovid"
+DATASETS_ROOT = "/media/dcceris/datasets"
 COLBERT_MODEL_NAME = "raphaelsty/neural-cherche-colbert"
 TOP_K = 10
 FILENAME = "main_weight_fde_gpu_triple_stage_optimized"
@@ -80,7 +82,7 @@ logging.info(f"Using device: {DEVICE}")
 # ========================================================
 # ---------- 배치 단위 처리: 인코딩 → FDE 생성 → 저장 ----------
 # ========================================================
-ATOMIC_BATCH_SIZE = 10000  # 배치 크기 (메모리 매핑으로 안전하게 처리)
+ATOMIC_BATCH_SIZE = 12000  # 배치 크기 (메모리 매핑으로 안전하게 처리)
 
 # ===========================
 # --- Helper Functions  -----
@@ -97,23 +99,14 @@ def log_memory_usage(stage: str):
     return memory_mb
     
 def load_nanobeir_dataset(repo_id: str):
-    """Loads BEIR dataset from local 'data_path' in test split."""
-    # 데이터셋 준비 (BEIR trec-covid)
-    url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip"
-    out_dir = os.path.join("/media/dcceris", "muvera_optimized", "datasets")
-
-    if not os.path.exists(os.path.join(out_dir, dataset)):
-        data_path = util.download_and_unzip(url, out_dir)
-        logging.info(
-            f"[Dataset] Downloaded and unzipped dataset from {url} to {out_dir}"
+    """BEIR 데이터셋을 /media/dcceris/datasets/{repo_id} 에서 로드."""
+    data_path = os.path.join(DATASETS_ROOT, repo_id)
+    if not os.path.isdir(data_path):
+        raise FileNotFoundError(
+            f"Dataset not found: {data_path}\n"
+            f"  기대 경로: {DATASETS_ROOT}/<dataset_name>/ (BEIR 디렉터리)"
         )
-    else:
-        data_path = os.path.join(out_dir, dataset)
-        logging.info(
-            f"[Dataset] Dataset already exists in {out_dir}"
-        )
-
-    logging.info(f"Loading dataset from local path (BEIR): '{repo_id}'...")
+    logging.info(f"Loading dataset from local path (BEIR): {data_path}")
     corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split="test")
     logging.info(f"Dataset loaded: {len(corpus)} documents, {len(queries)} queries.")
     return corpus, queries, qrels
@@ -546,11 +539,18 @@ class ColbertFdeRetriever:
         log_memory_usage("Before atomic batch processing")
         
         logging.info(f"[{self.__class__.__name__}] Processing {len(self.doc_ids)} documents in atomic batches of {ATOMIC_BATCH_SIZE}...")
-        
+
+        perf = PerfLogger("standalone")
+        worker_id = f"standalone-{socket.gethostname()}"
+        pipeline_start_ts = time.time()
+
         for batch_start in range(0, len(self.doc_ids), ATOMIC_BATCH_SIZE):
             batch_end = min(batch_start + ATOMIC_BATCH_SIZE, len(self.doc_ids))
             batch_doc_ids = self.doc_ids[batch_start:batch_end]
-            
+            t_batch_start_perf = time.perf_counter()
+            t_batch_req_ts = time.time()
+            embed_time = 0.0
+
             logging.info(f"[Atomic Batch] Processing batch {batch_start//ATOMIC_BATCH_SIZE + 1}/{(len(self.doc_ids) + ATOMIC_BATCH_SIZE - 1)//ATOMIC_BATCH_SIZE}: docs {batch_start}-{batch_end-1}")
             
             # Step 1: 배치용 임베딩 수집 (파일에서 직접 로드)
@@ -582,6 +582,7 @@ class ColbertFdeRetriever:
             # Step 2: 누락된 문서들 배치 인코딩
             if batch_missing_ids:
                 logging.info(f"[Atomic Batch] Encoding {len(batch_missing_ids)} missing documents...")
+                t_embed_start = time.perf_counter()
                 to_encode_docs = [{"id": did, **corpus[did]} for did in batch_missing_ids]
                 encoded_map = self.ranker.encode_documents(documents=to_encode_docs)
                 
@@ -602,7 +603,10 @@ class ColbertFdeRetriever:
                 
                 del to_encode_docs
                 del encoded_map
-            
+                embed_time = time.perf_counter() - t_embed_start
+
+            t_get_shard_done_ts = time.time()
+
             # Step 3: 배치 FDE 생성 (타이밍 측정 버전 사용)
             logging.info(f"[Atomic Batch] Generating FDE for {len(batch_embeddings)} documents...")
 
@@ -611,6 +615,8 @@ class ColbertFdeRetriever:
             #TIMING.clear()
 
             #start_total = time.perf_counter()
+            t_process_start_ts = time.time()
+            t_fde_start_perf = time.perf_counter()
             # 3-stream pipeline 함수는 fde_memmap에 직접 쓰므로, fde_index를 전달
             stats = generate_document_fde_batch_gpu_3stage(
                 batch_embeddings,
@@ -620,6 +626,8 @@ class ColbertFdeRetriever:
                 # mini_batch_size는 무시됨 (전체 배치를 한 번에 처리)
                 log_every=1000,
             )
+            fde_total = time.perf_counter() - t_fde_start_perf
+            t_process_done_ts = time.time()
             #end_total = time.perf_counter()
             #TIMING['total'] = end_total - start_total
 
@@ -662,7 +670,46 @@ class ColbertFdeRetriever:
             if 'flush' not in CUMULATIVE_TIMING:
                 CUMULATIVE_TIMING['flush'] = 0.0
             CUMULATIVE_TIMING['flush'] += flush_time
-            
+
+            t_batch_done_ts = time.time()
+            end_to_end = time.perf_counter() - t_batch_start_perf
+            _stats = stats or {}
+            perf.record_shard(ShardPerfRecord(
+                shard_index       = batch_start // ATOMIC_BATCH_SIZE,
+                worker_id         = worker_id,
+                status            = "success",
+                num_docs          = len(batch_doc_ids),
+                doc_start         = batch_start,
+                doc_end           = batch_end,
+                embed_time        = embed_time,
+                prep_time         = _stats.get("prep_time", 0.0),
+                upload_time       = _stats.get("upload_time", 0.0),
+                simhash_time      = _stats.get("simhash_time", 0.0),
+                partition_time    = _stats.get("partition_time", 0.0),
+                scatter_time      = _stats.get("scatter_time", 0.0),
+                average_time      = _stats.get("average_time", 0.0),
+                fill_time         = _stats.get("fill_time", 0.0),
+                compute_time      = _stats.get("compute_time", 0.0),
+                download_time     = _stats.get("download_time", 0.0),
+                reshape_time      = _stats.get("reshape_time", 0.0),
+                flush_time        = _stats.get("flush_time", 0.0) + flush_time,
+                fde_total         = fde_total,
+                end_to_end        = end_to_end,
+                worker_get_shard_req_ts  = t_batch_req_ts,
+                worker_get_shard_done_ts = t_get_shard_done_ts,
+                worker_process_start_ts  = t_process_start_ts,
+                worker_process_done_ts   = t_process_done_ts,
+                worker_status_report_ts  = t_batch_done_ts,
+                worker_wall_total_s      = t_batch_done_ts - t_batch_req_ts,
+            ))
+            logging.info(
+                "[PERF] batch=%d worker=%s docs=%d embed=%.4fs fde=%.4fs "
+                "end_to_end=%.4fs wall_total=%.4fs ts_req=%.3f ts_done=%.3f",
+                batch_start // ATOMIC_BATCH_SIZE, worker_id, len(batch_doc_ids),
+                embed_time, fde_total, end_to_end, t_batch_done_ts - t_batch_req_ts,
+                t_batch_req_ts, t_batch_done_ts,
+            )
+
             # Step 6: Simhash 통계 저장 (partition_counter가 있는 경우만)
             if partition_counter is not None:
                 for doc_idx in range(partition_counter.shape[0]):
@@ -707,7 +754,28 @@ class ColbertFdeRetriever:
         logging.info(f"[Atomic Batch] Completed processing {len(self.doc_ids)} documents")
         logging.info(f"[Atomic Batch] Integrated FDE index saved to: {fde_memmap_path}")
         log_memory_usage("After atomic batch processing")
-        
+
+        pipeline_end_ts = time.time()
+        pipeline_wall = {
+            "first_get_shard_recv_ts": pipeline_start_ts,
+            "last_status_recv_ts":     pipeline_end_ts,
+            "pipeline_wall_total_s":   round(pipeline_end_ts - pipeline_start_ts, 3),
+        }
+        metrics_csv = os.path.join(self._cache_dir, "metrics.csv")
+        manifest_path = os.path.join(self._cache_dir, "final_manifest.json")
+        perf.save_csv(metrics_csv)
+        perf.save_final_manifest(
+            manifest_path,
+            mode="standalone",
+            pipeline_wall_clock=pipeline_wall,
+            mmap_path=fde_memmap_path,
+        )
+        perf.print_summary()
+        logging.info(
+            "[PERF] metrics saved: %s  manifest: %s  pipeline_wall_total=%.3fs",
+            metrics_csv, manifest_path, pipeline_wall["pipeline_wall_total_s"],
+        )
+
         # 메모리 해제
         logging.info(f"[{self.__class__.__name__}] Memory cleanup completed")
         log_memory_usage("After memory cleanup")

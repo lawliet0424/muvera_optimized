@@ -261,10 +261,11 @@ class PerfLogger:
             for r in sorted(self._records, key=lambda x: x.shard_index):
                 row = asdict(r)
                 row["docs_per_sec"] = f"{r.docs_per_sec:.2f}"
-                for k, v in row.items():
-                    if isinstance(v, float):
-                        row[k] = f"{v:.6f}"
-                w.writerow(row)
+                out = {}
+                for k in self.CSV_FIELDS:
+                    v = row.get(k, "")
+                    out[k] = f"{v:.6f}" if isinstance(v, float) else v
+                w.writerow(out)
         logger.info("[PerfLogger] CSV saved → %s", path)
 
     def save_json(self, path: str) -> None:
@@ -276,6 +277,70 @@ class PerfLogger:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         logger.info("[PerfLogger] JSON saved → %s", path)
+
+    def save_final_manifest(
+        self,
+        path: str,
+        *,
+        mode: str = "standalone",
+        pipeline_wall_clock: Optional[dict] = None,
+        mmap_path: Optional[str] = None,
+    ) -> None:
+        """storage_node final_manifest.json 과 호환되는 형식으로 저장."""
+        success = [r for r in self._records if r.status == "success"]
+        pwc = pipeline_wall_clock or {}
+        manifest = {
+            "mode":                mode,
+            "generated_at":        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "total_shards":        len(self._records),
+            "done":                len(success),
+            "failed":              len(self._records) - len(success),
+            "total_elapsed_sec":   pwc.get("pipeline_wall_total_s", 0),
+            "pipeline_wall_clock": pwc,
+            "shards":              [],
+        }
+        for r in sorted(self._records, key=lambda x: x.shard_index):
+            timing = {
+                "prep_time":        r.prep_time,
+                "upload_time":      r.upload_time,
+                "simhash_time":     r.simhash_time,
+                "partition_time":   r.partition_time,
+                "scatter_time":     r.scatter_time,
+                "average_time":     r.average_time,
+                "fill_time":        r.fill_time,
+                "compute_time":     r.compute_time,
+                "download_time":    r.download_time,
+                "reshape_time":     r.reshape_time,
+                "flush_time":       r.flush_time,
+                "fde_total":        r.fde_total,
+                "embed_time":       r.embed_time,
+                "grpc_recv":        r.grpc_recv_time,
+                "grpc_send":        r.grpc_send_time,
+                "remote_flush":     r.remote_flush_time,
+                "end_to_end":       r.end_to_end,
+                "worker_get_shard_req_ts":  r.worker_get_shard_req_ts,
+                "worker_get_shard_done_ts": r.worker_get_shard_done_ts,
+                "worker_process_start_ts":  r.worker_process_start_ts,
+                "worker_process_done_ts":   r.worker_process_done_ts,
+                "worker_upload_req_ts":     r.worker_upload_req_ts,
+                "worker_upload_done_ts":    r.worker_upload_done_ts,
+                "worker_status_report_ts":  r.worker_status_report_ts,
+                "worker_wall_total_s":      r.worker_wall_total_s,
+            }
+            entry = {
+                "shard_index": r.shard_index,
+                "worker_id":   r.worker_id,
+                "status":      r.status,
+                "num_docs":    r.num_docs,
+                "timing":      timing,
+            }
+            if mmap_path:
+                entry["mmap_path"] = mmap_path
+            manifest["shards"].append(entry)
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        logger.info("[PerfLogger] final_manifest.json → %s", path)
 
 
 # ===========================================================================
