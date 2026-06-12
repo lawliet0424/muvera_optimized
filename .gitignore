@@ -13,3 +13,4 @@ gpu_partition_indices.txt
 *.nsys-rep
 gpu_result/
 data/
+storage/

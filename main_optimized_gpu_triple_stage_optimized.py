@@ -57,9 +57,13 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
 else:
     DEVICE = "cpu"
 
-# 캐시 루트
+# 캐시 루트 (임베딩 전용 — cache_muvera)
 CACHE_ROOT = os.path.join("/media/dcceris", "muvera_optimized", "cache_muvera", DATASET_REPO_ID, FILENAME)
 os.makedirs(CACHE_ROOT, exist_ok=True)
+
+# 결과물 저장 루트 (mmap, final_manifest.json, meta.json, metrics.csv, fde_index.pkl, doc_ids.json)
+STORAGE_ROOT = os.path.join(os.path.expanduser("~"), "Desktop", "muvera_optimized", "storage", DATASET_REPO_ID, FILENAME)
+os.makedirs(STORAGE_ROOT, exist_ok=True)
 
 # 쿼리 검색 디렉터리
 dataset = DATASET_REPO_ID
@@ -78,11 +82,13 @@ os.makedirs(COMMON_QUERY_EMBEDS_DIR, exist_ok=True)
 # ======================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logging.info(f"Using device: {DEVICE}")
+logging.info(f"Embeddings cache (cache_muvera): {COMMON_DOC_EMBEDS_DIR}")
+logging.info(f"Results storage: {STORAGE_ROOT}")
 
 # ========================================================
 # ---------- 배치 단위 처리: 인코딩 → FDE 생성 → 저장 ----------
 # ========================================================
-ATOMIC_BATCH_SIZE = 12000  # 배치 크기 (메모리 매핑으로 안전하게 처리)
+ATOMIC_BATCH_SIZE = 12000  # 배치 크기 기본값 (--batch-size 미지정 시)
 
 # ===========================
 # --- Helper Functions  -----
@@ -231,6 +237,7 @@ class ColbertFdeRetriever:
         num_repetitions: int = 2,
         num_simhash_projections: int = 5,
         projection_dimension: Optional[int] = None,  # ★ 추가: projection dimension
+        atomic_batch_size: int = ATOMIC_BATCH_SIZE,
     ):
         model = neural_cherche_models.ColBERT(model_name_or_path=model_name, device=DEVICE)
         self.ranker = neural_cherche_rank.ColBERT(key="id", on=["title", "text"], model=model)
@@ -238,6 +245,9 @@ class ColbertFdeRetriever:
         # 추가된 인자
         self.num_repetitions = num_repetitions
         self.num_simhash_projections = num_simhash_projections
+        if atomic_batch_size <= 0:
+            raise ValueError(f"atomic_batch_size must be positive, got {atomic_batch_size}")
+        self.atomic_batch_size = atomic_batch_size
 
         # projection_dimension이 지정되면 AMS_SKETCH 사용, 아니면 IDENTITY
         if projection_dimension is not None and projection_dimension > 0:
@@ -285,7 +295,7 @@ class ColbertFdeRetriever:
         self._doc_emb_dir = os.path.join(self._cache_dir, "doc_embeds")
 
         os.makedirs(self._cache_dir, exist_ok=True)
-        os.makedirs(self._queries_dir, exist_ok=True)
+        # os.makedirs(self._queries_dir, exist_ok=True)  # (기존) 쿼리 FDE/임베딩 저장 디렉터리 — 쿼리 저장 안 함
         # 개별 하위 디렉터리에 doc_embeds 저장하지 않음 (공통 디렉터리 사용)
 
         # 지연시간 로그 파일 (헤더 없이 누적)
@@ -298,7 +308,8 @@ class ColbertFdeRetriever:
         raw = f"{dataset}|{model_key}|{cfg_str}"
         key = hashlib.md5(raw.encode()).hexdigest()[:10]
         dir_name = f"{dataset.replace('/', '_')}__{model_key}__{cfg_str}__{key}"
-        return os.path.join(CACHE_ROOT, dir_name)
+        # return os.path.join(CACHE_ROOT, dir_name)  # (기존) cache_muvera 에 FDE/메트릭 등 저장
+        return os.path.join(STORAGE_ROOT, dir_name)  # (신규) ~/Desktop/muvera_optimized/storage 에 결과물 저장
 
     def _query_key(self, query_text: str, query_id: Optional[str]) -> str:
         base = (query_id or "") + "||" + query_text
@@ -373,20 +384,21 @@ class ColbertFdeRetriever:
         return True
 
     def _save_query_cache(self, key: str, query_embeddings: np.ndarray, query_fde: np.ndarray):
-        # 공통 디렉터리에 쿼리 임베딩 저장
-        if hasattr(self, 'common_query_embeds_dir') and self.common_query_embeds_dir:
-            # query_id 추출 (key에서)
-            query_id = key.split('||')[0] if '||' in key else None
-            if query_id and query_id.strip():  # 빈 문자열 체크 추가
-                common_emb_path = os.path.join(self.common_query_embeds_dir, f"query_{query_id}.npy")
-                if not os.path.exists(common_emb_path):
-                    os.makedirs(os.path.dirname(common_emb_path), exist_ok=True)
-                    np.save(common_emb_path, query_embeddings)
-                    logging.info(f"[query-embed] saved to common directory: {common_emb_path}")
-        
-        # FDE만 개별 하위 디렉터리에 저장 (백업 제거)
-        _, fde_path = self._query_paths(key)
-        np.save(fde_path, query_fde)
+        pass  # (신규) 쿼리 임베딩/FDE 저장 비활성화
+        # # 공통 디렉터리에 쿼리 임베딩 저장
+        # if hasattr(self, 'common_query_embeds_dir') and self.common_query_embeds_dir:
+        #     # query_id 추출 (key에서)
+        #     query_id = key.split('||')[0] if '||' in key else None
+        #     if query_id and query_id.strip():  # 빈 문자열 체크 추가
+        #         common_emb_path = os.path.join(self.common_query_embeds_dir, f"query_{query_id}.npy")
+        #         if not os.path.exists(common_emb_path):
+        #             os.makedirs(os.path.dirname(common_emb_path), exist_ok=True)
+        #             np.save(common_emb_path, query_embeddings)
+        #             logging.info(f"[query-embed] saved to common directory: {common_emb_path}")
+        #
+        # # FDE만 개별 하위 디렉터리에 저장 (백업 제거)
+        # _, fde_path = self._query_paths(key)
+        # np.save(fde_path, query_fde)
 
     def _load_query_cache(self, key: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         # 공통 디렉터리에서 쿼리 임베딩 로드 시도
@@ -481,41 +493,62 @@ class ColbertFdeRetriever:
         # 문서 아이디 & 포지션 확정
         self.doc_ids = list(corpus.keys())
         self._doc_pos = {d: i for i, d in enumerate(self.doc_ids)}
-        documents_for_ranker = [{"id": doc_id, **corpus[doc_id]} for doc_id in self.doc_ids]
-
-        # ---------- 외부/내부 임베딩 로드 & 부족분만 인코딩 ----------
-        doc_embeddings_map = {}
-        missing_doc_ids: List[str] = []
-
-        # 1) 외부/내부에서 가능한 만큼 채운다
-        for doc_id in self.doc_ids:
-            ext = self._external_doc_emb_path(doc_id)            
-            if ext and os.path.exists(ext):
-                doc_embeddings_map[doc_id] = np.load(ext).astype(np.float32)                
-                # 공통 디렉터리에서 로드했으므로 개별 저장 불필요
-                continue
-
-            # 내부 캐시 확인
-            dst = self._doc_emb_path(doc_id)
-            if os.path.exists(dst):
-                try:
-                    loaded_emb = np.load(dst)
-                    # shape 검증: (256, 128) 또는 (128,) 형태여야 함
-                    if loaded_emb.ndim == 2 and loaded_emb.shape[1] == 128:
-                        doc_embeddings_map[doc_id] = loaded_emb.astype(np.float32)
-                        print(f"[inner shape]: {loaded_emb.shape}")
-                    else:
-                        print(f"[inner shape invalid]: {loaded_emb.shape}, expected (256, 128) or (128,), will regenerate")
-                        missing_doc_ids.append(doc_id)
-                except Exception as e:
-                    print(f"[inner load error]: {e}, will regenerate")
-                    missing_doc_ids.append(doc_id)
-            else:
-                missing_doc_ids.append(doc_id)
+        # documents_for_ranker = [{"id": doc_id, **corpus[doc_id]} for doc_id in self.doc_ids]  # (기존) 미사용 — 17만 건 dict 생성으로 시작 지연
 
         logging.info(
-            f"[index] preloaded from external/internal: {len(doc_embeddings_map)} / {len(self.doc_ids)}, "
-            f"to-encode: {len(missing_doc_ids)}"
+            f"[{self.__class__.__name__}] index() started: {len(self.doc_ids)} documents, "
+            f"scanning embedding cache (existence only, no preload)..."
+        )
+
+        # ---------- 외부/내부 임베딩 존재 여부만 스캔 (배치 루프에서 로드) ----------
+        # (기존) 전체 문서 임베딩을 np.load 로 메모리에 선적재 — 17만 건 I/O + 수십 GB RAM, 로그 없이 수십 분 대기
+        # doc_embeddings_map = {}
+        missing_doc_ids: List[str] = []
+        cached_count = 0
+        scan_log_every = 10000
+
+        for i, doc_id in enumerate(self.doc_ids):
+            ext = self._external_doc_emb_path(doc_id)
+            if ext and os.path.exists(ext):
+                cached_count += 1
+            else:
+                dst = self._doc_emb_path(doc_id)
+                if os.path.exists(dst):
+                    cached_count += 1
+                else:
+                    missing_doc_ids.append(doc_id)
+
+            if (i + 1) % scan_log_every == 0 or (i + 1) == len(self.doc_ids):
+                logging.info(
+                    f"[index] embedding scan progress: {i + 1}/{len(self.doc_ids)} "
+                    f"(cached={cached_count}, to-encode={len(missing_doc_ids)})"
+                )
+
+        # # 1) 외부/내부에서 가능한 만큼 채운다
+        # for doc_id in self.doc_ids:
+        #     ext = self._external_doc_emb_path(doc_id)
+        #     if ext and os.path.exists(ext):
+        #         doc_embeddings_map[doc_id] = np.load(ext).astype(np.float32)
+        #         continue
+        #     dst = self._doc_emb_path(doc_id)
+        #     if os.path.exists(dst):
+        #         try:
+        #             loaded_emb = np.load(dst)
+        #             if loaded_emb.ndim == 2 and loaded_emb.shape[1] == 128:
+        #                 doc_embeddings_map[doc_id] = loaded_emb.astype(np.float32)
+        #                 print(f"[inner shape]: {loaded_emb.shape}")
+        #             else:
+        #                 print(f"[inner shape invalid]: {loaded_emb.shape}, expected (256, 128) or (128,), will regenerate")
+        #                 missing_doc_ids.append(doc_id)
+        #         except Exception as e:
+        #             print(f"[inner load error]: {e}, will regenerate")
+        #             missing_doc_ids.append(doc_id)
+        #     else:
+        #         missing_doc_ids.append(doc_id)
+
+        logging.info(
+            f"[index] embedding scan done: cached={cached_count} / {len(self.doc_ids)}, "
+            f"to-encode={len(missing_doc_ids)}"
         )
         
         #[1017] simhash별 indice별 원소 개수 csv 파일 저장 필요------------------------------------
@@ -538,20 +571,21 @@ class ColbertFdeRetriever:
         
         log_memory_usage("Before atomic batch processing")
         
-        logging.info(f"[{self.__class__.__name__}] Processing {len(self.doc_ids)} documents in atomic batches of {ATOMIC_BATCH_SIZE}...")
+        batch_size = self.atomic_batch_size
+        logging.info(f"[{self.__class__.__name__}] Processing {len(self.doc_ids)} documents in atomic batches of {batch_size}...")
 
         perf = PerfLogger("standalone")
         worker_id = f"standalone-{socket.gethostname()}"
         pipeline_start_ts = time.time()
 
-        for batch_start in range(0, len(self.doc_ids), ATOMIC_BATCH_SIZE):
-            batch_end = min(batch_start + ATOMIC_BATCH_SIZE, len(self.doc_ids))
+        for batch_start in range(0, len(self.doc_ids), batch_size):
+            batch_end = min(batch_start + batch_size, len(self.doc_ids))
             batch_doc_ids = self.doc_ids[batch_start:batch_end]
             t_batch_start_perf = time.perf_counter()
             t_batch_req_ts = time.time()
             embed_time = 0.0
 
-            logging.info(f"[Atomic Batch] Processing batch {batch_start//ATOMIC_BATCH_SIZE + 1}/{(len(self.doc_ids) + ATOMIC_BATCH_SIZE - 1)//ATOMIC_BATCH_SIZE}: docs {batch_start}-{batch_end-1}")
+            logging.info(f"[Atomic Batch] Processing batch {batch_start//batch_size + 1}/{(len(self.doc_ids) + batch_size - 1)//batch_size}: docs {batch_start}-{batch_end-1}")
             
             # Step 1: 배치용 임베딩 수집 (파일에서 직접 로드)
             batch_embeddings = []
@@ -632,14 +666,14 @@ class ColbertFdeRetriever:
             #TIMING['total'] = end_total - start_total
 
             # 배치별 타이밍 리포트 출력
-            logging.info(f"[Atomic Batch] Batch {batch_start//ATOMIC_BATCH_SIZE + 1} FDE generation completed")
+            logging.info(f"[Atomic Batch] Batch {batch_start//batch_size + 1} FDE generation completed")
             #print_timing_report(len(batch_embeddings), self.doc_config.num_repetitions, cumulative=False)
             
             partition_counter = None  # 타이밍 버전은 partition_counter를 반환하지 않음
             
             # Step 4: FDE 인덱스에 통합 저장은 이미 pipeline 함수 내부에서 완료됨
             # fde_index[batch_start:batch_end]는 pipeline 함수 내부에서 처리됨
-            logging.info(f"[FDE Integration] Integrated batch {batch_start//ATOMIC_BATCH_SIZE + 1} into final memmap (written directly by pipeline)")
+            logging.info(f"[FDE Integration] Integrated batch {batch_start//batch_size + 1} into final memmap (written directly by pipeline)")
             
             # Step 5: 3-stream pipeline 함수에서 반환한 flush 시간을 누적
             # (함수 내부에서 이미 flush를 수행했으므로, 여기서는 시간만 누적)
@@ -675,7 +709,7 @@ class ColbertFdeRetriever:
             end_to_end = time.perf_counter() - t_batch_start_perf
             _stats = stats or {}
             perf.record_shard(ShardPerfRecord(
-                shard_index       = batch_start // ATOMIC_BATCH_SIZE,
+                shard_index       = batch_start // batch_size,
                 worker_id         = worker_id,
                 status            = "success",
                 num_docs          = len(batch_doc_ids),
@@ -705,7 +739,7 @@ class ColbertFdeRetriever:
             logging.info(
                 "[PERF] batch=%d worker=%s docs=%d embed=%.4fs fde=%.4fs "
                 "end_to_end=%.4fs wall_total=%.4fs ts_req=%.3f ts_done=%.3f",
-                batch_start // ATOMIC_BATCH_SIZE, worker_id, len(batch_doc_ids),
+                batch_start // batch_size, worker_id, len(batch_doc_ids),
                 embed_time, fde_total, end_to_end, t_batch_done_ts - t_batch_req_ts,
                 t_batch_req_ts, t_batch_done_ts,
             )
@@ -726,7 +760,7 @@ class ColbertFdeRetriever:
                 del partition_counter
             gc.collect()
             
-            log_memory_usage(f"After atomic batch {batch_start//ATOMIC_BATCH_SIZE + 1}")
+            log_memory_usage(f"After atomic batch {batch_start//batch_size + 1}")
         
         # Step 8: 최종 통합 memmap 완성 및 저장
         final_flush_start = time.perf_counter()
@@ -761,8 +795,8 @@ class ColbertFdeRetriever:
             "last_status_recv_ts":     pipeline_end_ts,
             "pipeline_wall_total_s":   round(pipeline_end_ts - pipeline_start_ts, 3),
         }
-        metrics_csv = os.path.join(self._cache_dir, "metrics.csv")
-        manifest_path = os.path.join(self._cache_dir, "final_manifest.json")
+        metrics_csv = os.path.join(self._cache_dir, f"metrics_{ATOMIC_BATCH_SIZE}.csv")
+        manifest_path = os.path.join(self._cache_dir, f"final_manifest_{ATOMIC_BATCH_SIZE}.json")
         perf.save_csv(metrics_csv)
         perf.save_final_manifest(
             manifest_path,
@@ -794,7 +828,7 @@ class ColbertFdeRetriever:
             query_embeddings_map = self.ranker.encode_queries(queries=[qtext])
             query_embeddings = to_numpy(next(iter(query_embeddings_map.values())))
             query_fde = self._compute_query_fde(query_embeddings)
-            self._save_query_cache(key, query_embeddings, query_fde)
+            # self._save_query_cache(key, query_embeddings, query_fde)  # (기존) 쿼리 저장 — 비활성화
             missing += 1
         logging.info(f"[{self.__class__.__name__}] Precomputed {missing} uncached queries.")
 
@@ -813,7 +847,7 @@ class ColbertFdeRetriever:
             query_embeddings_map = self.ranker.encode_queries(queries=[query])
             query_embeddings = to_numpy(next(iter(query_embeddings_map.values())))
             query_fde = self._compute_query_fde(query_embeddings)
-            self._save_query_cache(key, query_embeddings, query_fde)
+            # self._save_query_cache(key, query_embeddings, query_fde)  # (기존) 쿼리 저장 — 비활성화
         else:
             query_embeddings = cached_emb
             query_fde = cached_fde
@@ -1149,7 +1183,13 @@ if __name__ == "__main__":
     parser.add_argument("--simhash", type=int, default=5)
     parser.add_argument("--projection", type=int, default=None, help="Projection dimension (optional)")
     parser.add_argument("--rerank", type=int, default=0, help="Rerank candidates (not used, kept for compatibility)")
+    parser.add_argument(
+        "--batch-size", type=int, default=ATOMIC_BATCH_SIZE,
+        help=f"Documents per batch/shard mmap (default: {ATOMIC_BATCH_SIZE})",
+    )
     args = parser.parse_args()
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be a positive integer")
 
     # 누적 타이밍 초기화 (전역 스코프이므로 global 선언 불필요)
     CUMULATIVE_TIMING.clear()  # 기존 딕셔너리 초기화
@@ -1175,12 +1215,16 @@ if __name__ == "__main__":
         num_repetitions=args.rep,
         num_simhash_projections=args.simhash,
         projection_dimension=args.projection,  # projection dimension 설정
+        atomic_batch_size=args.batch_size,
     )
 
     logging.info("=" * 100)
     logging.info("--- FDE INDEX BUILDING WITH TIMING MEASUREMENT ---")
     logging.info("=" * 100)
-    logging.info(f"Parameters: rep={args.rep}, simhash={args.simhash}, projection={args.projection}")
+    logging.info(
+        f"Parameters: rep={args.rep}, simhash={args.simhash}, "
+        f"projection={args.projection}, batch_size={args.batch_size}"
+    )
     logging.info(f"Total documents: {len(corpus)}")
     logging.info(f"Device: {DEVICE}")
     logging.info("=" * 100)
