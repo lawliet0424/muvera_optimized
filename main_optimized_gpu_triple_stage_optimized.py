@@ -383,6 +383,25 @@ class ColbertFdeRetriever:
         )
         return True
 
+    def _fde_memmap_path(self) -> str:
+        return os.path.join(
+            self._cache_dir,
+            f"fde_index_memmap_{self.num_repetitions}_{self.num_simhash_projections}.mmap",
+        )
+
+    def _cleanup_fde_cache(self, mmap_path: Optional[str] = None):
+        """FDE 인덱스 캐시 삭제 — 다음 실행에서 FDE를 다시 생성하도록 함."""
+        self.fde_index = None
+        mmap_path = mmap_path or self._fde_memmap_path()
+        for path in (self._fde_path, self._ids_path, self._meta_path, mmap_path):
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                os.remove(path)
+                logging.info(f"[{self.__class__.__name__}] Removed FDE cache: {path}")
+            except OSError as e:
+                logging.warning(f"[{self.__class__.__name__}] Failed to remove {path}: {e}")
+
     def _save_query_cache(self, key: str, query_embeddings: np.ndarray, query_fde: np.ndarray):
         pass  # (신규) 쿼리 임베딩/FDE 저장 비활성화
         # # 공통 디렉터리에 쿼리 임베딩 저장
@@ -565,7 +584,7 @@ class ColbertFdeRetriever:
         final_fde_dim = self.doc_config.num_repetitions * final_fde_dim_per_rep
         
         # FDE 인덱스 memmap 생성
-        fde_memmap_path = os.path.join(self._cache_dir, f"fde_index_memmap_{self.num_repetitions}_{self.num_simhash_projections}.mmap")
+        fde_memmap_path = self._fde_memmap_path()
         fde_index = np.memmap(fde_memmap_path, mode="w+", dtype=np.float32, 
                              shape=(len(self.doc_ids), final_fde_dim))
         
@@ -795,8 +814,8 @@ class ColbertFdeRetriever:
             "last_status_recv_ts":     pipeline_end_ts,
             "pipeline_wall_total_s":   round(pipeline_end_ts - pipeline_start_ts, 3),
         }
-        metrics_csv = os.path.join(self._cache_dir, f"metrics_{ATOMIC_BATCH_SIZE}.csv")
-        manifest_path = os.path.join(self._cache_dir, f"final_manifest_{ATOMIC_BATCH_SIZE}.json")
+        metrics_csv = os.path.join(self._cache_dir, f"metrics_{batch_size}.csv")
+        manifest_path = os.path.join(self._cache_dir, f"final_manifest_{batch_size}.json")
         perf.save_csv(metrics_csv)
         perf.save_final_manifest(
             manifest_path,
@@ -813,9 +832,9 @@ class ColbertFdeRetriever:
         # 메모리 해제
         logging.info(f"[{self.__class__.__name__}] Memory cleanup completed")
         log_memory_usage("After memory cleanup")
-        
-        # 저장
-        self._save_cache()
+
+        # metrics/manifest는 유지하고, FDE 캐시만 삭제 (batch-size별 재실행 보장)
+        self._cleanup_fde_cache(fde_memmap_path)
         log_memory_usage("Index completed")
 
     def precompute_queries(self, queries: dict):
@@ -1190,6 +1209,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.batch_size <= 0:
         parser.error("--batch-size must be a positive integer")
+
+    ATOMIC_BATCH_SIZE = args.batch_size
 
     # 누적 타이밍 초기화 (전역 스코프이므로 global 선언 불필요)
     CUMULATIVE_TIMING.clear()  # 기존 딕셔너리 초기화

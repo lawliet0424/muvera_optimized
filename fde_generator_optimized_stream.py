@@ -4,7 +4,7 @@ import time, pathlib, os
 import numpy as np
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Optional, List
+from typing import Optional, List, Dict, Tuple, Union
 from joblib import Parallel, delayed  # pip install joblib
 
 class EncodingType(Enum):
@@ -257,8 +257,9 @@ def generate_document_fde_batch(
     *,
     memmap_path: Optional[str] = None,           # e.g., "/path/to/fde_index.mmap"
     max_bytes_in_memory: int = 2 * 1024**3,      # 2GB safety threshold
-    log_every: int = 10000                        # progress logging
-) -> np.ndarray:
+    log_every: int = 10000,                       # progress logging
+    return_stats: bool = False,
+) -> Union[np.ndarray, Tuple[np.ndarray, Dict[str, float]]]:
     """
     Streaming implementation: no np.vstack; processes docs one by one.
     Optionally writes output to a numpy.memmap on disk if the full matrix would be large.
@@ -331,6 +332,18 @@ def generate_document_fde_batch(
 
     part_bits_tbl = _partition_bits_table(config.num_simhash_projections) if config.fill_empty_partitions else None
 
+    perf_stats: Dict[str, float] = {
+        "prep_time": 0.0,
+        "simhash_time": 0.0,
+        "partition_time": 0.0,
+        "scatter_time": 0.0,
+        "average_time": 0.0,
+        "fill_time": 0.0,
+        "compute_time": 0.0,
+        "flush_time": 0.0,
+        "fde_total": 0.0,
+    }
+
     # For each repetition, stream over docs
     for rep_num in range(config.num_repetitions):
         current_seed = config.seed + rep_num
@@ -340,6 +353,7 @@ def generate_document_fde_batch(
             )
 
         # Projection matrices for this repetition
+        t_prep_start = time.perf_counter()
         simhash_matrix = _simhash_matrix_from_seed(
             config.dimension, config.num_simhash_projections, current_seed
         )  # [D, b]
@@ -352,11 +366,13 @@ def generate_document_fde_batch(
             )  # [D, Pdim]
         else:
             raise ValueError(f"Unsupported projection type: {config.projection_type}")
+        perf_stats["prep_time"] += time.perf_counter() - t_prep_start
 
         rep_offset = rep_num * final_fde_dim_per_rep
 
         # Stream over documents (no vstack)
         for d in range(num_docs):
+            t_compute_start = time.perf_counter()
             X = doc_embeddings_list[d].astype(np.float32, copy=False)  # [Ld, D]
             Ld = X.shape[0]
             
@@ -367,12 +383,16 @@ def generate_document_fde_batch(
             #     continue
 
             # SimHash sketches
+            t_simhash_start = time.perf_counter()
             sketches = X @ simhash_matrix                    # [Ld, b]
             bits = (sketches > 0).astype(np.uint32)          # [Ld, b]
+            perf_stats["simhash_time"] += time.perf_counter() - t_simhash_start
             # Gray-code partition index (vectorized)
+            t_partition_start = time.perf_counter()
             p_idx = np.zeros(Ld, dtype=np.uint32)
             for b in range(config.num_simhash_projections):
                 p_idx = (p_idx << 1) + (bits[:, b] ^ (p_idx & 1))  # Gray append
+            perf_stats["partition_time"] += time.perf_counter() - t_partition_start
 
             # Projection
             if use_identity_proj:
@@ -385,20 +405,25 @@ def generate_document_fde_batch(
             counts = np.zeros(num_partitions, dtype=np.int32)
 
             # counts
+            t_scatter_start = time.perf_counter()
             np.add.at(counts, p_idx, 1)
 
             # sums (scatter-add per feature)
             # rep_sum[p_idx[k], :] += Pts[k, :]
             for feat in range(projection_dim):
                 np.add.at(rep_sum[:, feat], p_idx, Pts[:, feat])
+            perf_stats["scatter_time"] += time.perf_counter() - t_scatter_start
 
             # Average where counts > 0
+            t_avg_start = time.perf_counter()
             nz = counts > 0
             if nz.any():
                 rep_sum[nz, :] /= counts[nz, None]
+            perf_stats["average_time"] += time.perf_counter() - t_avg_start
 
             # Optional: fill empty partitions with nearest point (by Hamming dist in sketch space)
             if config.fill_empty_partitions and (~nz).any():
+                t_fill_start = time.perf_counter()
                 empties = np.flatnonzero(~nz)
                 # Build doc bit table once: [Ld, b]
                 doc_bits = (sketches > 0).astype(np.uint8)     # [Ld, b]
@@ -407,16 +432,20 @@ def generate_document_fde_batch(
                 distances = np.sum(tgt_bits[:, None, :] ^ doc_bits[None, :, :], axis=2)
                 nearest_local = np.argmin(distances, axis=1)   # [E]
                 rep_sum[empties, :] = Pts[nearest_local, :]
+                perf_stats["fill_time"] += time.perf_counter() - t_fill_start
 
             # Write this doc's rep chunk
             out_fdes[d, rep_offset:rep_offset + final_fde_dim_per_rep] = rep_sum.reshape(-1)
+            perf_stats["compute_time"] += time.perf_counter() - t_compute_start
 
             if (d + 1) % log_every == 0:
                 logging.info(f"[FDE Batch] rep {rep_num} doc {d+1}/{num_docs} processed")
 
         # If using memmap, ensure dirty pages are flushed each repetition
         if memmap_used and hasattr(out_fdes, "flush"):
+            t_flush_start = time.perf_counter()
             out_fdes.flush()
+            perf_stats["flush_time"] += time.perf_counter() - t_flush_start
 
     # Final projection (count-sketch) if requested — done per-doc to stay streaming
     if config.final_projection_dimension and config.final_projection_dimension > 0:
@@ -450,13 +479,18 @@ def generate_document_fde_batch(
                 logging.info(f"[FDE Batch] final-proj doc {d+1}/{num_docs}")
 
         if hasattr(final_out, "flush"):
+            t_flush_start = time.perf_counter()
             final_out.flush()
+            perf_stats["flush_time"] += time.perf_counter() - t_flush_start
         out_fdes = final_out  # replace with final
 
     total_time = time.perf_counter() - batch_start_time
+    perf_stats["fde_total"] = total_time
     logging.info(f"[FDE Batch] Batch generation completed in {total_time:.3f}s")
     logging.info(f"[FDE Batch] Output shape: {out_fdes.shape}")
 
+    if return_stats:
+        return out_fdes, perf_stats
     return out_fdes
 
 # -------------------------
